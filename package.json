@@ -1,7 +1,7 @@
 {
   "name": "opencode-relay",
   "version": "0.1.0",
-  "description": "Route OpenCode's own free models through your own Vercel relays, so the daily allowance follows the relay instead of your IP.",
+  "description": "Route OpenCode's own free models through your own Vercel relays and HTTP/SOCKS proxies, so the daily allowance follows the exit instead of your IP.",
   "type": "module",
   "license": "MIT",
   "packageManager": "bun@1.4.2",
