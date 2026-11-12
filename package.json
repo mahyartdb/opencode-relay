@@ -13,7 +13,7 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/B3hnamR/opencode-relay.git"
+    "url": "git+https://github.com/mahyartdb/opencode-relay.git"
   },
   "exports": {
     ".": {

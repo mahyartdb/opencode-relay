@@ -21,13 +21,13 @@ builds it, and adds it to your OpenCode config. `install.sh` is for Linux and
 macOS; on Windows, use `install.ps1` instead.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/B3hnamR/opencode-relay/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/mahyartdb/opencode-relay/main/install.sh | bash
 ```
 
 On Windows:
 
 ```powershell
-irm https://raw.githubusercontent.com/B3hnamR/opencode-relay/main/install.ps1 | iex
+irm https://raw.githubusercontent.com/mahyartdb/opencode-relay/main/install.ps1 | iex
 ```
 
 Both scripts:
@@ -47,7 +47,7 @@ installation instead of cloning again.
 ### Manual install
 
 ```bash
-git clone https://github.com/B3hnamR/opencode-relay.git
+git clone https://github.com/mahyartdb/opencode-relay.git
 cd opencode-relay
 bun install
 bun run build

@@ -29,7 +29,7 @@ function Show-RelayUsage {
     Write-Output ''
     Write-Output 'Environment:'
     Write-Output '  OPENCODE_RELAY_REPO       git repository to clone'
-    Write-Output '                             (default: https://github.com/B3hnamR/opencode-relay.git)'
+    Write-Output '                             (default: https://github.com/mahyartdb/opencode-relay.git)'
     Write-Output '  OPENCODE_RELAY_HOME       where the plugin is installed'
     Write-Output "                             (default: $HOME\.local\share\opencode-relay)"
     Write-Output '  OPENCODE_CONFIG_DIR       OpenCode config directory'
@@ -140,7 +140,7 @@ function ConvertTo-RelayJson {
     return (ConvertTo-Json -InputObject $Value -Compress)
 }
 
-$relayRepo = Get-RelayEnv 'OPENCODE_RELAY_REPO' 'https://github.com/B3hnamR/opencode-relay.git'
+$relayRepo = Get-RelayEnv 'OPENCODE_RELAY_REPO' 'https://github.com/mahyartdb/opencode-relay.git'
 $relayHome = Get-RelayEnv 'OPENCODE_RELAY_HOME' (Join-Path $HOME '.local\share\opencode-relay')
 $configDir = Get-RelayEnv 'OPENCODE_CONFIG_DIR' (Join-Path $HOME '.config\opencode')
 $noConfig = Test-RelayFlag 'OPENCODE_RELAY_NO_CONFIG'

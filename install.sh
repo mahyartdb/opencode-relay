@@ -4,7 +4,7 @@ set -euo pipefail
 # Installer for opencode-relay: clones the repository, builds it, and adds it
 # to the OpenCode config.
 
-REPO="${OPENCODE_RELAY_REPO:-https://github.com/B3hnamR/opencode-relay.git}"
+REPO="${OPENCODE_RELAY_REPO:-https://github.com/mahyartdb/opencode-relay.git}"
 INSTALL_DIR="${OPENCODE_RELAY_HOME:-$HOME/.local/share/opencode-relay}"
 CONFIG_DIR="${OPENCODE_CONFIG_DIR:-$HOME/.config/opencode}"
 CONFIG_FILE="$CONFIG_DIR/opencode.json"
@@ -30,7 +30,7 @@ Options:
 
 Environment:
   OPENCODE_RELAY_REPO       git repository to clone
-                            (default: https://github.com/B3hnamR/opencode-relay.git)
+                            (default: https://github.com/mahyartdb/opencode-relay.git)
   OPENCODE_RELAY_HOME       where the plugin is installed
                             (default: $HOME/.local/share/opencode-relay)
   OPENCODE_CONFIG_DIR       OpenCode config directory
