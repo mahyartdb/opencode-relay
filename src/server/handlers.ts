@@ -62,7 +62,7 @@ function describeState(
   catalog: ModelCatalog,
   notes: readonly string[],
   exhausted: readonly string[],
-  skipped: readonly string[],
+  skipped: readonly { readonly id: string; readonly name: string }[],
 ): string {
   if (!settings.enabled) return "Routing is off: requests go straight to OpenCode."
   if (!active) return "Routing is on, but no relay is chosen."
@@ -82,17 +82,21 @@ function describeState(
   if (exhausted.length > 0) {
     problems.push(`${exhausted.length} relay${exhausted.length === 1 ? " is" : "s are"} used up.`)
   }
-  const activeSkipped = skipped.includes(active.name)
+  // Relays are compared by id, not by name: two relays in one region get the
+  // same default name, and a name collision must not make the chosen one look
+  // broken.
+  const activeSkipped = skipped.some((relay) => relay.id === active.id)
   // The chosen relay gets its own sentence below, so naming it twice would be
   // noise. The other relays that are down still need to be named.
-  const otherSkipped = activeSkipped ? skipped.filter((name) => name !== active.name) : skipped
+  const otherSkipped = skipped.filter((relay) => relay.id !== active.id)
   if (otherSkipped.length > 0) {
+    const names = otherSkipped.map((relay) => relay.name)
     // A relay that does not answer is named, because a request that quietly
     // goes direct still spends the direct allowance the user was saving.
     problems.push(
-      otherSkipped.length === 1
-        ? `${otherSkipped[0]} did not answer, so it is skipped.`
-        : `${otherSkipped.join(", ")} did not answer, so they are skipped.`,
+      names.length === 1
+        ? `${names[0]} did not answer, so it is skipped.`
+        : `${names.join(", ")} did not answer, so they are skipped.`,
     )
   }
   problems.push(...notes)
@@ -153,7 +157,9 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
           catalog,
           state.notes(),
           state.exhaustedRelays(),
-          skipped.map((id) => state.relay(id)?.name ?? id),
+          skipped
+            .map((id) => state.relay(id))
+            .filter((relay): relay is RelayRecord => relay !== undefined),
         ),
       }
     },
