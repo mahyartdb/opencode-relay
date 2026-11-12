@@ -677,6 +677,7 @@ describe("the server half", () => {
     const status = (await call("status")) as { skipped: readonly string[]; note?: string }
     expect(status.skipped).toContain(dead.id)
     expect(status.note).toContain("dead end did not answer")
+    expect(status.note).toContain("requests go direct")
 
     await dispose?.()
   })

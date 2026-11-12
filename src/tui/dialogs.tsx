@@ -15,7 +15,13 @@ import type { Context, DialogSelectAction, DialogSelectOption } from "@opencode/
 import { Relay } from "../rpc.ts"
 import { REGIONS, STRATEGIES, STRATEGY_LABELS, type Strategy } from "../lib/types.ts"
 import { menuOptions, relayList, type MenuAction, type RelayChoice } from "./present.ts"
-import { publishModels, publishStatus, type RelayModel, type RelayStatus } from "./state.ts"
+import {
+  currentStatus,
+  publishModels,
+  publishStatus,
+  type RelayModel,
+  type RelayStatus,
+} from "./state.ts"
 
 /** The typed client for the relay contract, so both ends speak the same shapes. */
 export function relayClient(context: Context) {
@@ -136,21 +142,38 @@ async function withWorking<T>(context: Context, message: string, run: () => Prom
  * user out of the plugin and back to the prompt. The active relay can be
  * tested from here with t, without opening another screen.
  */
+let menuOpen = false
+
 export async function openRelayMenu(context: Context, client: RelayClient): Promise<void> {
-  for (;;) {
-    const refreshed = await refreshStatus(context, client)
-    if (!refreshed.ok) {
-      reportError(context, "Relay", refreshed.error)
-      return
+  // A second click on the pill, or a second /relay while the menu is up, must
+  // not stack menus on top of each other.
+  if (menuOpen) return
+  menuOpen = true
+  try {
+    for (;;) {
+      const refreshed = await refreshStatus(context, client)
+      const status = refreshed.ok ? refreshed.status : currentStatus()
+      if (!status) {
+        if (!refreshed.ok) reportError(context, "Relay", refreshed.error)
+        return
+      }
+      if (!refreshed.ok) {
+        // A refresh that failed is worth saying once, but it must not throw the
+        // user out of the menu. The last known state is still useful, and the
+        // next action may well succeed.
+        reportError(context, "Relay", refreshed.error)
+      }
+      const active = status.activeRelay
+      const choice = await context.ui.dialog.select<MenuAction>({
+        title: "Relay",
+        options: menuOptions(status),
+        ...(active ? { actions: [testActiveAction(context, client, active)] } : {}),
+      })
+      if (choice === undefined || choice === "close") return
+      await runAction(context, client, status, choice)
     }
-    const active = refreshed.status.activeRelay
-    const choice = await context.ui.dialog.select<MenuAction>({
-      title: "Relay",
-      options: menuOptions(refreshed.status),
-      ...(active ? { actions: [testActiveAction(context, client, active)] } : {}),
-    })
-    if (choice === undefined || choice === "close") return
-    await runAction(context, client, refreshed.status, choice)
+  } finally {
+    menuOpen = false
   }
 }
 
