@@ -78,8 +78,11 @@ Type `/relay` in the prompt. The command opens a menu:
 - **Add a Vercel account** - you need a Vercel API token with permission to
   create projects. The token is stored on your machine and sent only to
   Vercel.
-- **Remove an account / a relay** - removing a relay can also delete its
-  Vercel project.
+- **Remove an account / a relay** - removing a relay can also delete its Vercel
+  project, so the relay stops running and stops costing anything.
+- **Track an existing relay** - use a relay you deployed yourself.
+- **Update the active relay** - redeploy the current code over the relay that is
+  already running.
 - **Test the active relay** - checks that the relay answers and reports the
   address it sends from.
 
@@ -106,12 +109,21 @@ deploys only when you ask it to.
 ## How it is built
 
 - `src/server/` - the server part: the request hook, the stored state, the RPC handlers
+  - `index.ts` - the glue: it loads the state, registers the hooks and the RPC
+  - `handlers.ts` - one handler per method of the contract
+  - `hooks.ts` - the three session hooks and what they need
+  - `models.ts` - the provider's models and what they cost
+  - `state.ts` - the accounts, the relays and the routing rules
+  - `storage.ts` - how that state is written and read back
 - `src/tui/` - the terminal part: the `/relay` command, its dialogs, the status pill
 - `src/rpc.ts` - the contract the two halves share, typed with Standard Schema
+- `src/lib/types.ts` - the shapes both halves agree on
 - `src/lib/routing.ts` - which models are routed, and how a request is rewritten
 - `src/lib/vercel.ts` - the Vercel API client
 - `src/lib/relay-source.ts` - the relay source that gets deployed
+- `src/lib/redact.ts` - the one place a secret is taken out of a message
 - `relay/relay.js` - the relay itself, deployed to Vercel
+- `tools/` - the local relay, so the plugin can be tried without deploying
 
 The plugin ships compiled JavaScript. OpenCode compiles plugin TUI parts with
 its own Solid transform, but only outside `node_modules`, so a published

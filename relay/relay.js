@@ -73,7 +73,10 @@ const hostAllowed = (h) =>
 const IDENTITY =
   /^(forwarded|x-forwarded-.*|x-real-ip|true-client-ip|client-ip|cf-.*|cdn-loop|x-vercel-.*|x-nf-.*|x-amzn-.*|x-middleware-subrequest|x-invocation-id|logs-url|via|x-envoy-.*|fly-.*|x-country|x-azure-.*|x-relay-.*|host|connection|content-length)$/i;
 
-const json = (status, body) => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
+const json = (status, body, headers) => {
+  const out = { 'content-type': 'application/json', ...(headers ?? {}) };
+  return new Response(JSON.stringify(body), { status, headers: out });
+};
 
 // Both keys are hashed first, so the comparison takes the same time whatever their length or common prefix.
 const sameKey = (given, required) =>
@@ -88,7 +91,7 @@ const sameKey = (given, required) =>
 const instance = Math.random().toString(36).slice(2, 8);
 let egress;
 const egressIp = () =>
-  (egress ||= fetch('https://opencode.ai/cdn-cgi/trace', { signal: AbortSignal.timeout(5000) })
+  (egress ||= fetch(TRACE_URL, { signal: AbortSignal.timeout(10000) })
     .then((r) => r.text())
     .then((t) => {
       const ip = (t.match(/^ip=(.+)$/m) || [])[1] || '';
@@ -101,6 +104,10 @@ const egressIp = () =>
     }));
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Where the instance asks what address it is seen from. Pointing it somewhere else is what lets the
+// tests run without depending on that service.
+const TRACE_URL = process.env.RELAY_TRACE_URL || 'https://opencode.ai/cdn-cgi/trace';
 
 // recycle ends this instance once the requests it is serving have finished (or after 15 s), so the next request starts
 // a new instance with a new address.
@@ -151,16 +158,21 @@ export default {
     // The client lists the addresses it knows are used up; an instance on one of those answers at once, without
     // calling OpenCode.
     const avoid = (req.headers.get('x-relay-avoid') || '').split(',').map((x) => x.trim()).filter(Boolean);
-    if (avoid.length && avoid.includes(await egressIp()))
-      return json(409, {
-        error: 'The address of this instance is used up',
-        egress: await egressIp(),
-        headers: {
-          'x-relay-rotate': '1',
-          'x-relay-instance': instance,
-          'x-relay-egress': await egressIp(),
-        },
-      });
+    if (avoid.length && avoid.includes(await egressIp())) {
+      const used = await egressIp();
+      // The rotate signal has to be a real header: the client reads it from the response, not from
+      // the body, and a body it has to parse is a body that can be missed.
+      const rotated = {
+        'x-relay-rotate': '1',
+        'x-relay-instance': instance,
+        ...(used ? { 'x-relay-egress': used } : {}),
+      };
+      return json(
+        409,
+        { error: 'The address of this instance is used up', egress: used, headers: rotated },
+        rotated,
+      );
+    }
 
     const target = req.headers.get('x-relay-target');
     const path = req.headers.get('x-relay-path') || '/';
@@ -193,7 +205,10 @@ export default {
       if (isBun) out.delete('content-encoding'); // fetch decodes; node:https preserves the compressed wire bytes.
       out.set('x-relay-runtime', isBun ? 'bun ' + Bun.version : 'node-bun-ciphers ' + process.versions.node);
       out.set('x-relay-instance', instance);
-      out.set('x-relay-egress', await egressIp());
+      // The address is only known when the lookup answered, so the header is left
+      // out rather than set to an empty string that would look like an address.
+      const used = await egressIp();
+      if (used) out.set('x-relay-egress', used);
       if (!r.body) return new Response(null, { status: r.status, headers: out });
       handedOver = true;
       const reader = r.body.getReader();

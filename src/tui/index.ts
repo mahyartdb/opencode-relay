@@ -19,6 +19,13 @@ export default Plugin.define({
     // something different from the dialog the user just used.
     const releaseSlot = context.ui.slot({ append: "prompt.footer.status", render: renderRelayPill })
 
+    const openMenu = () => {
+      void openRelayMenu(context, client).catch((error: unknown) => {
+        reportError(context, "Relay", error)
+      })
+    }
+
+    // The command palette entry opens the menu directly.
     context.keymap.layer(() => ({
       commands: [
         {
@@ -27,31 +34,33 @@ export default Plugin.define({
           description: "Route OpenCode's free models through a relay of your own",
           group: "Relay",
           palette: true,
-          slash: { name: "relay" },
-          run: () => {
-            void openRelayMenu(context, client).catch((error: unknown) => {
-              reportError(context, "Relay", error)
-            })
-          },
+          run: openMenu,
         },
       ],
     }))
 
     // The server says when something changed; the pill follows.
     const unsubscribe = client.events.on("changed", () => {
-      void refreshStatus(client)
+      void refreshStatus(context, client)
+    })
+
+    // The prompt runs the command on the server, which cannot open a dialog.
+    // It asks the terminal part to, and this is where that happens.
+    const unsubscribeMenu = client.events.on("menu", () => {
+      openMenu()
     })
 
     // The provider's model list can change under us, and the routed count with it.
     const stopModels = context.data.on("model.updated", () => {
-      void refreshStatus(client)
+      void refreshStatus(context, client)
     })
 
     // The first paint: the pill must know the state before anyone asks for it.
-    void refreshStatus(client)
+    void refreshStatus(context, client)
 
     return () => {
       unsubscribe()
+      unsubscribeMenu()
       stopModels()
       releaseSlot()
       // The keymap layer belongs to the host, which releases it right after

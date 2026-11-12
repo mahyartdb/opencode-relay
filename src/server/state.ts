@@ -8,7 +8,7 @@
  */
 import { randomUUID } from "node:crypto"
 import type { StorageDomain } from "@opencode/plugin/promise/storage"
-import type { Account, Relay, Selection } from "../lib/types.ts"
+import type { Account, RelayRecord, Selection } from "../lib/types.ts"
 import {
   readAccounts,
   readRelays,
@@ -59,10 +59,14 @@ export interface NewAccount {
 export class RelayState {
   private readonly storage: StorageDomain
   private accountList: Account[] = []
-  private relayList: Relay[] = []
+  private relayList: RelayRecord[] = []
   private rules: Settings = { ...DEFAULT_SETTINGS, customModels: [] }
   /** The addresses whose free allowance is gone, per relay. Memory is enough: they expire with the process. */
   private readonly spent = new Map<string, Set<string>>()
+  /** What the user has to be told about. */
+  private notes_: string[] = []
+  /** Why an address was marked as spent, when the provider said why. */
+  private readonly spendReasons = new Map<string, string>()
 
   constructor(storage: StorageDomain) {
     this.storage = storage
@@ -91,7 +95,7 @@ export class RelayState {
   }
 
   /** The stored relays. */
-  relays(): readonly Relay[] {
+  relays(): readonly RelayRecord[] {
     return this.relayList
   }
 
@@ -106,12 +110,12 @@ export class RelayState {
   }
 
   /** The relay with this id, if it is still there. */
-  relay(id: string): Relay | undefined {
+  relay(id: string): RelayRecord | undefined {
     return this.relayList.find((relay) => relay.id === id)
   }
 
   /** The relay traffic goes through, when one is picked and still exists. */
-  activeRelay(): Relay | undefined {
+  activeRelay(): RelayRecord | undefined {
     const id = this.rules.activeRelayId
     if (id === undefined) return undefined
     return this.relayList.find((relay) => relay.id === id)
@@ -142,14 +146,14 @@ export class RelayState {
   }
 
   /** Store a relay. */
-  async addRelay(relay: Relay): Promise<Relay> {
+  async addRelay(relay: RelayRecord): Promise<RelayRecord> {
     this.relayList = [...this.relayList, relay]
     await writeRelays(this.storage, this.relayList)
     return relay
   }
 
   /** Record whether the relay answered its last check. Says whether anything changed. */
-  async setRelayStatus(id: string, status: Relay["status"]): Promise<boolean> {
+  async setRelayStatus(id: string, status: RelayRecord["status"]): Promise<boolean> {
     const current = this.relayList.find((relay) => relay.id === id)
     if (!current || current.status === status) return false
     this.relayList = this.relayList.map((relay) => (relay.id === id ? { ...relay, status } : relay))
@@ -158,7 +162,7 @@ export class RelayState {
   }
 
   /** Forget a relay, and stop routing through it when it was the active one. */
-  async removeRelay(id: string): Promise<Relay | undefined> {
+  async removeRelay(id: string): Promise<RelayRecord | undefined> {
     const relay = this.relayList.find((entry) => entry.id === id)
     if (!relay) return undefined
     this.relayList = this.relayList.filter((entry) => entry.id !== id)
@@ -192,6 +196,32 @@ export class RelayState {
   async setActiveRelay(id: string | undefined): Promise<void> {
     this.rules = { ...this.rules, activeRelayId: id }
     await writeSettings(this.storage, this.rules)
+  }
+
+  /**
+   * Something the user should know about, shown in the status note.
+   *
+   * A failure that is only written to a log is a failure the user never learns
+   * about, and a project left running because a deletion failed is worth
+   * saying out loud.
+   */
+  noteFailure(message: string): void {
+    this.notes_ = [...this.notes_, message]
+  }
+
+  /** The things the user should be told about, newest last. */
+  notes(): readonly string[] {
+    return this.notes_
+  }
+
+  /** Why an address was marked as spent, when the provider said. */
+  noteSpendReason(egress: string, body: string): void {
+    this.spendReasons.set(egress, body.slice(0, 200))
+  }
+
+  /** Why an address was marked as spent, when the provider said. */
+  spendReason(egress: string): string | undefined {
+    return this.spendReasons.get(egress)
   }
 
   /** Remember an address whose free allowance is gone, so the relay skips it from now on. */

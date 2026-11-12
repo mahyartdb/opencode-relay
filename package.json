@@ -15,10 +15,22 @@
     "url": "git+https://github.com/B3hnamR/opencode-relay.git"
   },
   "exports": {
-    ".": "./dist/index.js",
-    "./server": "./dist/index.js",
-    "./tui": "./dist/tui.js",
-    "./rpc": "./dist/rpc.js"
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./server": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./tui": {
+      "types": "./dist/tui.d.ts",
+      "import": "./dist/tui.js"
+    },
+    "./rpc": {
+      "types": "./dist/rpc.d.ts",
+      "import": "./dist/rpc.js"
+    }
   },
   "files": [
     "dist",
@@ -36,12 +48,9 @@
   },
   "dependencies": {},
   "devDependencies": {
-    "@babel/core": "7.29.7",
-    "@babel/preset-typescript": "7.27.1",
     "@opentui/core": "0.8.4",
     "@opentui/solid": "0.8.4",
     "@types/bun": "^1.4.3",
-    "babel-preset-solid": "1.9.16",
     "esbuild-plugin-solid": "0.6.0",
     "effect": "4.1.0",
     "solid-js": "1.9.16",
@@ -65,5 +74,11 @@
     "solid-js": {
       "optional": true
     }
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "engines": {
+    "node": ">=20",
+    "bun": ">=1.2"
   }
 }

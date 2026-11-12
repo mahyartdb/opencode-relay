@@ -1,4 +1,5 @@
 import { PLAN_LIMITS, type AccountPlan } from "./types.ts"
+import { redact } from "./redact.ts"
 
 export interface VercelAccount {
   readonly token: string
@@ -39,14 +40,6 @@ const DEPLOY_TIMEOUT_MS = 120000
 const DEPLOY_STATUS_TIMEOUT_MS = 15000
 const PROBE_TIMEOUT_MS = 15000
 const REQUEST_TIMEOUT_MS = 30000
-
-function redact(text: string, secrets: readonly (string | undefined)[]): string {
-  let out = text
-  for (const s of secrets) {
-    if (s && s.length > 0) out = out.split(s).join("***")
-  }
-  return out
-}
 
 function authHeader(token: string): Record<string, string> {
   return { Authorization: `Bearer ${token}` }

@@ -25,10 +25,12 @@ type MenuAction =
   | "models"
   | "relay"
   | "deploy"
+  | "track-relay"
   | "add-account"
   | "remove-account"
   | "remove-relay"
   | "test"
+  | "update"
 
 /** One model in the picker, or the way out of it. */
 type ModelChoice = { readonly kind: "model"; readonly id: string } | { readonly kind: "done" }
@@ -67,11 +69,11 @@ async function callRpc<T>(context: Context, title: string, run: () => Promise<T>
  * The model list is only fetched when the number of routed models depends on
  * it, so the common case stays one round trip.
  */
-export async function refreshStatus(client: RelayClient): Promise<Refresh> {
+export async function refreshStatus(context: Context, client: RelayClient): Promise<Refresh> {
   try {
     const status = await client.status({})
     publishStatus(status)
-    await refreshModels(client, status)
+    await refreshModels(context, client, status)
     return { ok: true, status }
   } catch (error) {
     return { ok: false, error }
@@ -79,14 +81,19 @@ export async function refreshStatus(client: RelayClient): Promise<Refresh> {
 }
 
 /** Fetch the model list, but only when the routed count depends on it. */
-async function refreshModels(client: RelayClient, status: RelayStatus): Promise<void> {
+async function refreshModels(
+  context: Context,
+  client: RelayClient,
+  status: RelayStatus,
+): Promise<void> {
   if (status.selection !== "all" && status.selection !== "free") return
   try {
     const models = await client.models({})
     publishModels(models.models)
-  } catch {
-    // The count in the pill is a nicety; a missing model list must not hide
-    // the routing state itself.
+  } catch (error) {
+    // The count in the pill is a nicety, but a missing model list is not the
+    // same as an empty one: the user has to hear that nothing is known.
+    reportError(context, "Relay", error)
   }
 }
 
@@ -119,18 +126,25 @@ function menuOptions(status: RelayStatus): DialogSelectOption<MenuAction>[] {
             : "No relay is active",
     },
     { title: "Deploy a relay", value: "deploy" },
+    { title: "Track an existing relay", value: "track-relay" },
     { title: "Add a Vercel account", value: "add-account" },
   ]
   if (status.accounts.length > 0) options.push({ title: "Remove an account", value: "remove-account" })
   if (status.relays.length > 0) options.push({ title: "Remove a relay", value: "remove-relay" })
   if (status.activeRelay)
     options.push({ title: "Test the active relay", value: "test", description: status.activeRelay.name })
+  if (status.activeRelay)
+    options.push({
+      title: "Update the active relay",
+      value: "update",
+      description: "Redeploy the current code over the same relay",
+    })
   return options
 }
 
 /** Open the main menu and run whatever the user picked. */
 export async function openRelayMenu(context: Context, client: RelayClient): Promise<void> {
-  const refreshed = await refreshStatus(client)
+  const refreshed = await refreshStatus(context, client)
   if (!refreshed.ok) {
     reportError(context, "Relay", refreshed.error)
     return
@@ -147,6 +161,10 @@ export async function openRelayMenu(context: Context, client: RelayClient): Prom
       return chooseRelay(context, client, status)
     case "deploy":
       return deployRelay(context, client, status)
+    case "track-relay":
+      return trackRelay(context, client)
+    case "update":
+      return updateRelay(context, client, status)
     case "add-account":
       return addAccount(context, client)
     case "remove-account":
@@ -163,7 +181,7 @@ async function toggleRouting(context: Context, client: RelayClient, status: Rela
   const enabled = !status.enabled
   const result = await callRpc(context, "Relay", () => client.setEnabled({ enabled }))
   if (!result) return
-  const refreshed = await refreshStatus(client)
+  const refreshed = await refreshStatus(context, client)
   const note = refreshed.ok ? refreshed.status.note : undefined
   const summary = enabled ? "Routing is on." : "Routing is off."
   context.ui.toast.show({
@@ -248,7 +266,7 @@ async function setSelection(
   const result = await callRpc(context, "Relay", () => client.setSelection(input))
   if (!result) return
   context.ui.toast.show({ title: "Relay", message: "The routed models changed.", variant: "success" })
-  await refreshStatus(client)
+  await refreshStatus(context, client)
 }
 
 /** Switch to another relay. */
@@ -270,7 +288,7 @@ async function chooseRelay(context: Context, client: RelayClient, status: RelayS
   const result = await callRpc(context, "Relay", () => client.useRelay({ id: choice.id }))
   if (!result) return
   context.ui.toast.show({ title: "Relay", message: `${choice.name} is the active relay.`, variant: "success" })
-  await refreshStatus(client)
+  await refreshStatus(context, client)
 }
 
 /** Deploy a new relay to a region. */
@@ -306,8 +324,61 @@ async function deployRelay(context: Context, client: RelayClient, status: RelayS
     message: `${deployed.name} is deployed in ${deployed.regionLabel}.`,
     variant: "success",
   })
-  await refreshStatus(client)
+  await refreshStatus(context, client)
   showRelayCard(context, deployed.name, [deployed.url, deployed.regionLabel])
+}
+
+/**
+ * Track a relay that already exists.
+ *
+ * A relay deployed by hand, or by another tool, can be used as it is: the
+ * plugin only needs its address and the token it requires.
+ */
+async function trackRelay(context: Context, client: RelayClient): Promise<void> {
+  const name = await context.ui.dialog.prompt({
+    title: "Name this relay",
+    description: "A name you will recognize later.",
+    placeholder: "my relay",
+  })
+  if (name === undefined) return
+  const url = await context.ui.dialog.prompt({
+    title: "Where does it answer?",
+    description: "The address of the relay, for example https://my-relay.vercel.app.",
+    placeholder: "https://my-relay.vercel.app",
+  })
+  if (url === undefined) return
+  const access = await context.ui.dialog.prompt({
+    title: "Its access token",
+    description: "The token the relay requires in x-relay-key.",
+    placeholder: "access token",
+  })
+  if (access === undefined) return
+  const added = await callRpc(context, "Relay", () =>
+    client.addRelay({ name: name.trim(), url: url.trim(), access: access.trim() }),
+  )
+  if (!added) return
+  context.ui.toast.show({
+    title: "Relay",
+    message: added.reachable ? `${added.name} is tracked.` : `${added.name} is tracked but did not answer.`,
+    variant: added.reachable ? "success" : "warning",
+  })
+  await refreshStatus(context, client)
+}
+
+/** Redeploy the current relay code over the relay that is already running. */
+async function updateRelay(context: Context, client: RelayClient, status: RelayStatus): Promise<void> {
+  const relay = status.activeRelay
+  if (!relay) return
+  const updated = await callRpc(context, "Relay", () => client.updateRelay({ id: relay.id }))
+  if (!updated) return
+  context.ui.toast.show({
+    title: "Relay",
+    message: updated.reachable
+      ? `${relay.name} was redeployed and answers.`
+      : `${relay.name} was redeployed but did not answer.`,
+    variant: updated.reachable ? "success" : "warning",
+  })
+  await refreshStatus(context, client)
 }
 
 /** Add a Vercel account, so a relay can be deployed later. */
@@ -335,7 +406,7 @@ async function addAccount(context: Context, client: RelayClient): Promise<void> 
     message: `${added.name} added (${added.plan ?? "plan unknown"}).`,
     variant: "success",
   })
-  await refreshStatus(client)
+  await refreshStatus(context, client)
 }
 
 /** Forget an account. The relays deployed with it stay. */
@@ -352,7 +423,7 @@ async function removeAccount(context: Context, client: RelayClient, status: Rela
   const result = await callRpc(context, "Relay", () => client.removeAccount({ id: choice.id }))
   if (!result) return
   context.ui.toast.show({ title: "Relay", message: `${choice.name} removed.`, variant: "success" })
-  await refreshStatus(client)
+  await refreshStatus(context, client)
 }
 
 /** Forget a relay. The Vercel project it runs on is kept. */
@@ -366,16 +437,25 @@ async function removeRelay(context: Context, client: RelayClient, status: RelayS
     })),
   })
   if (choice === undefined) return
-  const confirmed = await context.ui.dialog.confirm({
-    title: `Remove ${choice.name}?`,
-    message: "The relay is forgotten. The Vercel project it runs on is kept.",
-    label: { confirm: "Remove", cancel: "Keep" },
+  const withProject = await context.ui.dialog.confirm({
+    title: `Delete the Vercel project of ${choice.name} too?`,
+    message:
+      "The project is what runs the relay, so deleting it stops the relay and frees its deployment. Choose no to forget the relay and leave the project running.",
+    label: { confirm: "Delete it as well", cancel: "Leave it running" },
   })
-  if (confirmed !== true) return
-  const result = await callRpc(context, "Relay", () => client.removeRelay({ id: choice.id }))
+  if (withProject === undefined) return
+  const result = await callRpc(context, "Relay", () =>
+    client.removeRelay({ id: choice.id, deleteProject: withProject }),
+  )
   if (!result) return
-  context.ui.toast.show({ title: "Relay", message: `${choice.name} removed.`, variant: "success" })
-  await refreshStatus(client)
+  context.ui.toast.show({
+    title: "Relay",
+    message: withProject
+      ? `${choice.name} and its Vercel project were removed.`
+      : `${choice.name} was removed. Its Vercel project is still running.`,
+    variant: "success",
+  })
+  await refreshStatus(context, client)
 }
 
 /** Ask the relay whether it answers, and from where. */

@@ -244,6 +244,16 @@ export const Relay = Rpc.define({
         Schema.Struct({ reason: Schema.String }),
       ),
     },
+    /**
+     * Emitted when the command is run, so the TUI can open its menu.
+     *
+     * The command itself lives on the server, because that is where the list of
+     * commands the prompt offers comes from. The menu is a dialog, and a dialog
+     * can only be opened by the terminal.
+     */
+    menu: {
+      schema: Schema.toStandardSchemaV1(Schema.Struct({})),
+    },
   },
 })
 

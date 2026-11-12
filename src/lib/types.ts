@@ -84,7 +84,7 @@ export function toAccountSummary(account: Account): AccountSummary {
 }
 
 /** A relay deployed to Vercel and tracked by this plugin. */
-export interface Relay {
+export interface RelayRecord {
   readonly id: string
   /** The name the user gave this relay. */
   readonly name: string
@@ -112,11 +112,11 @@ export interface RelaySummary {
   readonly regionLabel: string
   readonly url: string
   readonly accountId: string
-  readonly status: Relay["status"]
+  readonly status: RelayRecord["status"]
   readonly createdAt: number
 }
 
-export function toRelaySummary(relay: Relay): RelaySummary {
+export function toRelaySummary(relay: RelayRecord): RelaySummary {
   return {
     id: relay.id,
     name: relay.name,

@@ -9,7 +9,7 @@
  */
 import { Option, Schema } from "effect"
 import type { StorageDomain } from "@opencode/plugin/promise/storage"
-import type { Account, Relay } from "../lib/types.ts"
+import type { Account, RelayRecord } from "../lib/types.ts"
 import type { Settings } from "./state.ts"
 
 export const ACCOUNTS_KEY = "accounts"
@@ -61,7 +61,7 @@ function accountJson(account: Account): Schema.JsonObject {
 }
 
 /** A relay as it is written out. */
-function relayJson(relay: Relay): Schema.JsonObject {
+function relayJson(relay: RelayRecord): Schema.JsonObject {
   const json: Record<string, Schema.Json> = {
     id: relay.id,
     name: relay.name,
@@ -103,7 +103,7 @@ function decodeAccount(value: unknown): Account | undefined {
 }
 
 /** Read one relay, or nothing when the stored value does not make sense. */
-function decodeRelay(value: unknown): Relay | undefined {
+function decodeRelay(value: unknown): RelayRecord | undefined {
   const decoded = Schema.decodeUnknownOption(StoredRelay)(value)
   if (Option.isNone(decoded)) return undefined
   const relay = decoded.value
@@ -133,10 +133,10 @@ export async function readAccounts(storage: StorageDomain): Promise<Account[]> {
 }
 
 /** The stored relays, keeping the ones that still make sense and dropping the rest. */
-export async function readRelays(storage: StorageDomain): Promise<Relay[]> {
+export async function readRelays(storage: StorageDomain): Promise<RelayRecord[]> {
   const raw = await storage.get(RELAYS_KEY)
   if (!Array.isArray(raw)) return []
-  const relays: Relay[] = []
+  const relays: RelayRecord[] = []
   for (const entry of raw) {
     const relay = decodeRelay(entry)
     if (relay) relays.push(relay)
@@ -164,7 +164,7 @@ export async function writeAccounts(storage: StorageDomain, accounts: readonly A
 }
 
 /** Write the relays back. */
-export async function writeRelays(storage: StorageDomain, relays: readonly Relay[]): Promise<void> {
+export async function writeRelays(storage: StorageDomain, relays: readonly RelayRecord[]): Promise<void> {
   await storage.set(RELAYS_KEY, relays.map((relay) => relayJson(relay)))
 }
 

@@ -5,12 +5,9 @@
     "": {
       "name": "opencode-relay",
       "devDependencies": {
-        "@babel/core": "7.29.7",
-        "@babel/preset-typescript": "7.27.1",
         "@opentui/core": "0.8.4",
         "@opentui/solid": "0.8.4",
         "@types/bun": "^1.4.3",
-        "babel-preset-solid": "1.9.16",
         "effect": "4.1.0",
         "esbuild-plugin-solid": "0.6.0",
         "solid-js": "1.9.16",

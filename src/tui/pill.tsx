@@ -24,7 +24,8 @@ function summarize(status: RelayStatus | undefined, models: readonly RelayModel[
   }
   if (!relay) return "relay on, no relay"
   const count = routedCount(status, models)
-  return `relay ${relay.name} · ${count} model${count === 1 ? "" : "s"}`
+  // The command is named, so the footer says how to open the menu.
+  return `relay ${relay.name} · ${count} model${count === 1 ? "" : "s"} · /relay`
 }
 
 /** The pill itself. */
