@@ -7,28 +7,54 @@
  *
  * Every schema is a Standard Schema, so the same definition types both ends:
  * the TUI knows what a method returns, and the server validates what it is
- * given before the handler ever sees it.
+ * given before the handler ever sees it. Credentials never cross it: a relay's
+ * access token and a proxy's password stay on the server.
  */
 import { Schema } from "effect"
 import { Rpc } from "@opencode/plugin/rpc"
 
-/** Which models are routed through a relay. */
-const Selection = Schema.Literals(["all", "free", "custom"])
+/** Which models are routed through an exit. Only free models are ever used. */
+const Selection = Schema.Literals(["free", "custom"])
 
-/** How the relays are used. */
-const Strategy = Schema.Literals(["fixed", "round-robin", "exhausted"])
+/** How the exits are used. */
+const Strategy = Schema.Literals(["fixed", "round-robin", "exhausted", "fastest"])
 
-/** A relay as the TUI sees it. The access token never leaves the server. */
-const RelaySummary = Schema.Struct({
+/** What happens when no exit can serve a request. */
+const Direct = Schema.Literals(["allow", "never"])
+
+/** Counters kept for one exit since the process started. */
+const ExitStats = Schema.Struct({
+  requests: Schema.Number,
+  ok: Schema.Number,
+  rotated: Schema.Number,
+  limited: Schema.Number,
+  failed: Schema.Number,
+  lastMs: Schema.optional(Schema.Number),
+  averageMs: Schema.optional(Schema.Number),
+})
+
+/** A relay or a proxy as the TUI sees it. Credentials are stripped. */
+const ExitSummary = Schema.Struct({
   id: Schema.String,
+  kind: Schema.Literals(["relay", "proxy"]),
   name: Schema.String,
-  project: Schema.String,
-  region: Schema.String,
-  regionLabel: Schema.String,
-  url: Schema.String,
-  accountId: Schema.String,
   status: Schema.String,
+  statusLabel: Schema.String,
+  enabled: Schema.Boolean,
+  /** A relay's public URL, or a proxy's address with its credentials removed. */
+  url: Schema.String,
   createdAt: Schema.Number,
+  project: Schema.optional(Schema.String),
+  region: Schema.optional(Schema.String),
+  regionLabel: Schema.optional(Schema.String),
+  accountId: Schema.optional(Schema.String),
+  egress: Schema.optional(Schema.String),
+  runtime: Schema.optional(Schema.String),
+  latencyMs: Schema.optional(Schema.Number),
+  lastCheck: Schema.optional(Schema.Number),
+  exhaustedUntil: Schema.optional(Schema.Number),
+  lastError: Schema.optional(Schema.String),
+  stats: ExitStats,
 })
 
 /** A Vercel account as the TUI sees it. The token never leaves the server. */
@@ -48,35 +74,101 @@ const ModelSummary = Schema.Struct({
   routed: Schema.Boolean,
 })
 
+/** Why one exit was skipped, for the preview page. */
+const SkippedExit = Schema.Struct({
+  id: Schema.String,
+  name: Schema.String,
+  kind: Schema.Literals(["relay", "proxy"]),
+  reason: Schema.String,
+})
+
+/** The last routing decision, so the user can see why a request went direct. */
+const LastDecision = Schema.Struct({
+  at: Schema.Number,
+  modelId: Schema.String,
+  routed: Schema.Boolean,
+  reason: Schema.String,
+  exitId: Schema.optional(Schema.String),
+  exitName: Schema.optional(Schema.String),
+  kind: Schema.optional(Schema.Literals(["relay", "proxy"])),
+})
+
+/** How far a background test run has got. */
+const ScanProgress = Schema.Struct({
+  startedAt: Schema.Number,
+  total: Schema.Number,
+  done: Schema.Number,
+  kind: Schema.optional(Schema.Literals(["relay", "proxy"])),
+  deep: Schema.Boolean,
+})
+
+/** What the plugin is doing right now. */
+const Status = Schema.Struct({
+  enabled: Schema.Boolean,
+  selection: Selection,
+  strategy: Strategy,
+  direct: Direct,
+  /** Whether exits are checked automatically in the background. */
+  healthChecks: Schema.Boolean,
+  customModels: Schema.Array(Schema.String),
+  activeExit: Schema.optional(ExitSummary),
+  exits: Schema.Array(ExitSummary),
+  accounts: Schema.Array(AccountSummary),
+  exhausted: Schema.Array(Schema.String),
+  paused: Schema.Array(Schema.String),
+  /** Exits that are not used right now because they did not answer. */
+  skipped: Schema.Array(Schema.String),
+  scanning: Schema.optional(ScanProgress),
+  lastDecision: Schema.optional(LastDecision),
+  note: Schema.optional(Schema.String),
+  /** How many free models the current selection routes. */
+  routedCount: Schema.Number,
+  /** How many OpenCode models are known, free or not. */
+  modelCount: Schema.Number,
+})
+
+/** What a routing preview says, without sending or advancing anything. */
+const RoutePreview = Schema.Struct({
+  modelId: Schema.optional(Schema.String),
+  routed: Schema.Boolean,
+  reason: Schema.String,
+  direct: Direct,
+  exit: Schema.optional(ExitSummary),
+  skipped: Schema.Array(SkippedExit),
+})
+
+/** One proxy that was added from a pasted list. */
+const AddedProxy = Schema.Struct({
+  id: Schema.String,
+  name: Schema.String,
+  /** The address without credentials. */
+  url: Schema.String,
+  status: Schema.String,
+})
+
+/** A relay that was just deployed. */
+const DeployedRelay = Schema.Struct({
+  id: Schema.String,
+  name: Schema.String,
+  url: Schema.String,
+  region: Schema.String,
+  regionLabel: Schema.String,
+  reachable: Schema.Boolean,
+})
+
 export const Relay = Rpc.define({
   id: "opencode-relay",
   methods: {
-    /** Current routing state: on or off, the active relay, and what is known. */
+    /** Current routing state: on or off, the exits, and what is known. */
     status: {
       // An empty struct rather than Undefined: the call travels as JSON, and a
       // missing key is rejected by the server before the method is even found.
       input: Schema.toStandardSchemaV1(Schema.Struct({})),
-      output: Schema.toStandardSchemaV1(
-        Schema.Struct({
-          enabled: Schema.Boolean,
-          selection: Selection,
-          strategy: Strategy,
-          customModels: Schema.Array(Schema.String),
-          activeRelay: Schema.optional(RelaySummary),
-          relays: Schema.Array(RelaySummary),
-          accounts: Schema.Array(AccountSummary),
-          exhausted: Schema.Array(Schema.String),
-          /** Relays that are not used right now because they did not answer. */
-          skipped: Schema.Array(Schema.String),
-          note: Schema.optional(Schema.String),
-        }),
-      ),
+      output: Schema.toStandardSchemaV1(Status),
     },
 
     /** The models of the OpenCode provider, each flagged free and routed. */
     models: {
-      // An empty struct rather than Undefined: the call travels as JSON, and a
-      // missing key is rejected by the server before the method is even found.
       input: Schema.toStandardSchemaV1(Schema.Struct({})),
       output: Schema.toStandardSchemaV1(
         Schema.Struct({ models: Schema.Array(ModelSummary) }),
@@ -125,7 +217,7 @@ export const Relay = Rpc.define({
       ),
     },
 
-    /** Deploy a relay to a region with a stored account. */
+    /** Deploy a relay to one region with a stored account. */
     deployRelay: {
       input: Schema.toStandardSchemaV1(
         Schema.Struct({
@@ -135,21 +227,32 @@ export const Relay = Rpc.define({
           runtime: Schema.optional(Schema.Literals(["bun", "node"])),
         }),
       ),
-      output: Schema.toStandardSchemaV1(
-        Schema.Struct({
-          id: Schema.String,
-          name: Schema.String,
-          url: Schema.String,
-          region: Schema.String,
-          regionLabel: Schema.String,
-          reachable: Schema.Boolean,
-        }),
-      ),
+      output: Schema.toStandardSchemaV1(DeployedRelay),
       errors: {
         deploy_failed: Schema.toStandardSchemaV1(
           Schema.Struct({ message: Schema.String }),
         ),
       },
+    },
+
+    /** Deploy the same relay to several regions in one conversation. */
+    deployRelays: {
+      input: Schema.toStandardSchemaV1(
+        Schema.Struct({
+          accountId: Schema.String,
+          name: Schema.optional(Schema.String),
+          regions: Schema.Array(Schema.String),
+          runtime: Schema.optional(Schema.Literals(["bun", "node"])),
+        }),
+      ),
+      output: Schema.toStandardSchemaV1(
+        Schema.Struct({
+          deployed: Schema.Array(DeployedRelay),
+          failed: Schema.Array(
+            Schema.Struct({ region: Schema.String, message: Schema.String }),
+          ),
+        }),
+      ),
     },
 
     /** Track a relay that already exists somewhere else. */
@@ -162,16 +265,7 @@ export const Relay = Rpc.define({
           region: Schema.optional(Schema.String),
         }),
       ),
-      output: Schema.toStandardSchemaV1(
-        Schema.Struct({
-          id: Schema.String,
-          name: Schema.String,
-          url: Schema.String,
-          region: Schema.String,
-          regionLabel: Schema.String,
-          reachable: Schema.Boolean,
-        }),
-      ),
+      output: Schema.toStandardSchemaV1(DeployedRelay),
     },
 
     /** Remove a relay, and optionally delete its Vercel project. */
@@ -191,6 +285,14 @@ export const Relay = Rpc.define({
       ),
     },
 
+    /** Remove any exit, whichever kind it is. The Vercel project is kept. */
+    removeExit: {
+      input: Schema.toStandardSchemaV1(Schema.Struct({ id: Schema.String })),
+      output: Schema.toStandardSchemaV1(
+        Schema.Struct({ removed: Schema.Boolean }),
+      ),
+    },
+
     /** Redeploy the current relay code, keeping the URL and access token. */
     updateRelay: {
       input: Schema.toStandardSchemaV1(Schema.Struct({ id: Schema.String })),
@@ -204,38 +306,109 @@ export const Relay = Rpc.define({
       },
     },
 
-    /** Ask a relay whether it answers, and which address it sends from. */
-    testRelay: {
-      input: Schema.toStandardSchemaV1(Schema.Struct({ id: Schema.String })),
+    /** Redeploy every relay that this plugin deployed. */
+    updateAllRelays: {
+      input: Schema.toStandardSchemaV1(Schema.Struct({})),
       output: Schema.toStandardSchemaV1(
         Schema.Struct({
-          reachable: Schema.Boolean,
-          status: Schema.Number,
-          /** How long the relay took to answer, in milliseconds. */
-          ms: Schema.Number,
-          egress: Schema.optional(Schema.String),
-          runtime: Schema.optional(Schema.String),
+          updated: Schema.Number,
+          failed: Schema.Array(
+            Schema.Struct({ id: Schema.String, name: Schema.String, message: Schema.String }),
+          ),
         }),
       ),
     },
 
-    /** Switch the active relay. */
-    useRelay: {
+    /** Test one exit: a ping, an OpenCode request, or a tiny real model request. */
+    testExit: {
+      input: Schema.toStandardSchemaV1(
+        Schema.Struct({
+          id: Schema.String,
+          deep: Schema.optional(Schema.Boolean),
+        }),
+      ),
+      output: Schema.toStandardSchemaV1(
+        Schema.Struct({
+          ok: Schema.Boolean,
+          status: Schema.String,
+          /** The HTTP status, or 0 when no answer arrived. */
+          code: Schema.Number,
+          ms: Schema.Number,
+          egress: Schema.optional(Schema.String),
+          runtime: Schema.optional(Schema.String),
+          note: Schema.optional(Schema.String),
+        }),
+      ),
+    },
+
+    /** Start checking every exit in the background. */
+    testAll: {
+      input: Schema.toStandardSchemaV1(
+        Schema.Struct({ deep: Schema.optional(Schema.Boolean) }),
+      ),
+      output: Schema.toStandardSchemaV1(
+        Schema.Struct({ total: Schema.Number, started: Schema.Boolean }),
+      ),
+    },
+
+    /** Switch the exit the one-exit and until-exhausted strategies prefer. */
+    useExit: {
       input: Schema.toStandardSchemaV1(Schema.Struct({ id: Schema.String })),
       output: Schema.toStandardSchemaV1(Schema.Struct({ active: Schema.String })),
     },
 
-    /** Turn routing on or off. */
-    setEnabled: {
+    /** Pause an exit, or bring it back. */
+    setExitEnabled: {
       input: Schema.toStandardSchemaV1(
-        Schema.Struct({ enabled: Schema.Boolean }),
+        Schema.Struct({ id: Schema.String, enabled: Schema.Boolean }),
       ),
       output: Schema.toStandardSchemaV1(
-        Schema.Struct({ enabled: Schema.Boolean }),
+        Schema.Struct({ id: Schema.String, enabled: Schema.Boolean }),
       ),
     },
 
-    /** Choose which models are routed. */
+    /** Add every proxy that can be read from a pasted list. */
+    addProxies: {
+      input: Schema.toStandardSchemaV1(
+        Schema.Struct({
+          text: Schema.String,
+          /** A prefix for the names; the host is appended. */
+          name: Schema.optional(Schema.String),
+        }),
+      ),
+      output: Schema.toStandardSchemaV1(
+        Schema.Struct({
+          added: Schema.Array(AddedProxy),
+          /** Entries that could not be read, with their credentials removed. */
+          invalid: Schema.Array(
+            Schema.Struct({ value: Schema.String, reason: Schema.String }),
+          ),
+          duplicates: Schema.Number,
+        }),
+      ),
+    },
+
+    /** Change a proxy's name or address. A new address is tested afresh. */
+    updateProxy: {
+      input: Schema.toStandardSchemaV1(
+        Schema.Struct({
+          id: Schema.String,
+          name: Schema.optional(Schema.String),
+          url: Schema.optional(Schema.String),
+        }),
+      ),
+      output: Schema.toStandardSchemaV1(
+        Schema.Struct({ updated: Schema.Boolean }),
+      ),
+    },
+
+    /** Turn routing on or off. */
+    setEnabled: {
+      input: Schema.toStandardSchemaV1(Schema.Struct({ enabled: Schema.Boolean })),
+      output: Schema.toStandardSchemaV1(Schema.Struct({ enabled: Schema.Boolean })),
+    },
+
+    /** Choose which models are routed. Only free models are accepted. */
     setSelection: {
       input: Schema.toStandardSchemaV1(
         Schema.Struct({
@@ -247,21 +420,65 @@ export const Relay = Rpc.define({
         Schema.Struct({
           selection: Schema.String,
           customModels: Schema.Array(Schema.String),
+          /** Ids that were left out because they are not free. */
+          dropped: Schema.Array(Schema.String),
         }),
       ),
     },
 
-    /** Choose how the relays are used. */
+    /** Choose how the exits are used. */
     setStrategy: {
       input: Schema.toStandardSchemaV1(Schema.Struct({ strategy: Strategy })),
       output: Schema.toStandardSchemaV1(Schema.Struct({ strategy: Strategy })),
     },
 
-    /** Bring the relays whose allowance is gone back into use. */
+    /** Choose what happens when no exit can serve a request. */
+    setDirect: {
+      input: Schema.toStandardSchemaV1(Schema.Struct({ direct: Direct })),
+      output: Schema.toStandardSchemaV1(Schema.Struct({ direct: Direct })),
+    },
+
+    /** Whether the exits are checked in the background. */
+    setHealthChecks: {
+      input: Schema.toStandardSchemaV1(
+        Schema.Struct({ enabled: Schema.Boolean }),
+      ),
+      output: Schema.toStandardSchemaV1(
+        Schema.Struct({ enabled: Schema.Boolean }),
+      ),
+    },
+
+    /** Bring the exits whose allowance is gone back into use. */
     resetExhausted: {
       input: Schema.toStandardSchemaV1(Schema.Struct({})),
       output: Schema.toStandardSchemaV1(
         Schema.Struct({ restored: Schema.Array(Schema.String) }),
+      ),
+    },
+
+    /** Show where the next request would go, without sending or advancing anything. */
+    preview: {
+      input: Schema.toStandardSchemaV1(
+        Schema.Struct({ modelId: Schema.optional(Schema.String) }),
+      ),
+      output: Schema.toStandardSchemaV1(RoutePreview),
+    },
+
+    /** Write the exits and the rules out as JSON. Credentials are included. */
+    exportConfig: {
+      input: Schema.toStandardSchemaV1(Schema.Struct({})),
+      output: Schema.toStandardSchemaV1(Schema.Struct({ json: Schema.String })),
+    },
+
+    /** Read exits and rules back in. Accounts are never imported. */
+    importConfig: {
+      input: Schema.toStandardSchemaV1(Schema.Struct({ json: Schema.String })),
+      output: Schema.toStandardSchemaV1(
+        Schema.Struct({
+          relays: Schema.Number,
+          proxies: Schema.Number,
+          invalid: Schema.Number,
+        }),
       ),
     },
   },

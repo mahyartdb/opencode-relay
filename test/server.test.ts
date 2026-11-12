@@ -2,6 +2,7 @@ import { afterAll, beforeAll, describe, expect, setDefaultTimeout, test } from "
 import type { Server } from "node:http"
 import { startRelay, startTraceStub, traceUrl } from "../tools/relay-harness.ts"
 import { ROTATE_DELAY_MS } from "../src/server/hooks.ts"
+import { relayRequest } from "../src/lib/routing.ts"
 import plugin from "../src/server/index.ts"
 
 /**
@@ -10,6 +11,9 @@ import plugin from "../src/server/index.ts"
  * A real relay runs on a local port, so the request hook is not asked whether it
  * would produce the right headers: the rewritten request is actually sent, and
  * the answer has to come back from OpenCode.
+ *
+ * The tests never turn routing on in the live OpenCode service: every test
+ * builds its own context, its own storage and its own plugin instance.
  */
 
 // The relay looks up its own egress address over the network before it answers,
@@ -20,8 +24,41 @@ const ACCESS = "test-access-token"
 
 type Handler = (input: never) => Promise<void> | void
 
+interface StatusAnswer {
+  readonly enabled: boolean
+  readonly selection: string
+  readonly strategy: string
+  readonly direct: string
+  readonly healthChecks: boolean
+  readonly customModels: readonly string[]
+  readonly activeExit?: { readonly id: string; readonly name: string; readonly kind: string }
+  readonly exits: readonly {
+    readonly id: string
+    readonly name: string
+    readonly kind: "relay" | "proxy"
+    readonly status: string
+    readonly enabled: boolean
+    readonly url: string
+    readonly project?: string
+    readonly statusLabel: string
+    readonly lastError?: string
+  }[]
+  readonly exhausted: readonly string[]
+  readonly paused: readonly string[]
+  readonly skipped: readonly string[]
+  readonly note: string
+  readonly routedCount: number
+  readonly modelCount: number
+  readonly lastDecision?: {
+    readonly modelId: string
+    readonly routed: boolean
+    readonly reason: string
+    readonly exitId?: string
+  }
+}
+
 /** A stand-in for the parts of the OpenCode server the plugin uses. */
-function makeContext() {
+function makeContext(models = true) {
   const store = new Map<string, unknown>()
   const hooks = new Map<string, Handler>()
   const handlers = new Map<string, (input: unknown, context: unknown) => Promise<unknown>>()
@@ -42,31 +79,34 @@ function makeContext() {
   const context = {
     storage,
     model: {
-      list: async () => ({
-        data: [
-          {
-            id: "opencode/iceman-free",
-            modelID: "iceman-free",
-            providerID: "opencode",
-            name: "Iceman Free",
-            cost: [{ input: 0, output: 0, cache: { read: 0, write: 0 } }],
-          },
-          {
-            id: "opencode/gpt-6.1-sol",
-            modelID: "gpt-6.1-sol",
-            providerID: "opencode",
-            name: "GPT 6.1 Sol",
-            cost: [{ input: 2, output: 6, cache: { read: 0.2, write: 0 } }],
-          },
-          {
-            id: "anthropic/claude",
-            modelID: "claude",
-            providerID: "anthropic",
-            name: "Claude",
-            cost: [{ input: 3, output: 15, cache: { read: 0.3, write: 0 } }],
-          },
-        ],
-      }),
+      list: async () => {
+        if (!models) throw new Error("the model list is unavailable")
+        return {
+          data: [
+            {
+              id: "opencode/iceman-free",
+              modelID: "iceman-free",
+              providerID: "opencode",
+              name: "Iceman Free",
+              cost: [{ input: 0, output: 0, cache: { read: 0, write: 0 } }],
+            },
+            {
+              id: "opencode/gpt-6.1-sol",
+              modelID: "gpt-6.1-sol",
+              providerID: "opencode",
+              name: "GPT 6.1 Sol",
+              cost: [{ input: 2, output: 6, cache: { read: 0.2, write: 0 } }],
+            },
+            {
+              id: "anthropic/claude",
+              modelID: "claude",
+              providerID: "anthropic",
+              name: "Claude",
+              cost: [{ input: 3, output: 15, cache: { read: 0.3, write: 0 } }],
+            },
+          ],
+        }
+      },
     },
     session: {
       hook: async (name: string, callback: Handler) => {
@@ -109,17 +149,30 @@ function makeContext() {
   const call = (name: string, input?: unknown) => {
     const handler = handlers.get(name)
     if (!handler) throw new Error(`no handler ${name}`)
-    return handler(input, { signal: new AbortController().signal, error: () => ({}) })
+    return handler(input, {
+      signal: new AbortController().signal,
+      error: (tag: string, message: string, data: unknown) => ({ tag, message, data }),
+    })
   }
 
   return { context, store, hooks, call, emitted, commands }
 }
 
-/** The id of the first relay in a status answer. */
-function relayId(status: { relays: readonly { id: string }[] }): string {
-  const first = status.relays[0]
-  if (!first) throw new Error("no relay")
-  return first.id
+type App = ReturnType<typeof makeContext> & { readonly dispose: () => Promise<void> }
+
+/** Build a plugin instance on its own storage and take it down afterwards. */
+async function start(models = true, store?: Map<string, unknown>): Promise<App> {
+  const made = makeContext(models)
+  if (store) for (const [key, value] of store) made.store.set(key, value)
+  const dispose = await plugin.setup(made.context as never)
+  return { ...made, dispose: async () => { await dispose?.() } }
+}
+
+/** The id of the first exit in a status answer. */
+function firstExit(status: StatusAnswer): StatusAnswer["exits"][number] {
+  const exit = status.exits[0]
+  if (!exit) throw new Error("no exit")
+  return exit
 }
 
 /** Whether the provider can be reached at all. */
@@ -142,6 +195,7 @@ describe("the server half", () => {
   let server: Server
   let trace: Server
   let url = ""
+
   beforeAll(async () => {
     // The address lookup is pointed at a local stub, so the tests do not depend
     // on the service the relay normally asks.
@@ -162,631 +216,728 @@ describe("the server half", () => {
     delete process.env.RELAY_TOKEN
   })
 
-  test("does nothing while it is off", async () => {
-    const { context, hooks, call } = makeContext()
-    const dispose = await plugin.setup(context as never)
+  test("starts off and leaves requests alone", async () => {
+    const app = await start()
+    try {
+      const status = (await app.call("status")) as StatusAnswer
+      expect(status.enabled).toBe(false)
+      expect(status.exits).toEqual([])
+      expect(status.selection).toBe("free")
+      expect(status.direct).toBe("allow")
+      expect(status.healthChecks).toBe(true)
 
-    const status = (await call("status")) as { enabled: boolean; relays: unknown[] }
-    expect(status.enabled).toBe(false)
-    expect(status.relays).toEqual([])
-
-    const input = {
-      model: { id: "iceman-free", providerID: "opencode" },
-      request: new Request("https://opencode.ai/inference/openai/v1/models"),
-    }
-    await hooks.get("http.request")?.(input as never)
-    expect(input.request.url).toBe("https://opencode.ai/inference/openai/v1/models")
-
-    await dispose?.()
-  })
-
-  test("leaves requests for other providers alone", async () => {
-    const { context, hooks, call } = makeContext()
-    const dispose = await plugin.setup(context as never)
-
-    await call("addRelay", { name: "local", url, access: ACCESS })
-    const status = (await call("status")) as { relays: readonly { id: string }[] }
-    await call("useRelay", { id: relayId(status) })
-    await call("setEnabled", { enabled: true })
-    await call("setSelection", { selection: "all" })
-
-    const input = {
-      model: { id: "claude", providerID: "anthropic" },
-      request: new Request("https://api.anthropic.com/v1/messages"),
-    }
-    await hooks.get("http.request")?.(input as never)
-    expect(input.request.url).toBe("https://api.anthropic.com/v1/messages")
-
-    await dispose?.()
-  })
-
-  test("a spent address is answered with a real rotate header", async () => {
-    const { context, hooks, call } = makeContext()
-    const dispose = await plugin.setup(context as never)
-
-    await call("addRelay", { name: "local", url, access: ACCESS })
-    const status = (await call("status")) as { relays: readonly { id: string }[] }
-    await call("useRelay", { id: relayId(status) })
-    await call("setEnabled", { enabled: true })
-    await call("setSelection", { selection: "all" })
-
-    // Ask the relay which address it uses, then ask it to avoid that very address.
-    const ping = await fetch(url, { headers: { "x-relay-key": ACCESS, "x-relay-control": "ping" } })
-    const used = (await ping.json()) as { egress?: string }
-    expect(used.egress).toBeTruthy()
-
-    const answer = await fetch(url, {
-      headers: {
-        "x-relay-key": ACCESS,
-        "x-relay-target": "https://opencode.ai",
-        "x-relay-path": "/inference/openai/v1/models",
-        "x-relay-avoid": used.egress ?? "",
-      },
-    })
-    expect(answer.status).toBe(409)
-    // The client reads the rotate flag from the headers, so it has to be there.
-    expect(answer.headers.get("x-relay-rotate")).toBe("1")
-    expect(answer.headers.get("x-relay-egress")).toBe(used.egress ?? null)
-
-    await dispose?.()
-  })
-
-  test.skipIf(!online)("routes a selected model through the relay, and the answer comes back", async () => {
-    const { context, hooks, call } = makeContext()
-    const dispose = await plugin.setup(context as never)
-
-    await call("addRelay", { name: "local", url, access: ACCESS })
-    const status = (await call("status")) as { relays: readonly { id: string }[] }
-    await call("useRelay", { id: relayId(status) })
-    await call("setEnabled", { enabled: true })
-    await call("setSelection", { selection: "free" })
-
-    const input = {
-      model: { id: "iceman-free", providerID: "opencode" },
-      request: new Request("https://opencode.ai/inference/openai/v1/models"),
-    }
-    await hooks.get("http.request")?.(input as never)
-
-    // The request now points at the relay and carries the relay's headers.
-    expect(input.request.url).toBe(`${url}/`)
-    expect(input.request.headers.get("x-relay-target")).toBe("https://opencode.ai")
-    expect(input.request.headers.get("x-relay-path")).toBe("/inference/openai/v1/models")
-    expect(input.request.headers.get("x-relay-key")).toBe(ACCESS)
-
-    // And it really works: the relay calls OpenCode and the answer comes back.
-    const answer = await fetch(input.request)
-    expect(answer.status).toBe(200)
-    const body = (await answer.json()) as { data: { id: string }[] }
-    expect(body.data.length).toBeGreaterThan(0)
-    // The runtime is always reported. The egress address is only reported when the
-    // relay could look it up, which depends on a third party answering.
-    expect(answer.headers.get("x-relay-runtime")).toBeTruthy()
-
-    await dispose?.()
-  })
-
-  test("a paid model stays direct when only the free ones are routed", async () => {
-    const { context, hooks, call } = makeContext()
-    const dispose = await plugin.setup(context as never)
-
-    await call("addRelay", { name: "local", url, access: ACCESS })
-    const status = (await call("status")) as { relays: readonly { id: string }[] }
-    await call("useRelay", { id: relayId(status) })
-    await call("setEnabled", { enabled: true })
-    await call("setSelection", { selection: "free" })
-
-    const input = {
-      model: { id: "gpt-6.1-sol", providerID: "opencode" },
-      request: new Request("https://opencode.ai/inference/openai/v1/models"),
-    }
-    await hooks.get("http.request")?.(input as never)
-    expect(input.request.url).toBe("https://opencode.ai/inference/openai/v1/models")
-
-    await dispose?.()
-  })
-
-  test("remembers the relays, the accounts and the rules across a restart", async () => {
-    const { context, store, call } = makeContext()
-    const dispose = await plugin.setup(context as never)
-
-    await call("addRelay", { name: "local", url, access: ACCESS })
-    const status = (await call("status")) as { relays: readonly { id: string }[] }
-    await call("useRelay", { id: relayId(status) })
-    await call("setEnabled", { enabled: true })
-    await call("setSelection", { selection: "custom", models: ["iceman-free"] })
-    await dispose?.()
-
-    // A second run finds the same relay and the same rules.
-    const again = makeContext()
-    for (const [key, value] of store) again.store.set(key, value)
-    const dispose2 = await plugin.setup(again.context as never)
-    const restored = (await again.call("status")) as {
-      enabled: boolean
-      selection: string
-      customModels: string[]
-      activeRelay?: { name: string }
-    }
-    expect(restored.enabled).toBe(true)
-    expect(restored.selection).toBe("custom")
-    expect(restored.customModels).toEqual(["iceman-free"])
-    expect(restored.activeRelay?.name).toBe("local")
-    await dispose2?.()
-  })
-
-  test("a relay that is gone stops being the active one", async () => {
-    const { context, call } = makeContext()
-    const dispose = await plugin.setup(context as never)
-
-    await call("addRelay", { name: "local", url, access: ACCESS })
-    const status = (await call("status")) as { relays: readonly { id: string }[] }
-    await call("useRelay", { id: relayId(status) })
-    await call("setEnabled", { enabled: true })
-
-    const removed = (await call("removeRelay", { id: relayId(status) })) as { removed: boolean }
-    expect(removed.removed).toBe(true)
-
-    const after = (await call("status")) as { activeRelay?: unknown; note: string }
-    expect(after.activeRelay).toBeUndefined()
-    expect(after.note).toContain("no relay")
-
-    await dispose?.()
-  })
-
-  test("the access token never leaves the server", async () => {
-    const { context, call } = makeContext()
-    const dispose = await plugin.setup(context as never)
-
-    await call("addRelay", { name: "local", url, access: ACCESS })
-    const status = JSON.stringify(await call("status"))
-    expect(status).not.toContain(ACCESS)
-    expect(status).not.toContain("access")
-
-    await dispose?.()
-  })
-
-  test("offers the command in the prompt", async () => {
-    const { context, commands, emitted } = makeContext()
-    const dispose = await plugin.setup(context as never)
-
-    // The prompt offers the commands the server knows about, so this is where
-    // the command has to be, or /relay is nowhere to be found.
-    const command = commands.get("relay")
-    expect(command).toBeDefined()
-
-    // Running it asks the terminal part to open its menu: the server cannot
-    // open a dialog itself.
-    await command?.execute()
-    expect(emitted.some((entry) => entry.startsWith("menu:"))).toBe(true)
-
-    await dispose?.()
-  })
-
-  test("announces every change", async () => {
-    const { context, call, emitted } = makeContext()
-    const dispose = await plugin.setup(context as never)
-
-    await call("setEnabled", { enabled: true })
-    expect(emitted.some((entry) => entry.includes("routing enabled"))).toBe(true)
-
-    await dispose?.()
-  })
-
-  test("the first relay becomes the chosen one", async () => {
-    const { context, call } = makeContext()
-    const dispose = await plugin.setup(context as never)
-
-    const added = (await call("addRelay", { name: "local", url, access: ACCESS })) as { id: string }
-    const status = (await call("status")) as { activeRelay?: { id: string } }
-    expect(status.activeRelay?.id).toBe(added.id)
-
-    await dispose?.()
-  })
-
-  test("remembers the strategy across a restart", async () => {
-    const { context, store, call } = makeContext()
-    const dispose = await plugin.setup(context as never)
-    await call("setStrategy", { strategy: "round-robin" })
-    const status = (await call("status")) as { strategy: string }
-    expect(status.strategy).toBe("round-robin")
-    await dispose?.()
-
-    const again = makeContext()
-    for (const [key, value] of store) again.store.set(key, value)
-    const dispose2 = await plugin.setup(again.context as never)
-    const restored = (await again.call("status")) as { strategy: string }
-    expect(restored.strategy).toBe("round-robin")
-    await dispose2?.()
-  })
-
-  test("an installation from before the strategies keeps its rules", async () => {
-    const { context, store, call } = makeContext()
-    const dispose = await plugin.setup(context as never)
-    await call("addRelay", { name: "local", url, access: ACCESS })
-    await call("setEnabled", { enabled: true })
-    await call("setSelection", { selection: "custom", models: ["iceman-free"] })
-    await dispose?.()
-
-    // The strategy was added later, so an older stored value has no such key.
-    const settings = store.get("settings") as Record<string, unknown>
-    delete settings.strategy
-
-    const again = makeContext()
-    for (const [key, value] of store) again.store.set(key, value)
-    const dispose2 = await plugin.setup(again.context as never)
-    const status = (await again.call("status")) as {
-      enabled: boolean
-      selection: string
-      strategy: string
-      customModels: string[]
-    }
-    expect(status.enabled).toBe(true)
-    expect(status.selection).toBe("custom")
-    expect(status.customModels).toEqual(["iceman-free"])
-    expect(status.strategy).toBe("fixed")
-    await dispose2?.()
-  })
-
-  test("a stored choice that points at nothing falls back to the first relay", async () => {
-    const { context, store, call } = makeContext()
-    const dispose = await plugin.setup(context as never)
-    const added = (await call("addRelay", { name: "local", url, access: ACCESS })) as { id: string }
-    await dispose?.()
-
-    const settings = store.get("settings") as Record<string, unknown>
-    settings.activeRelayId = "relay-that-is-gone"
-
-    const again = makeContext()
-    for (const [key, value] of store) again.store.set(key, value)
-    const dispose2 = await plugin.setup(again.context as never)
-    const status = (await again.call("status")) as { activeRelay?: { id: string } }
-    expect(status.activeRelay?.id).toBe(added.id)
-    await dispose2?.()
-  })
-
-  test("round robin spreads requests and sidelines a relay that is used up", async () => {
-    const { context, hooks, call } = makeContext()
-    const dispose = await plugin.setup(context as never)
-
-    await call("addRelay", { name: "one", url, access: ACCESS })
-    await call("addRelay", { name: "two", url, access: ACCESS })
-    const status = (await call("status")) as { relays: readonly { id: string; name: string }[] }
-    const first = status.relays[0]
-    const second = status.relays[1]
-    if (!first || !second) throw new Error("the relays were not stored")
-
-    await call("setEnabled", { enabled: true })
-    await call("setSelection", { selection: "all" })
-    await call("setStrategy", { strategy: "round-robin" })
-
-    const send = async () => {
       const input = {
+        sessionID: "off",
         model: { id: "iceman-free", providerID: "opencode" },
         request: new Request("https://opencode.ai/inference/openai/v1/models"),
       }
-      await hooks.get("http.request")?.(input as never)
-      return input.request
+      await app.hooks.get("http.request")?.(input as never)
+      expect(input.request.url).toBe("https://opencode.ai/inference/openai/v1/models")
+    } finally {
+      await app.dispose()
     }
-
-    const one = await send()
-    const two = await send()
-    expect(one.headers.get("x-relay-id")).toBe(first.id)
-    expect(two.headers.get("x-relay-id")).toBe(second.id)
-
-    // The second relay answers 429, so it is the one that is used up, even
-    // though the first relay is the one the user chose.
-    const answer = new Response("free usage limit", {
-      status: 429,
-      headers: { "x-relay-egress": "9.9.9.9" },
-    })
-    await hooks.get("http.response")?.({
-      model: { id: "iceman-free", providerID: "opencode" },
-      request: two,
-      response: answer,
-    } as never)
-    const after = (await call("status")) as { exhausted: string[] }
-    expect(after.exhausted).toEqual([second.id])
-
-    // The next request skips the exhausted relay and lands on the first one.
-    const three = await send()
-    expect(three.headers.get("x-relay-id")).toBe(first.id)
-    expect(three.headers.get("x-relay-avoid")).toBeNull()
-
-    // Bringing it back makes it usable again, and its spent address is still
-    // avoided, because that is a fact about the address and not about the relay.
-    const restored = (await call("resetExhausted")) as { restored: string[] }
-    expect(restored.restored).toEqual([second.id])
-    // The rotation starts over, so the first request goes to the first relay
-    // and the next one reaches the relay that was just brought back.
-    const four = await send()
-    expect(four.headers.get("x-relay-id")).toBe(first.id)
-    const five = await send()
-    expect(five.headers.get("x-relay-id")).toBe(second.id)
-    expect(five.headers.get("x-relay-avoid")).toBe("9.9.9.9")
-    const clean = (await call("status")) as { exhausted: string[] }
-    expect(clean.exhausted).toEqual([])
-
-    await dispose?.()
   })
 
-  test("removing the chosen relay hands the choice to the next one", async () => {
-    const { context, call } = makeContext()
-    const dispose = await plugin.setup(context as never)
+  test("leaves requests for other providers alone", async () => {
+    const app = await start()
+    try {
+      await app.call("addRelay", { name: "local", url, access: ACCESS })
+      const status = (await app.call("status")) as StatusAnswer
+      await app.call("useExit", { id: firstExit(status).id })
+      await app.call("setEnabled", { enabled: true })
 
-    const one = (await call("addRelay", { name: "one", url, access: ACCESS })) as { id: string }
-    const two = (await call("addRelay", { name: "two", url, access: ACCESS })) as { id: string }
-    await call("useRelay", { id: one.id })
-    const removed = (await call("removeRelay", { id: one.id, deleteProject: false })) as {
-      removed: boolean
-      projectDeleted: boolean
+      const input = {
+        sessionID: "other",
+        model: { id: "claude", providerID: "anthropic" },
+        request: new Request("https://api.anthropic.com/v1/messages"),
+      }
+      await app.hooks.get("http.request")?.(input as never)
+      expect(input.request.url).toBe("https://api.anthropic.com/v1/messages")
+    } finally {
+      await app.dispose()
     }
-    expect(removed).toEqual({ removed: true, projectDeleted: false })
-
-    const status = (await call("status")) as { activeRelay?: { id: string } }
-    expect(status.activeRelay?.id).toBe(two.id)
-
-    await dispose?.()
   })
 
-  test("a used-up answer is retried on the one-relay strategy too", async () => {
-    const { context, hooks, call } = makeContext()
-    const dispose = await plugin.setup(context as never)
+  test("routes a free model through the relay", async () => {
+    const app = await start()
+    try {
+      await app.call("addRelay", { name: "local", url, access: ACCESS })
+      const status = (await app.call("status")) as StatusAnswer
+      const id = firstExit(status).id
+      await app.call("useExit", { id })
+      await app.call("setEnabled", { enabled: true })
 
-    const only = (await call("addRelay", { name: "only", url, access: ACCESS })) as { id: string }
-    await call("useRelay", { id: only.id })
-    await call("setEnabled", { enabled: true })
-    await call("setSelection", { selection: "all" })
-    expect(((await call("status")) as { strategy: string }).strategy).toBe("fixed")
+      const input = {
+        sessionID: "routed",
+        model: { id: "iceman-free", providerID: "opencode" },
+        request: new Request("https://opencode.ai/inference/openai/v1/models"),
+      }
+      await app.hooks.get("http.request")?.(input as never)
 
-    const request = {
-      sessionID: "session-fixed",
-      model: { id: "iceman-free", providerID: "opencode" },
-      request: new Request("https://opencode.ai/inference/openai/v1/models"),
+      expect(input.request.url).toBe(`${url}/`)
+      expect(input.request.headers.get("x-relay-target")).toBe("https://opencode.ai")
+      expect(input.request.headers.get("x-relay-path")).toBe("/inference/openai/v1/models")
+      expect(input.request.headers.get("x-relay-key")).toBe(ACCESS)
+      expect(input.request.headers.get("x-relay-id")).toBe(id)
+
+      const after = (await app.call("status")) as StatusAnswer
+      expect(after.lastDecision).toMatchObject({ modelId: "iceman-free", routed: true, exitId: id })
+      expect(after.exits[0]?.status).toBe("reachable")
+    } finally {
+      await app.dispose()
     }
-    await hooks.get("http.request")?.(request as never)
-    expect(request.request.headers.get("x-relay-id")).toBe(only.id)
-
-    const limited: {
-      sessionID: string
-      model: { id: string }
-      error: { status: number; response: { body: string } }
-      attempt: number
-      decision: { retry: boolean; delay?: number }
-    } = {
-      sessionID: "session-fixed",
-      model: { id: "iceman-free" },
-      error: { status: 429, response: { body: '{"error":{"message":"Free usage limit reached"}}' } },
-      attempt: 1,
-      decision: { retry: false },
-    }
-    await hooks.get("retry")?.(limited as never)
-    expect(limited.decision).toEqual({ retry: true, delay: ROTATE_DELAY_MS })
-
-    await dispose?.()
   })
 
-  test("asks for another attempt when the instance behind the relay is used up", async () => {
-    const { context, hooks, call } = makeContext()
-    const dispose = await plugin.setup(context as never)
-    const retry = hooks.get("retry")
+  test("a paid model stays direct, and a listed paid model is dropped", async () => {
+    const app = await start()
+    try {
+      await app.call("addRelay", { name: "local", url, access: ACCESS })
+      const status = (await app.call("status")) as StatusAnswer
+      await app.call("useExit", { id: firstExit(status).id })
+      await app.call("setEnabled", { enabled: true })
 
-    // Only a request this plugin routed can be blamed on a relay.
-    const directRotation = {
-      sessionID: "session-direct",
-      model: { id: "iceman-free" },
-      error: { status: 409 },
-      attempt: 1,
-      decision: { retry: false },
+      const chosen = (await app.call("setSelection", {
+        selection: "custom",
+        models: ["iceman-free", "gpt-6.1-sol"],
+      })) as { customModels: string[]; dropped: string[] }
+      expect(chosen.customModels).toEqual(["iceman-free"])
+      expect(chosen.dropped).toEqual(["gpt-6.1-sol"])
+
+      const paid = {
+        sessionID: "paid",
+        model: { id: "gpt-6.1-sol", providerID: "opencode" },
+        request: new Request("https://opencode.ai/inference/openai/v1/models"),
+      }
+      await app.hooks.get("http.request")?.(paid as never)
+      expect(paid.request.url).toBe("https://opencode.ai/inference/openai/v1/models")
+
+      // A custom free model still routes: the price is looked up for both
+      // selections, not only for the all-free one.
+      const free = {
+        sessionID: "custom",
+        model: { id: "iceman-free", providerID: "opencode" },
+        request: new Request("https://opencode.ai/inference/openai/v1/models"),
+      }
+      await app.hooks.get("http.request")?.(free as never)
+      expect(free.request.url).toBe(`${url}/`)
+    } finally {
+      await app.dispose()
     }
-    await retry?.(directRotation as never)
-    expect(directRotation.decision).toEqual({ retry: false })
-
-    await call("addRelay", { name: "local", url, access: ACCESS })
-    await call("setEnabled", { enabled: true })
-    await call("setSelection", { selection: "all" })
-    const request = {
-      sessionID: "session-1",
-      model: { id: "iceman-free", providerID: "opencode" },
-      request: new Request("https://opencode.ai/inference/openai/v1/models"),
-    }
-    await hooks.get("http.request")?.(request as never)
-
-    // The instance behind the relay is used up, so another attempt is asked
-    // for, and the attempt count is not allowed to grow without end.
-    const first: {
-      sessionID: string
-      model: { id: string }
-      error: { status: number }
-      attempt: number
-      decision: { retry: boolean; delay?: number }
-    } = {
-      sessionID: "session-1",
-      model: { id: "iceman-free" },
-      error: { status: 409 },
-      attempt: 1,
-      decision: { retry: false },
-    }
-    await retry?.(first as never)
-    expect(first.decision).toEqual({ retry: true, delay: ROTATE_DELAY_MS })
-
-    const last = {
-      sessionID: "session-1",
-      model: { id: "iceman-free" },
-      error: { status: 409 },
-      attempt: 9,
-      decision: { retry: false },
-    }
-    await retry?.(last as never)
-    expect(last.decision).toEqual({ retry: false })
-
-    const limited: {
-      sessionID: string
-      model: { id: string }
-      error: { status: number; response: { body: string } }
-      attempt: number
-      decision: { retry: boolean; delay?: number }
-    } = {
-      sessionID: "session-1",
-      model: { id: "iceman-free" },
-      error: { status: 429, response: { body: '{"error":{"message":"Free usage limit reached"}}' } },
-      attempt: 1,
-      decision: { retry: false },
-    }
-    await retry?.(limited as never)
-    expect(limited.decision).toEqual({ retry: true, delay: ROTATE_DELAY_MS })
-
-    // The same answer for a request that never went through a relay is not the
-    // relay's fault, so nothing is retried.
-    const direct = {
-      sessionID: "session-2",
-      model: { id: "gpt-6.1-sol" },
-      error: { status: 429, response: { body: '{"error":{"message":"Free usage limit reached"}}' } },
-      attempt: 1,
-      decision: { retry: false },
-    }
-    await retry?.(direct as never)
-    expect(direct.decision).toEqual({ retry: false })
-
-    await dispose?.()
   })
 
-  test("never routes through a relay that did not answer", async () => {
-    const { context, hooks, call } = makeContext()
-    const dispose = await plugin.setup(context as never)
+  test.skipIf(!online)("a routed request really comes back from OpenCode", async () => {
+    const app = await start()
+    try {
+      await app.call("addRelay", { name: "local", url, access: ACCESS })
+      const status = (await app.call("status")) as StatusAnswer
+      await app.call("useExit", { id: firstExit(status).id })
+      await app.call("setEnabled", { enabled: true })
 
-    // Port 9 is the discard port: nothing listens there, so the check fails.
-    const dead = (await call("addRelay", {
-      name: "dead end",
-      url: "http://127.0.0.1:9",
-      access: ACCESS,
-    })) as { id: string; reachable: boolean }
-    expect(dead.reachable).toBe(false)
-    await call("useRelay", { id: dead.id })
-    await call("setEnabled", { enabled: true })
-    await call("setSelection", { selection: "all" })
+      const input = {
+        sessionID: "real",
+        model: { id: "iceman-free", providerID: "opencode" },
+        request: new Request("https://opencode.ai/inference/openai/v1/models"),
+      }
+      await app.hooks.get("http.request")?.(input as never)
 
-    const input = {
-      sessionID: "session-dead",
-      model: { id: "iceman-free", providerID: "opencode" },
-      request: new Request("https://opencode.ai/inference/openai/v1/models"),
+      const answer = await fetch(input.request)
+      expect(answer.status).toBe(200)
+      const body = (await answer.json()) as { data: { id: string }[] }
+      expect(body.data.length).toBeGreaterThan(0)
+      expect(answer.headers.get("x-relay-runtime")).toBeTruthy()
+    } finally {
+      await app.dispose()
     }
-    await hooks.get("http.request")?.(input as never)
-    // The session keeps working: the request goes where it would have gone
-    // without the plugin, rather than to a relay that cannot answer.
-    expect(input.request.url).toBe("https://opencode.ai/inference/openai/v1/models")
-
-    const status = (await call("status")) as { skipped: readonly string[]; note?: string }
-    expect(status.skipped).toContain(dead.id)
-    expect(status.note).toContain("dead end did not answer")
-    expect(status.note).toContain("requests go direct")
-
-    await dispose?.()
   })
 
-  test("a relay that cannot be reached is skipped after one failed request", async () => {
-    const { context, hooks, call } = makeContext()
-    const dispose = await plugin.setup(context as never)
-
-    await call("addRelay", { name: "local", url, access: ACCESS })
-    const status = (await call("status")) as { relays: readonly { id: string }[] }
-    const id = relayId(status)
-    await call("useRelay", { id })
-    await call("setEnabled", { enabled: true })
-    await call("setSelection", { selection: "all" })
-
-    const first = {
-      sessionID: "session-1",
-      model: { id: "iceman-free", providerID: "opencode" },
-      request: new Request("https://opencode.ai/inference/openai/v1/models"),
+  test("remembers the exits and the rules across a restart", async () => {
+    const app = await start()
+    let id = ""
+    try {
+      const added = (await app.call("addRelay", { name: "local", url, access: ACCESS })) as { id: string }
+      id = added.id
+      await app.call("useExit", { id })
+      await app.call("setEnabled", { enabled: true })
+      await app.call("setSelection", { selection: "custom", models: ["iceman-free"] })
+      await app.call("setStrategy", { strategy: "round-robin" })
+      await app.call("setDirect", { direct: "never" })
+      await app.call("setHealthChecks", { enabled: false })
+    } finally {
+      await app.dispose()
     }
-    await hooks.get("http.request")?.(first as never)
-    expect(first.request.url).toContain(url)
 
-    // A failure with no status never reached the relay. Another attempt is
-    // asked for, and the relay is left alone for a while.
-    const retryInput: {
-      sessionID: string
-      model: { id: string }
-      error: { status?: number; message: string }
-      attempt: number
-      decision: { retry: boolean; delay?: number }
-    } = {
-      sessionID: "session-1",
-      model: { id: "iceman-free" },
-      error: { message: "fetch failed" },
-      attempt: 1,
-      decision: { retry: false },
+    const again = await start(true, app.store)
+    try {
+      const restored = (await again.call("status")) as StatusAnswer
+      expect(restored.enabled).toBe(true)
+      expect(restored.selection).toBe("custom")
+      expect(restored.customModels).toEqual(["iceman-free"])
+      expect(restored.activeExit?.id).toBe(id)
+      expect(restored.strategy).toBe("round-robin")
+      expect(restored.direct).toBe("never")
+      expect(restored.healthChecks).toBe(false)
+    } finally {
+      await again.dispose()
     }
-    await hooks.get("retry")?.(retryInput as never)
-    expect(retryInput.decision).toEqual({ retry: true, delay: ROTATE_DELAY_MS })
-
-    const second = {
-      sessionID: "session-1",
-      model: { id: "iceman-free", providerID: "opencode" },
-      request: new Request("https://opencode.ai/inference/openai/v1/models"),
-    }
-    await hooks.get("http.request")?.(second as never)
-    expect(second.request.url).toBe("https://opencode.ai/inference/openai/v1/models")
-
-    const after = (await call("status")) as { skipped: readonly string[] }
-    expect(after.skipped).toContain(id)
-
-    await dispose?.()
   })
 
-  test("a relay that answers with a server error is skipped too", async () => {
-    const { context, hooks, call } = makeContext()
-    const dispose = await plugin.setup(context as never)
-
-    await call("addRelay", { name: "local", url, access: ACCESS })
-    const status = (await call("status")) as { relays: readonly { id: string }[] }
-    const id = relayId(status)
-    await call("useRelay", { id })
-    await call("setEnabled", { enabled: true })
-    await call("setSelection", { selection: "all" })
-
-    const input = {
-      sessionID: "session-1",
-      model: { id: "iceman-free", providerID: "opencode" },
-      request: new Request("https://opencode.ai/inference/openai/v1/models"),
+  test("an installation from before the new rules keeps its choices", async () => {
+    const app = await start()
+    let id = ""
+    try {
+      const added = (await app.call("addRelay", { name: "local", url, access: ACCESS })) as { id: string }
+      id = added.id
+      await app.call("setEnabled", { enabled: true })
+      await app.call("setSelection", { selection: "custom", models: ["iceman-free"] })
+    } finally {
+      await app.dispose()
     }
-    await hooks.get("http.request")?.(input as never)
 
-    const retryInput: {
-      sessionID: string
-      model: { id: string }
-      error: { status: number; message: string }
-      attempt: number
-      decision: { retry: boolean; delay?: number }
-    } = {
-      sessionID: "session-1",
-      model: { id: "iceman-free" },
-      error: { status: 502, message: "Upstream request failed" },
-      attempt: 1,
-      decision: { retry: false },
+    // Older versions wrote "all", no strategy, no direct policy, no health
+    // flag, and called the chosen exit activeRelayId.
+    const settings = app.store.get("settings") as Record<string, unknown>
+    settings.selection = "all"
+    delete settings.strategy
+    delete settings.direct
+    delete settings.healthChecks
+    delete settings.activeExitId
+    settings.activeRelayId = id
+
+    const again = await start(true, app.store)
+    try {
+      const status = (await again.call("status")) as StatusAnswer
+      expect(status.selection).toBe("free")
+      expect(status.strategy).toBe("fixed")
+      expect(status.direct).toBe("allow")
+      expect(status.healthChecks).toBe(true)
+      expect(status.activeExit?.id).toBe(id)
+    } finally {
+      await again.dispose()
     }
-    await hooks.get("retry")?.(retryInput as never)
-    expect(retryInput.decision).toEqual({ retry: true, delay: ROTATE_DELAY_MS })
-
-    const after = (await call("status")) as { skipped: readonly string[] }
-    expect(after.skipped).toContain(id)
-
-    await dispose?.()
   })
 
-  test("a test of a relay says whether it answered and how fast", async () => {
-    const { context, call } = makeContext()
-    const dispose = await plugin.setup(context as never)
-
-    const added = (await call("addRelay", { name: "local", url, access: ACCESS })) as { id: string }
-    const result = (await call("testRelay", { id: added.id })) as {
-      reachable: boolean
-      status: number
-      ms: number
+  test("a stored choice that points at nothing falls back to the first exit", async () => {
+    const app = await start()
+    let id = ""
+    try {
+      const added = (await app.call("addRelay", { name: "local", url, access: ACCESS })) as { id: string }
+      id = added.id
+    } finally {
+      await app.dispose()
     }
-    expect(result.reachable).toBe(true)
-    expect(result.status).toBe(200)
-    expect(result.ms).toBeGreaterThanOrEqual(0)
 
-    await dispose?.()
+    const settings = app.store.get("settings") as Record<string, unknown>
+    settings.activeExitId = "exit-that-is-gone"
+
+    const again = await start(true, app.store)
+    try {
+      const status = (await again.call("status")) as StatusAnswer
+      expect(status.activeExit?.id).toBe(id)
+    } finally {
+      await again.dispose()
+    }
+  })
+
+  test("the access token and a proxy password never leave the server", async () => {
+    const app = await start()
+    try {
+      await app.call("addRelay", { name: "local", url, access: ACCESS })
+      await app.call("addProxies", { text: "alice:secret@1.2.3.4:8080" })
+      const status = JSON.stringify(await app.call("status"))
+      expect(status).not.toContain(ACCESS)
+      expect(status).not.toContain("secret")
+      expect(status).not.toContain("alice")
+      // The proxy is still listed, with its credentials taken out.
+      const answer = (await app.call("status")) as StatusAnswer
+      expect(answer.exits.some((exit) => exit.kind === "proxy" && exit.url.includes("***@"))).toBe(true)
+    } finally {
+      await app.dispose()
+    }
+  })
+
+  test("the first exit becomes the chosen one, and removing it hands the choice on", async () => {
+    const app = await start()
+    try {
+      const one = (await app.call("addRelay", { name: "one", url, access: ACCESS })) as { id: string }
+      const two = (await app.call("addRelay", { name: "two", url, access: ACCESS })) as { id: string }
+      const status = (await app.call("status")) as StatusAnswer
+      expect(status.activeExit?.id).toBe(one.id)
+
+      await app.call("useExit", { id: one.id })
+      const removed = (await app.call("removeRelay", { id: one.id, deleteProject: false })) as {
+        removed: boolean
+        projectDeleted: boolean
+      }
+      expect(removed).toEqual({ removed: true, projectDeleted: false })
+
+      const after = (await app.call("status")) as StatusAnswer
+      expect(after.activeExit?.id).toBe(two.id)
+      expect(after.note).not.toContain("no relay")
+    } finally {
+      await app.dispose()
+    }
+  })
+
+  test("round robin spreads the requests over the exits", async () => {
+    const app = await start()
+    try {
+      const one = (await app.call("addRelay", { name: "one", url, access: ACCESS })) as { id: string }
+      const two = (await app.call("addRelay", { name: "two", url, access: ACCESS })) as { id: string }
+      await app.call("setEnabled", { enabled: true })
+      await app.call("setStrategy", { strategy: "round-robin" })
+
+      const send = async (sessionID: string) => {
+        const input = {
+          sessionID,
+          model: { id: "iceman-free", providerID: "opencode" },
+          request: new Request("https://opencode.ai/inference/openai/v1/models"),
+        }
+        await app.hooks.get("http.request")?.(input as never)
+        return input.request
+      }
+
+      const first = await send("rr-1")
+      const second = await send("rr-2")
+      const third = await send("rr-3")
+
+      expect(first.headers.get("x-relay-id")).toBe(one.id)
+      expect(second.headers.get("x-relay-id")).toBe(two.id)
+      expect(third.headers.get("x-relay-id")).toBe(one.id)
+    } finally {
+      await app.dispose()
+    }
+  })
+
+  test("a relay that asks for another instance is retired and the next one serves", async () => {
+    const app = await start()
+    try {
+      const one = (await app.call("addRelay", { name: "one", url, access: ACCESS })) as { id: string }
+      const two = (await app.call("addRelay", { name: "two", url, access: ACCESS })) as { id: string }
+      await app.call("useExit", { id: one.id })
+      await app.call("setEnabled", { enabled: true })
+
+      const request = relayRequest(
+        new Request("https://opencode.ai/inference/openai/v1/models"),
+        { url, access: ACCESS, id: one.id },
+      )
+      await app.hooks.get("http.response")?.({
+        sessionID: "rotate",
+        model: { id: "iceman-free", providerID: "opencode" },
+        request,
+        response: new Response("{}", {
+          status: 409,
+          headers: {
+            "x-relay-rotate": "1",
+            "x-relay-egress": "203.0.113.9",
+            "x-relay-runtime": "bun",
+          },
+        }),
+      } as never)
+
+      const retired = (await app.call("status")) as StatusAnswer
+      expect(retired.exhausted).toEqual([one.id])
+      expect(retired.exits.find((exit) => exit.id === one.id)?.status).toBe("exhausted")
+
+      const next = {
+        sessionID: "rotate-next",
+        model: { id: "iceman-free", providerID: "opencode" },
+        request: new Request("https://opencode.ai/inference/openai/v1/models"),
+      }
+      await app.hooks.get("http.request")?.(next as never)
+      expect(next.request.headers.get("x-relay-id")).toBe(two.id)
+
+      // Bringing it back does not forget the address that was used up: the
+      // relay is asked to avoid it on the next attempt.
+      await app.call("resetExhausted")
+      const again = {
+        sessionID: "rotate-back",
+        model: { id: "iceman-free", providerID: "opencode" },
+        request: new Request("https://opencode.ai/inference/openai/v1/models"),
+      }
+      await app.hooks.get("http.request")?.(again as never)
+      expect(again.request.headers.get("x-relay-id")).toBe(one.id)
+      expect(again.request.headers.get("x-relay-avoid")).toBe("203.0.113.9")
+    } finally {
+      await app.dispose()
+    }
+  })
+
+  test("a 429 is only a suspicion until a canary agrees", async () => {
+    const app = await start()
+    try {
+      const added = (await app.call("addRelay", { name: "local", url, access: ACCESS })) as { id: string }
+      await app.call("useExit", { id: added.id })
+      await app.call("setEnabled", { enabled: true })
+
+      // No request was routed in this session, so there is no real request to
+      // shape a canary from. The safe verdict is a rest, not a retirement.
+      const request = relayRequest(
+        new Request("https://opencode.ai/inference/openai/v1/models"),
+        { url, access: ACCESS, id: added.id },
+      )
+      await app.hooks.get("http.response")?.({
+        sessionID: "suspect",
+        model: { id: "iceman-free", providerID: "opencode" },
+        request,
+        response: new Response('{"error":{"message":"Free usage limit reached"}}', {
+          status: 429,
+          headers: { "x-relay-egress": "203.0.113.11" },
+        }),
+      } as never)
+
+      const after = (await app.call("status")) as StatusAnswer
+      expect(after.exhausted).toEqual([])
+      expect(after.skipped).toContain(added.id)
+      expect(after.exits.find((exit) => exit.id === added.id)?.status).toBe("limited")
+
+      // A refused request is not retried through another address: the request
+      // was the problem, not the exit.
+      const retry = {
+        sessionID: "suspect",
+        model: { id: "iceman-free" },
+        error: {
+          status: 429,
+          response: { body: '{"error":{"message":"Free usage limit reached"}}' },
+        },
+        attempt: 1,
+        decision: { retry: false },
+      }
+      await app.hooks.get("retry")?.(retry as never)
+      expect(retry.decision).toEqual({ retry: false })
+    } finally {
+      await app.dispose()
+    }
+  })
+
+  test("a relay that did not answer is never used", async () => {
+    const app = await start()
+    try {
+      // Port 9 is the discard port: nothing listens there, so the probe fails.
+      const dead = (await app.call("addRelay", {
+        name: "dead end",
+        url: "http://127.0.0.1:9",
+        access: ACCESS,
+      })) as { id: string; reachable: boolean }
+      expect(dead.reachable).toBe(false)
+      await app.call("useExit", { id: dead.id })
+      await app.call("setEnabled", { enabled: true })
+
+      const input = {
+        sessionID: "dead",
+        model: { id: "iceman-free", providerID: "opencode" },
+        request: new Request("https://opencode.ai/inference/openai/v1/models"),
+      }
+      await app.hooks.get("http.request")?.(input as never)
+      expect(input.request.url).toBe("https://opencode.ai/inference/openai/v1/models")
+
+      const status = (await app.call("status")) as StatusAnswer
+      expect(status.exits.find((exit) => exit.id === dead.id)?.status).toBe("unreachable")
+      expect(status.skipped).not.toContain(dead.id)
+      expect(status.note).toContain("no exit can serve")
+    } finally {
+      await app.dispose()
+    }
+  })
+
+  test("a transport failure rests the exit, and the next request goes direct", async () => {
+    const app = await start()
+    try {
+      await app.call("addRelay", { name: "local", url, access: ACCESS })
+      const status = (await app.call("status")) as StatusAnswer
+      const id = firstExit(status).id
+      await app.call("useExit", { id })
+      await app.call("setEnabled", { enabled: true })
+
+      const first = {
+        sessionID: "transport",
+        model: { id: "iceman-free", providerID: "opencode" },
+        request: new Request("https://opencode.ai/inference/openai/v1/models"),
+      }
+      await app.hooks.get("http.request")?.(first as never)
+      expect(first.request.url).toContain(url)
+
+      const retry = {
+        sessionID: "transport",
+        model: { id: "iceman-free" },
+        error: { message: "fetch failed" },
+        attempt: 1,
+        decision: { retry: false } as { retry: boolean; delay?: number },
+      }
+      await app.hooks.get("retry")?.(retry as never)
+      expect(retry.decision).toEqual({ retry: true, delay: ROTATE_DELAY_MS })
+
+      const second = {
+        sessionID: "transport",
+        model: { id: "iceman-free", providerID: "opencode" },
+        request: new Request("https://opencode.ai/inference/openai/v1/models"),
+      }
+      await app.hooks.get("http.request")?.(second as never)
+      expect(second.request.url).toBe("https://opencode.ai/inference/openai/v1/models")
+
+      const after = (await app.call("status")) as StatusAnswer
+      expect(after.skipped).toContain(id)
+    } finally {
+      await app.dispose()
+    }
+  })
+
+  test("a server error is retried and the exit is rested", async () => {
+    const app = await start()
+    try {
+      await app.call("addRelay", { name: "local", url, access: ACCESS })
+      const status = (await app.call("status")) as StatusAnswer
+      const id = firstExit(status).id
+      await app.call("useExit", { id })
+      await app.call("setEnabled", { enabled: true })
+
+      await app.hooks.get("http.request")?.({
+        sessionID: "failing",
+        model: { id: "iceman-free", providerID: "opencode" },
+        request: new Request("https://opencode.ai/inference/openai/v1/models"),
+      } as never)
+
+      const retry = {
+        sessionID: "failing",
+        model: { id: "iceman-free" },
+        error: { status: 502, message: "Upstream request failed" },
+        attempt: 1,
+        decision: { retry: false } as { retry: boolean; delay?: number },
+      }
+      await app.hooks.get("retry")?.(retry as never)
+      expect(retry.decision).toEqual({ retry: true, delay: ROTATE_DELAY_MS })
+
+      const after = (await app.call("status")) as StatusAnswer
+      expect(after.skipped).toContain(id)
+    } finally {
+      await app.dispose()
+    }
+  })
+
+  test("a retry is never asked for a request this plugin did not route", async () => {
+    const app = await start()
+    try {
+      const retry = {
+        sessionID: "direct",
+        model: { id: "iceman-free" },
+        error: { status: 409 },
+        attempt: 1,
+        decision: { retry: false },
+      }
+      await app.hooks.get("retry")?.(retry as never)
+      expect(retry.decision).toEqual({ retry: false })
+    } finally {
+      await app.dispose()
+    }
+  })
+
+  test("direct routing can be forbidden", async () => {
+    const app = await start()
+    try {
+      await app.call("setEnabled", { enabled: true })
+      await app.call("setDirect", { direct: "never" })
+
+      const input = {
+        sessionID: "never",
+        model: { id: "iceman-free", providerID: "opencode" },
+        request: new Request("https://opencode.ai/inference/openai/v1/models"),
+      }
+      await expect(app.hooks.get("http.request")?.(input as never)).rejects.toThrow(
+        /never go direct/i,
+      )
+      expect(input.request.url).toBe("https://opencode.ai/inference/openai/v1/models")
+    } finally {
+      await app.dispose()
+    }
+  })
+
+  test("the preview says where the next request would go, and why not elsewhere", async () => {
+    const app = await start()
+    try {
+      await app.call("addRelay", { name: "local", url, access: ACCESS })
+      await app.call("setEnabled", { enabled: true })
+      const preview = (await app.call("preview", {})) as {
+        routed: boolean
+        reason: string
+        exit?: { id: string }
+        skipped: readonly { name: string; reason: string }[]
+      }
+      expect(preview.routed).toBe(true)
+      expect(preview.exit).toBeDefined()
+      expect(preview.reason).toContain("through")
+
+      await app.call("setEnabled", { enabled: false })
+      const off = (await app.call("preview", {})) as { routed: boolean; reason: string }
+      expect(off.routed).toBe(false)
+      expect(off.reason).toContain("Routing is off")
+    } finally {
+      await app.dispose()
+    }
+  })
+
+  test("a proxy list is read, deduplicated and reported", async () => {
+    const app = await start()
+    try {
+      const added = (await app.call("addProxies", {
+        text: `
+          1.2.3.4:8080
+          socks5://5.6.7.8:1080
+          http://1.2.3.4:8080
+          notaproxy
+        `,
+      })) as {
+        added: readonly { id: string; name: string; url: string }[]
+        invalid: readonly { value: string; reason: string }[]
+        duplicates: number
+      }
+
+      expect(added.added).toHaveLength(2)
+      expect(added.duplicates).toBe(1)
+      expect(added.invalid).toHaveLength(1)
+      expect(added.added[0]?.url).toBe("http://1.2.3.4:8080")
+
+      const status = (await app.call("status")) as StatusAnswer
+      expect(status.exits.filter((exit) => exit.kind === "proxy")).toHaveLength(2)
+
+      const proxy = status.exits.find((exit) => exit.kind === "proxy")
+      if (!proxy) throw new Error("the proxy was not stored")
+      const removed = (await app.call("removeExit", { id: proxy.id })) as { removed: boolean }
+      expect(removed.removed).toBe(true)
+      const after = (await app.call("status")) as StatusAnswer
+      expect(after.exits.some((exit) => exit.id === proxy.id)).toBe(false)
+    } finally {
+      await app.dispose()
+    }
+  })
+
+  test("a proxy can be paused, resumed and edited", async () => {
+    const app = await start()
+    try {
+      const added = (await app.call("addProxies", { text: "1.2.3.4:8080" })) as {
+        added: readonly { id: string }[]
+      }
+      const id = added.added[0]?.id
+      if (!id) throw new Error("the proxy was not added")
+
+      await app.call("setExitEnabled", { id, enabled: false })
+      let status = (await app.call("status")) as StatusAnswer
+      expect(status.paused).toContain(id)
+      expect(status.exits.find((exit) => exit.id === id)?.enabled).toBe(false)
+
+      await app.call("setExitEnabled", { id, enabled: true })
+      status = (await app.call("status")) as StatusAnswer
+      expect(status.paused).not.toContain(id)
+
+      const updated = (await app.call("updateProxy", {
+        id,
+        name: "home proxy",
+        url: "socks5://user:pass@9.9.9.9:1080",
+      })) as { updated: boolean }
+      expect(updated.updated).toBe(true)
+
+      status = (await app.call("status")) as StatusAnswer
+      const proxy = status.exits.find((exit) => exit.id === id)
+      expect(proxy?.name).toBe("home proxy")
+      expect(proxy?.url).toBe("socks5://***@9.9.9.9:1080")
+      expect(proxy?.status).toBe("untested")
+    } finally {
+      await app.dispose()
+    }
+  })
+
+  test("export and import move exits and rules, but never accounts", async () => {
+    const source = await start()
+    let json = ""
+    try {
+      await source.call("addRelay", { name: "local", url, access: ACCESS })
+      await source.call("setEnabled", { enabled: true })
+      await source.call("setStrategy", { strategy: "fastest" })
+      await source.call("addProxies", { text: "1.2.3.4:8080" })
+      const exported = (await source.call("exportConfig", {})) as { json: string }
+      json = exported.json
+      expect(json).toContain(ACCESS)
+    } finally {
+      await source.dispose()
+    }
+
+    const target = await start()
+    try {
+      const imported = (await target.call("importConfig", { json })) as {
+        relays: number
+        proxies: number
+        invalid: number
+      }
+      expect(imported).toEqual({ relays: 1, proxies: 1, invalid: 0 })
+
+      const status = (await target.call("status")) as StatusAnswer
+      expect(status.enabled).toBe(false)
+      expect(status.strategy).toBe("fastest")
+      expect(status.exits).toHaveLength(2)
+      expect(status.exits.some((exit) => exit.kind === "relay")).toBe(true)
+      expect(status.exits.some((exit) => exit.kind === "proxy")).toBe(true)
+    } finally {
+      await target.dispose()
+    }
+  })
+
+  test("a test of an exit says whether OpenCode can be reached through it", async () => {
+    const app = await start()
+    try {
+      const added = (await app.call("addRelay", { name: "local", url, access: ACCESS })) as { id: string }
+      const result = (await app.call("testExit", { id: added.id })) as {
+        ok: boolean
+        status: string
+        code: number
+        ms: number
+        egress?: string
+      }
+      // The API check reaches the real provider; without a network it can only
+      // say the exit itself did not answer.
+      if (online) {
+        expect(result.ok).toBe(true)
+        expect(result.status).toBe("reachable")
+        expect(result.code).toBe(200)
+        expect(result.ms).toBeGreaterThanOrEqual(0)
+      } else {
+        expect(result.ok).toBe(false)
+      }
+    } finally {
+      await app.dispose()
+    }
+  })
+
+  test("an unknown exit tests as unknown instead of throwing", async () => {
+    const app = await start()
+    try {
+      const result = (await app.call("testExit", { id: "not-there" })) as {
+        ok: boolean
+        status: string
+      }
+      expect(result.ok).toBe(false)
+      expect(result.status).toBe("unknown")
+    } finally {
+      await app.dispose()
+    }
+  })
+
+  test("the command asks the terminal to open its menu", async () => {
+    const app = await start()
+    try {
+      const command = app.commands.get("relay")
+      expect(command).toBeDefined()
+      await command?.execute()
+      expect(app.emitted.some((entry) => entry.startsWith("menu:"))).toBe(true)
+    } finally {
+      await app.dispose()
+    }
+  })
+
+  test("announces every change", async () => {
+    const app = await start()
+    try {
+      await app.call("setEnabled", { enabled: true })
+      expect(app.emitted.some((entry) => entry.includes("routing enabled"))).toBe(true)
+    } finally {
+      await app.dispose()
+    }
   })
 })

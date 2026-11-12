@@ -60,3 +60,20 @@ Changes made in this repository:
 - The address a relay instance uses is looked up through `RELAY_TRACE_URL`,
   which defaults to the address lookup Polygate used and exists so the tests
   do not depend on that service.
+
+## Polygate SOCKS bridge
+
+`src/server/socks-bridge.ts` is adapted from Polygate's
+`backend/socks-bridge.ts`. The MIT license text above covers this file too.
+
+Changes made in this repository:
+
+- The module is smaller: it starts one loopback bridge per proxy on first use,
+  sweeps idle bridges, and caps the number of live bridges at 64.
+- There is no pool scanner or health probing. The plugin only dials proxies the
+  user added.
+- The public surface is reduced to `socksBridge`, `parseSocksUrl`,
+  `closeSocksBridges`, and the SOCKS4/SOCKS5 connect helpers.
+- Target restrictions, the proxy credentials handling, and the HTTP CONNECT
+  behavior are unchanged; the plugin's `src/server/bridge.ts` additionally
+  restricts targets to `opencode.ai`.

@@ -72,11 +72,11 @@ export class ModelCatalog {
   /**
    * The model a request is for, in the shape the routing rules understand.
    *
-   * The price is only needed to tell a free model from a paid one, so the caller
-   * only brings a list when the selection depends on it.
+   * The price is needed for both selections: even a model on the custom list
+   * is only routed when it is free. Looking the model up by id is what brings
+   * that price along.
    */
-  resolve(models: readonly RoutableModel[], modelId: string, selection: Selection): RoutableModel {
-    if (selection !== "free") return { id: modelId, name: modelId }
+  resolve(models: readonly RoutableModel[], modelId: string, _selection: Selection): RoutableModel {
     const known = models.find((model) => model.id === modelId)
     return known ?? { id: modelId, name: modelId }
   }

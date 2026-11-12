@@ -34,6 +34,7 @@ export interface RelayProbe {
   readonly ms: number
   readonly egress?: string
   readonly runtime?: string
+  readonly instance?: string
 }
 
 const BASE = "https://api.vercel.com"
@@ -310,12 +311,14 @@ export async function probeRelay(url: string, access: string): Promise<RelayProb
     const obj = data && typeof data === "object" ? (data as Record<string, unknown>) : undefined
     const egress = typeof obj?.["egress"] === "string" ? (obj["egress"] as string) : undefined
     const runtime = typeof obj?.["runtime"] === "string" ? (obj["runtime"] as string) : undefined
+    const instance = typeof obj?.["instance"] === "string" ? (obj["instance"] as string) : undefined
     return {
       reachable: true,
       status,
       ms: elapsed(),
       ...(egress !== undefined ? { egress } : {}),
       ...(runtime !== undefined ? { runtime } : {}),
+      ...(instance !== undefined ? { instance } : {}),
     }
   } catch {
     return { reachable: false, status: 0, ms: elapsed() }

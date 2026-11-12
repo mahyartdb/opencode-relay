@@ -1,19 +1,28 @@
 /**
  * The plugin's own storage: one key per kind of thing.
  *
- * Accounts, relays and settings are each written under a single key, so a
- * restart finds the same state again without a migration path nobody would
- * remember. What comes back out is checked before it is believed: the storage
- * is a file that may have been edited by hand, and one broken account must not
- * take the routing down with every other account.
+ * Accounts, relays, proxies and settings are each written under a single key,
+ * so a restart finds the same state again without a migration path nobody
+ * would remember. What comes back out is checked before it is believed: the
+ * storage is a file that may have been edited by hand, and one broken entry
+ * must not take the routing down with every other entry.
  */
 import { Option, Schema } from "effect"
 import type { StorageDomain } from "@opencode/plugin/promise/storage"
-import type { Account, RelayRecord } from "../lib/types.ts"
+import type {
+  Account,
+  DirectPolicy,
+  ExitStatus,
+  ProxyRecord,
+  RelayRecord,
+  Selection,
+  Strategy,
+} from "../lib/types.ts"
 import type { Settings } from "./state.ts"
 
 export const ACCOUNTS_KEY = "accounts"
 export const RELAYS_KEY = "relays"
+export const PROXIES_KEY = "proxies"
 export const SETTINGS_KEY = "settings"
 
 /** The stored shape of an account. The token is part of it, and never leaves this plugin. */
@@ -26,8 +35,35 @@ const StoredAccount = Schema.Struct({
   createdAt: Schema.Number,
 })
 
+/** The statuses an older installation may have written. */
+const STATUSES = Schema.Literals([
+  "untested",
+  "ready",
+  "reachable",
+  "limited",
+  "exhausted",
+  "blocked",
+  "unreachable",
+  "bad",
+  "unknown",
+])
+
+/** The health fields both kinds of exit share. */
+const HealthFields = {
+  enabled: Schema.optionalKey(Schema.Boolean),
+  status: STATUSES,
+  lastCheck: Schema.optionalKey(Schema.Number),
+  latencyMs: Schema.optionalKey(Schema.Number),
+  egress: Schema.optionalKey(Schema.String),
+  runtime: Schema.optionalKey(Schema.String),
+  lastError: Schema.optionalKey(Schema.String),
+  exhaustedUntil: Schema.optionalKey(Schema.Number),
+  createdAt: Schema.Number,
+}
+
 /** The stored shape of a relay. The access token is part of it, and never leaves this plugin. */
 const StoredRelay = Schema.Struct({
+  kind: Schema.optionalKey(Schema.Literal("relay")),
   id: Schema.String,
   name: Schema.String,
   project: Schema.String,
@@ -35,8 +71,16 @@ const StoredRelay = Schema.Struct({
   url: Schema.String,
   access: Schema.String,
   accountId: Schema.String,
-  status: Schema.Literals(["ready", "unreachable", "unknown"]),
-  createdAt: Schema.Number,
+  ...HealthFields,
+})
+
+/** The stored shape of a proxy. Its URL may carry credentials, and never leaves this plugin. */
+const StoredProxy = Schema.Struct({
+  kind: Schema.optionalKey(Schema.Literal("proxy")),
+  id: Schema.String,
+  name: Schema.String,
+  url: Schema.String,
+  ...HealthFields,
 })
 
 /** The stored shape of the routing rules. */
@@ -44,11 +88,72 @@ const StoredSettings = Schema.Struct({
   enabled: Schema.Boolean,
   selection: Schema.Literals(["all", "free", "custom"]),
   // Written before the strategies existed, so a stored value may not have it.
-  // Reading it as optional keeps an older installation's rules intact.
-  strategy: Schema.optionalKey(Schema.Literals(["fixed", "round-robin", "exhausted"])),
+  strategy: Schema.optionalKey(
+    Schema.Literals(["fixed", "round-robin", "exhausted", "fastest"]),
+  ),
   customModels: Schema.Array(Schema.String),
+  // The field was called activeRelayId before proxies existed.
+  activeExitId: Schema.optionalKey(Schema.String),
   activeRelayId: Schema.optionalKey(Schema.String),
+  direct: Schema.optionalKey(Schema.Literals(["allow", "never"])),
+  healthChecks: Schema.optionalKey(Schema.Boolean),
 })
+
+type StoredHealth = {
+  readonly enabled?: boolean
+  readonly status: ExitStatus
+  readonly lastCheck?: number
+  readonly latencyMs?: number
+  readonly egress?: string
+  readonly runtime?: string
+  readonly lastError?: string
+  readonly exhaustedUntil?: number
+  readonly createdAt: number
+}
+
+/** Normalize the status names an older version could write. */
+function statusOf(status: ExitStatus): ExitStatus {
+  return status === "unknown" ? "untested" : status
+}
+
+function healthJson(exit: StoredHealth): Record<string, Schema.Json> {
+  const json: Record<string, Schema.Json> = {
+    enabled: exit.enabled ?? true,
+    status: exit.status,
+    createdAt: exit.createdAt,
+  }
+  if (exit.lastCheck !== undefined) json.lastCheck = exit.lastCheck
+  if (exit.latencyMs !== undefined) json.latencyMs = exit.latencyMs
+  if (exit.egress !== undefined) json.egress = exit.egress
+  if (exit.runtime !== undefined) json.runtime = exit.runtime
+  if (exit.lastError !== undefined) json.lastError = exit.lastError
+  if (exit.exhaustedUntil !== undefined) json.exhaustedUntil = exit.exhaustedUntil
+  return json
+}
+
+function healthOf(stored: StoredHealth): {
+  enabled: boolean
+  status: ExitStatus
+  createdAt: number
+  lastCheck?: number
+  latencyMs?: number
+  egress?: string
+  runtime?: string
+  lastError?: string
+  exhaustedUntil?: number
+} {
+  return {
+    enabled: stored.enabled ?? true,
+    status: statusOf(stored.status),
+    createdAt: stored.createdAt,
+    ...(stored.lastCheck !== undefined ? { lastCheck: stored.lastCheck } : {}),
+    ...(stored.latencyMs !== undefined ? { latencyMs: stored.latencyMs } : {}),
+    ...(stored.egress !== undefined ? { egress: stored.egress } : {}),
+    ...(stored.runtime !== undefined ? { runtime: stored.runtime } : {}),
+    ...(stored.lastError !== undefined ? { lastError: stored.lastError } : {}),
+    ...(stored.exhaustedUntil !== undefined ? { exhaustedUntil: stored.exhaustedUntil } : {}),
+  }
+}
 
 /** An account as it is written out, built field by field so nothing unexpected rides along. */
 function accountJson(account: Account): Schema.JsonObject {
@@ -65,7 +170,8 @@ function accountJson(account: Account): Schema.JsonObject {
 
 /** A relay as it is written out. */
 function relayJson(relay: RelayRecord): Schema.JsonObject {
-  const json: Record<string, Schema.Json> = {
+  return {
+    kind: "relay",
     id: relay.id,
     name: relay.name,
     project: relay.project,
@@ -73,10 +179,19 @@ function relayJson(relay: RelayRecord): Schema.JsonObject {
     url: relay.url,
     access: relay.access,
     accountId: relay.accountId,
-    status: relay.status,
-    createdAt: relay.createdAt,
+    ...healthJson(relay),
   }
-  return json
+}
+
+/** A proxy as it is written out. */
+function proxyJson(proxy: ProxyRecord): Schema.JsonObject {
+  return {
+    kind: "proxy",
+    id: proxy.id,
+    name: proxy.name,
+    url: proxy.url,
+    ...healthJson(proxy),
+  }
 }
 
 /** The rules as they are written out. */
@@ -84,10 +199,12 @@ function settingsJson(settings: Settings): Schema.JsonObject {
   const json: Record<string, Schema.Json> = {
     enabled: settings.enabled,
     selection: settings.selection,
-    strategy: settings.strategy ?? "fixed",
+    strategy: settings.strategy,
     customModels: [...settings.customModels],
+    direct: settings.direct,
+    healthChecks: settings.healthChecks,
   }
-  if (settings.activeRelayId !== undefined) json.activeRelayId = settings.activeRelayId
+  if (settings.activeExitId !== undefined) json.activeExitId = settings.activeExitId
   return json
 }
 
@@ -112,6 +229,7 @@ function decodeRelay(value: unknown): RelayRecord | undefined {
   if (Option.isNone(decoded)) return undefined
   const relay = decoded.value
   return {
+    kind: "relay",
     id: relay.id,
     name: relay.name,
     project: relay.project,
@@ -119,8 +237,21 @@ function decodeRelay(value: unknown): RelayRecord | undefined {
     url: relay.url,
     access: relay.access,
     accountId: relay.accountId,
-    status: relay.status,
-    createdAt: relay.createdAt,
+    ...healthOf(relay),
+  }
+}
+
+/** Read one proxy, or nothing when the stored value does not make sense. */
+function decodeProxy(value: unknown): ProxyRecord | undefined {
+  const decoded = Schema.decodeUnknownOption(StoredProxy)(value)
+  if (Option.isNone(decoded)) return undefined
+  const proxy = decoded.value
+  return {
+    kind: "proxy",
+    id: proxy.id,
+    name: proxy.name,
+    url: proxy.url,
+    ...healthOf(proxy),
   }
 }
 
@@ -148,20 +279,35 @@ export async function readRelays(storage: StorageDomain): Promise<RelayRecord[]>
   return relays
 }
 
+/** The stored proxies, keeping the ones that still make sense and dropping the rest. */
+export async function readProxies(storage: StorageDomain): Promise<ProxyRecord[]> {
+  const raw = await storage.get(PROXIES_KEY)
+  if (!Array.isArray(raw)) return []
+  const proxies: ProxyRecord[] = []
+  for (const entry of raw) {
+    const proxy = decodeProxy(entry)
+    if (proxy) proxies.push(proxy)
+  }
+  return proxies
+}
+
 /** The stored rules, or nothing when there are none yet. */
 export async function readSettings(storage: StorageDomain): Promise<Settings | undefined> {
   const raw = await storage.get(SETTINGS_KEY)
   const decoded = Schema.decodeUnknownOption(StoredSettings)(raw)
   if (Option.isNone(decoded)) return undefined
   const settings = decoded.value
-  // The strategy was added after the first release, so an older stored value
-  // has none and starts on the fixed relay.
+  const activeExitId = settings.activeExitId ?? settings.activeRelayId
   return {
     enabled: settings.enabled,
-    selection: settings.selection,
-    strategy: settings.strategy ?? "fixed",
+    // "all" predates the free-only rule. It is read as "free", which is what
+    // the plugin would have routed anyway once paid models were filtered out.
+    selection: (settings.selection === "all" ? "free" : settings.selection) as Selection,
+    strategy: (settings.strategy ?? "fixed") as Strategy,
     customModels: [...settings.customModels],
-    ...(settings.activeRelayId !== undefined ? { activeRelayId: settings.activeRelayId } : {}),
+    direct: (settings.direct ?? "allow") as DirectPolicy,
+    healthChecks: settings.healthChecks ?? true,
+    ...(activeExitId !== undefined ? { activeExitId } : {}),
   }
 }
 
@@ -173,6 +319,11 @@ export async function writeAccounts(storage: StorageDomain, accounts: readonly A
 /** Write the relays back. */
 export async function writeRelays(storage: StorageDomain, relays: readonly RelayRecord[]): Promise<void> {
   await storage.set(RELAYS_KEY, relays.map((relay) => relayJson(relay)))
+}
+
+/** Write the proxies back. */
+export async function writeProxies(storage: StorageDomain, proxies: readonly ProxyRecord[]): Promise<void> {
+  await storage.set(PROXIES_KEY, proxies.map((proxy) => proxyJson(proxy)))
 }
 
 /** Write the rules back. */

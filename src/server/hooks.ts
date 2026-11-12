@@ -1,62 +1,50 @@
 /**
- * The three hooks that decide what OpenCode sends, and what happens when the
- * relay cannot serve it.
+ * The three hooks that decide what OpenCode sends, and what happens when an
+ * exit cannot serve it.
  *
- * These are the only places where the plugin changes anything about a request,
- * and they are deliberately narrow: only the OpenCode provider's own requests
- * are touched, and only when the plugin is on, a relay is picked and the model
- * is selected. Everything else is left exactly as it was.
+ * These are the only places where the plugin changes anything about a request.
+ * Only the OpenCode provider's own requests are touched, and only when the
+ * plugin is on, an exit is picked and the model is free. Everything else is
+ * left exactly as it was.
+ *
+ * The response hook is where a free allowance is confirmed. A 429 alone is not
+ * proof: OpenCode also refuses individual requests. The exit is only retired
+ * after a one-token canary through the same exit is refused as well.
  */
 import type { Context } from "@opencode/plugin/promise/plugin"
-import { PROVIDER_ID } from "../lib/types.ts"
+import { PROVIDER_ID, nextResetAt } from "../lib/types.ts"
 import {
   isFreeUsageLimit,
   isSelected,
+  parseRetryAfter,
+  proxyRequest,
+  readBody,
   readResponseState,
-  relayIdOf,
   relayRequest,
+  exitIdOf,
 } from "../lib/routing.ts"
+import type { ProxyBridge } from "./bridge.ts"
 import type { ModelCatalog } from "./models.ts"
-import type { RelayState } from "./state.ts"
+import {
+  REFUSED_COOLDOWN_MS,
+  RATE_LIMIT_COOLDOWN_MS,
+  type FailureContext,
+  type RelayState,
+} from "./state.ts"
+import type { Tester } from "./tester.ts"
 
-/** How long the client waits before trying another relay instance. */
+/** How long the client waits before trying another exit. */
 export const ROTATE_DELAY_MS = 250
 
-/** How many times one request may be moved to another instance before it is given up on. */
+/** How many times one request may be moved to another exit before it is given up on. */
 export const MAX_ROTATION_RETRIES = 3
-
-/** How long the body of a failed answer is waited for before it is given up on. */
-const BODY_TIMEOUT_MS = 2000
 
 /** What the hooks need from the outside world. */
 export interface HookDeps {
   readonly state: RelayState
   readonly catalog: ModelCatalog
-}
-
-/**
- * The body of an answer, read from a copy so the answer itself still reaches OpenCode.
- *
- * The body belongs to the caller, streaming, and reading it here would eat the
- * answer before it reaches OpenCode.
- */
-async function readBody(response: Response): Promise<string | undefined> {
-  let timer: ReturnType<typeof setTimeout> | undefined
-  try {
-    const copy = response.clone()
-    const body = await Promise.race([
-      copy.text(),
-      new Promise<undefined>((resolve) => {
-        timer = setTimeout(() => resolve(undefined), BODY_TIMEOUT_MS)
-      }),
-    ])
-    return body
-  } catch {
-    return undefined
-  } finally {
-    // The answer is not waited for forever: a stream that never ends must not hold the request up.
-    if (timer !== undefined) clearTimeout(timer)
-  }
+  readonly bridge: ProxyBridge
+  readonly tester: Tester
 }
 
 /** The registrations of the three hooks, so they can be disposed of. */
@@ -66,12 +54,25 @@ export interface HookRegistrations {
   readonly retry: { readonly dispose: () => Promise<void> }
 }
 
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
+
+/** The headers of a request, as a sample a test can replay. */
+function headerRecord(request: Request): Record<string, string> {
+  const headers: Record<string, string> = {}
+  request.headers.forEach((value, name) => {
+    headers[name] = value
+  })
+  return headers
+}
+
 /** Registers the three session hooks. */
 export async function registerHooks(
   context: Context,
   deps: HookDeps,
 ): Promise<HookRegistrations> {
-  const { state, catalog } = deps
+  const { state, catalog, bridge, tester } = deps
 
   // The request hook is the only one that changes what OpenCode sends, and it
   // is scoped to the OpenCode provider so no other provider is ever touched.
@@ -81,113 +82,282 @@ export async function registerHooks(
       if (input.model.providerID !== PROVIDER_ID) return
       const settings = state.settings()
       if (!settings.enabled) return
-      const list = settings.selection === "free" ? await catalog.list() : []
-      const model = catalog.resolve(list, input.model.id, settings.selection)
+      const sessionID = input.sessionID ?? ""
+      const modelId = input.model.id
+      // Every request starts with a clean slate: an answer from an earlier
+      // request must never be blamed on an exit this one did not use.
+      state.forgetRelayed(sessionID, modelId)
+      const list = await catalog.list()
+      const model = catalog.resolve(list, modelId, settings.selection)
       if (!isSelected(model, settings.selection, settings.customModels)) return
-      // The strategy decides which relay serves this request: one relay always,
-      // one request each in turn, or one until its allowance is gone. This runs
-      // only once the model is known to be routed, so a model that stays direct
-      // never moves the rotation on.
-      const relay = state.pickRelay()
-      if (!relay) return
-      input.request = relayRequest(input.request, {
-        id: relay.id,
-        url: relay.url,
-        access: relay.access,
-        avoid: state.spentEgresses(relay.id),
+
+      // The request is remembered before it is rewritten, so a test later can
+      // look exactly like the request OpenCode Free is willing to answer.
+      state.noteSample({
+        modelID: modelId,
+        path: `${new URL(input.request.url).pathname}${new URL(input.request.url).search}`,
+        headers: headerRecord(input.request),
       })
-      state.noteRelayed(input.sessionID, input.model.id, relay.id)
+
+      // The strategy decides which exit serves this request: one exit always,
+      // one request each in turn, one until its allowance is gone, or the
+      // fastest measured one. Only a routed model moves the rotation on.
+      const pick = state.pickExit()
+      const exit = pick.exit
+      if (!exit) {
+        const reclaimed = pick.reason
+        state.noteDecision({
+          modelId,
+          routed: false,
+          reason: settings.direct === "never" ? `${reclaimed} Direct routing is not allowed.` : reclaimed,
+        })
+        if (settings.direct === "never") {
+          throw new Error(
+            `${reclaimed} The plugin is set to never go direct, so the request was not sent.`,
+          )
+        }
+        return
+      }
+
+      // The exit is chosen here; the in-memory timing starts now. A request that
+      // never reaches the exit still has a started mark, which the response
+      // hook clears when the failure surfaces.
+      state.noteStarted(sessionID, modelId)
+      state.noteRequest(exit.id)
+      try {
+        if (exit.kind === "relay") {
+          input.request = relayRequest(input.request, {
+            id: exit.id,
+            url: exit.url,
+            access: exit.access,
+            avoid: state.spentEgresses(),
+          })
+        } else {
+          if (!bridge.ready) {
+            state.markFailure(exit.id, "The local proxy bridge is not running.")
+            state.noteDecision({
+              modelId,
+              routed: false,
+              reason: "The local proxy bridge is not running, so the request went direct.",
+            })
+            if (settings.direct === "never") {
+              throw new Error("The local proxy bridge is not running, and the plugin is set to never go direct.")
+            }
+            return
+          }
+          input.request = proxyRequest(input.request, {
+            bridge: bridge.origin,
+            key: bridge.key,
+            id: exit.id,
+          })
+        }
+      } catch (error) {
+        state.markFailure(exit.id, errorText(error))
+        state.noteDecision({
+          modelId,
+          routed: false,
+          reason: `${exit.name} could not be prepared: ${errorText(error)}`,
+        })
+        if (settings.direct === "never") throw error
+        return
+      }
+      state.noteRelayed(sessionID, modelId, exit.id)
+      state.noteDecision({
+        modelId,
+        routed: true,
+        reason: `The request went through ${exit.name}.`,
+        exitId: exit.id,
+        exitName: exit.name,
+        kind: exit.kind,
+      })
     },
     { providerID: PROVIDER_ID },
   )
 
   /*
-   * When something is used up, and what follows from it:
-   * - the relay answers 409, or marks the answer with x-relay-rotate, when the
-   *   instance behind it is spent. The address it used is remembered and
-   *   another attempt is asked for.
-   * - the provider answers 429 when the free allowance of an address is gone.
-   *   The address is remembered and the relay steps aside, whatever the body
-   *   says. Another attempt is only worth asking for when the body is a free
-   *   usage limit, the request went through this plugin, and an address that
-   *   still works can be reached.
+   * The response hook turns an answer into what the plugin knows:
+   *
+   * - A 2xx says the exit works. Its latency feeds the fastest strategy.
+   * - A 409 is the relay saying its instance's address is spent. The address is
+   *   remembered and another attempt is worth asking for.
+   * - A 429 is only a suspicion. The body and a canary decide whether the
+   *   address is spent or the request was refused.
    */
-  // The response hook learns which addresses are used up, so the relay can be
-  // asked to skip them from then on.
   const response = await context.session.hook(
     "http.response",
     async (input) => {
-      // The request says which relay carried it, so a round robin answer is
-      // attributed to the relay that actually served it rather than to the one
-      // the user happens to have chosen.
-      const relayId = relayIdOf(input.request)
-      if (relayId === undefined) return
-      const relay = state.relay(relayId)
-      if (!relay) return
-      // With routing off the request went straight to OpenCode, so any answer
-      // has nothing to do with the relay and nothing to remember.
       if (!state.settings().enabled) return
+      const exitId = exitIdOf(input.request)
+      if (exitId === undefined) return
+      const exit = state.exit(exitId)
+      if (!exit) return
+      const sessionID = input.sessionID ?? ""
+      const modelId = input.model.id
+      const timing = state.finishTiming(sessionID, modelId)
       const answer = readResponseState(input.response)
+      state.noteEgress(exitId, answer.egress, answer.runtime)
+
       if (answer.rotate) {
-        // The instance behind the relay is used up: remember its address, so the
-        // next request is sent to another one.
-        if (answer.egress !== undefined) state.markSpent(relay.id, answer.egress)
+        const until = nextResetAt()
+        if (answer.egress !== undefined) state.markSpent(answer.egress, until)
+        state.markRotated(exitId)
+        state.markExhausted(exitId, until, "The address behind this relay is used up.")
+        state.noteFailureContext(sessionID, modelId, {
+          at: Date.now(),
+          exitId,
+          kind: "rotate",
+          reached: true,
+          until,
+          note: "The relay asked for another instance.",
+        })
         return
       }
-      if (!answer.spent) return
-      // A 429 means the free allowance is gone. The wording of the body says
-      // why, but it must not decide whether the relay steps aside: a wording we
-      // do not recognise would otherwise keep using an address that is spent.
-      const body = await readBody(input.response)
-      // The address is only known when the relay could look it up, so it is
-      // remembered when it is there, and the relay still steps aside when it is not.
-      if (answer.egress !== undefined) {
-        state.markSpent(relay.id, answer.egress)
-        if (body !== undefined) state.noteSpendReason(answer.egress, body)
+
+      const code = input.response.status
+      if (code < 400) {
+        state.markSuccess(exitId, timing)
+        return
       }
-      state.markExhausted(relay.id)
+
+      if (code === 429) {
+        state.markLimited(exitId)
+        const body = (await readBody(input.response, 2500, 4000)) ?? ""
+        if (!isFreeUsageLimit(body)) {
+          const until =
+            Date.now() +
+            Math.max(
+              parseRetryAfter(input.response.headers.get("retry-after")),
+              RATE_LIMIT_COOLDOWN_MS,
+            )
+          state.markRateLimited(exitId, until, "OpenCode rate-limited this exit.")
+          state.noteFailureContext(sessionID, modelId, {
+            at: Date.now(),
+            exitId,
+            kind: "rate-limited",
+            reached: true,
+            until,
+            note: "OpenCode rate-limited this exit.",
+          })
+          return
+        }
+
+        // The request was refused. Ask once more, tiny, through the same exit:
+        // only a canary that is refused too says the address is used up.
+        const canary = await tester.canary(exit)
+        if (canary === "spent") {
+          const wait = parseRetryAfter(input.response.headers.get("retry-after"))
+          const until = wait > 0 ? Date.now() + Math.min(wait, 24 * 60 * 60_000) : nextResetAt()
+          if (answer.egress !== undefined) state.markSpent(answer.egress, until)
+          else if (exit.egress !== undefined) state.markSpent(exit.egress, until)
+          state.markExhausted(exitId, until, "OpenCode confirmed the free allowance of this address is used up.")
+          state.noteFailureContext(sessionID, modelId, {
+            at: Date.now(),
+            exitId,
+            kind: "exhausted",
+            reached: true,
+            until,
+            note: "The free allowance of this exit is gone.",
+          })
+          return
+        }
+        // Either the request itself was refused, or the canary could not tell.
+        // Neither is a reason to keep the exit out of use for long, and neither
+        // is a reason to retry the same request through another address.
+        const until = Date.now() + REFUSED_COOLDOWN_MS
+        const note =
+          canary === "clean"
+            ? "OpenCode refused this request; the exit itself still works."
+            : "OpenCode refused this request; the exit could not be confirmed either way."
+        state.markRateLimited(exitId, until, note)
+        state.noteFailureContext(sessionID, modelId, {
+          at: Date.now(),
+          exitId,
+          kind: "refused",
+          reached: true,
+          until,
+          note,
+        })
+        return
+      }
+
+      if (code === 401 || code === 403) {
+        state.markBlocked(exitId, `OpenCode refused this exit (HTTP ${code}).`)
+        state.noteFailureContext(sessionID, modelId, {
+          at: Date.now(),
+          exitId,
+          kind: "blocked",
+          reached: true,
+          note: `OpenCode refused this exit (HTTP ${code}).`,
+        })
+        return
+      }
+
+      if (code >= 500) {
+        state.markFailed(exitId)
+        state.markFailure(exitId, `The exit answered with HTTP ${code}.`, "bad")
+        state.noteFailureContext(sessionID, modelId, {
+          at: Date.now(),
+          exitId,
+          kind: "server",
+          reached: true,
+          note: `The exit answered with HTTP ${code}.`,
+        })
+      }
     },
     { providerID: PROVIDER_ID },
   )
 
-  // The retry hook moves a request that landed on a used up instance to another one.
+  // The retry hook moves a request that landed on an exit that cannot serve it
+  // to another one, when that is worth doing. A refused request is not retried:
+  // the request was the problem, and another address would refuse it too.
   const retry = await context.session.hook(
     "retry",
     async (input) => {
-      // Only a request this plugin routed can be blamed on a relay. A direct
-      // answer that happens to look like a relay signal is left alone.
-      const relayId = state.relayedBy(input.sessionID, input.model.id)
-      if (relayId === undefined) return
-      // A failure with no HTTP status never reached the relay: the host was not
-      // found, the connection was refused, TLS said no. The relay is skipped
-      // for a while, so the retry (and the rest of the session) is not sent to
-      // the same dead end.
-      if (input.error.status === undefined || input.error.status === 0) {
-        state.markRelayFailure(relayId)
-        if (input.attempt >= MAX_ROTATION_RETRIES) return
-        input.decision = { retry: true, delay: ROTATE_DELAY_MS }
-        return
-      }
-      // A relay that answers with a server error did not carry the request, so
-      // it is given a rest as well. The next attempt goes direct or to another
-      // relay, which is better than sending the same request at the same wall.
-      if (input.error.status >= 500) {
-        state.markRelayFailure(relayId)
-        if (input.attempt >= MAX_ROTATION_RETRIES) return
-        input.decision = { retry: true, delay: ROTATE_DELAY_MS }
-        return
-      }
-      const body = input.error.response?.body
-      const text = typeof body === "string" ? body : undefined
-      const rotation = input.error.status === 409 || (text !== undefined && text.includes("used up"))
-      const allowance =
-        input.error.status === 429 &&
-        text !== undefined &&
-        isFreeUsageLimit(text) &&
-        state.canRetryAfterAllowance()
-      if (!rotation && !allowance) return
+      const sessionID = input.sessionID ?? ""
+      const exitId = state.relayedBy(sessionID, input.model.id)
+      if (exitId === undefined) return
+      const exit = state.exit(exitId)
+      if (!exit) return
       if (input.attempt >= MAX_ROTATION_RETRIES) return
-      input.decision = { retry: true, delay: ROTATE_DELAY_MS }
+
+      const status = input.error.status
+      if (status === undefined || status === 0) {
+        // Nothing answered: the host was not found, the connection was refused,
+        // TLS said no. The exit gets a rest, and another attempt may land on
+        // one that works.
+        state.markFailure(exitId, input.error.message ?? "The exit did not answer.", "unreachable")
+        input.decision = { retry: true, delay: ROTATE_DELAY_MS }
+        return
+      }
+
+      const context: FailureContext | undefined = state.failureFor(sessionID, input.model.id)
+      if (status === 429) {
+        const body = input.error.response?.body
+        const text = typeof body === "string" ? body : ""
+        // The response hook normally decided this already. If it did not (a
+        // transport layer that skipped it), the safe answer is to try another
+        // exit only when one can serve, never to keep hammering this one.
+        if (context?.kind === "refused" || context?.kind === "blocked") return
+        if (context?.kind === "exhausted" && !state.canRetryAfterAllowance()) return
+        if (context === undefined && !isFreeUsageLimit(text)) return
+        if (!state.canRetryAfterAllowance()) return
+        input.decision = {
+          retry: true,
+          delay: context?.kind === "rate-limited" ? 1000 : ROTATE_DELAY_MS,
+        }
+        return
+      }
+
+      if (status === 409) {
+        if (!state.canRetryAfterAllowance()) return
+        input.decision = { retry: true, delay: ROTATE_DELAY_MS }
+        return
+      }
+
+      if (status >= 500) {
+        state.markFailure(exitId, input.error.message ?? `HTTP ${status}`, "bad")
+        input.decision = { retry: true, delay: ROTATE_DELAY_MS }
+      }
     },
     { providerID: PROVIDER_ID },
   )

@@ -1,14 +1,23 @@
 import { describe, expect, test } from "bun:test"
 import {
+  BRIDGE_EXIT_HEADER,
+  BRIDGE_KEY_HEADER,
+  BRIDGE_TARGET_HEADER,
+  exitIdOf,
   isFree,
   isFreeUsageLimit,
   isSelected,
-  nextRelay,
+  nextExit,
+  parseRetryAfter,
+  proxyIdOf,
+  proxyRequest,
+  readBody,
   readResponseState,
   relayIdOf,
   relayRequest,
   RELAY_ID_HEADER,
   selectModels,
+  type ExitCandidate,
   type RelayTarget,
   type RoutableModel,
 } from "../src/lib/routing.ts"
@@ -33,6 +42,17 @@ const unknownModel: RoutableModel = {
 const target: RelayTarget = {
   url: "https://relay.example.com",
   access: "access-secret",
+}
+
+/** A candidate with only the fields the strategy reads. */
+function candidate(id: string, latencyMs?: number): ExitCandidate {
+  return {
+    id,
+    kind: id.startsWith("relay-") ? "relay" : "proxy",
+    name: id,
+    status: "ready",
+    ...(latencyMs !== undefined ? { latencyMs } : {}),
+  }
 }
 
 describe("isFree", () => {
@@ -70,12 +90,6 @@ describe("isFree", () => {
 })
 
 describe("isSelected", () => {
-  test("all selects every model, free or not", () => {
-    expect(isSelected(freeModel, "all", [])).toBe(true)
-    expect(isSelected(paidModel, "all", [])).toBe(true)
-    expect(isSelected(unknownModel, "all", [])).toBe(true)
-  })
-
   test("free selects only the models that cost nothing", () => {
     expect(isSelected(freeModel, "free", [])).toBe(true)
     expect(isSelected(paidModel, "free", [])).toBe(false)
@@ -88,11 +102,16 @@ describe("isSelected", () => {
     expect(isSelected(paidModel, "custom", custom)).toBe(false)
   })
 
+  test("a listed paid model is still never routed", () => {
+    const custom = ["opencode/sonoma"]
+    expect(isSelected(paidModel, "custom", custom)).toBe(false)
+  })
+
   test("custom ignores a listed id that is not in the model list", () => {
     const custom = ["opencode/grok-code-fast", "opencode/ghost"]
     expect(isSelected(paidModel, "custom", custom)).toBe(false)
     expect(
-      selectModels([freeModel, paidModel], "custom", custom).map((m) => m.id),
+      selectModels([freeModel, paidModel], "custom", custom).map((model) => model.id),
     ).toEqual(["opencode/grok-code-fast", "opencode/sonoma"])
   })
 })
@@ -100,12 +119,6 @@ describe("isSelected", () => {
 describe("selectModels", () => {
   test("flags the free models and the routed ones, and keeps the input order", () => {
     const models = [paidModel, freeModel, unknownModel]
-
-    expect(selectModels(models, "all", [])).toEqual([
-      { id: "opencode/sonoma", name: "Sonoma", free: false, routed: true },
-      { id: "opencode/grok-code-fast", name: "Grok Code Fast", free: true, routed: true },
-      { id: "opencode/mystery", name: "Mystery", free: false, routed: true },
-    ])
 
     expect(selectModels(models, "free", [])).toEqual([
       { id: "opencode/sonoma", name: "Sonoma", free: false, routed: false },
@@ -116,8 +129,118 @@ describe("selectModels", () => {
     expect(selectModels(models, "custom", ["opencode/mystery"])).toEqual([
       { id: "opencode/sonoma", name: "Sonoma", free: false, routed: false },
       { id: "opencode/grok-code-fast", name: "Grok Code Fast", free: true, routed: false },
-      { id: "opencode/mystery", name: "Mystery", free: false, routed: true },
+      { id: "opencode/mystery", name: "Mystery", free: false, routed: false },
     ])
+  })
+})
+
+describe("nextExit", () => {
+  const all = [candidate("relay-a"), candidate("relay-b"), candidate("relay-c")]
+  const usable = (skip: readonly string[] = []) => all.filter((exit) => !skip.includes(exit.id))
+
+  test("one exit prefers the chosen one", () => {
+    const pick = nextExit(usable(), all, { strategy: "fixed", activeId: "relay-b", cursor: 0 })
+
+    expect(pick.exit?.id).toBe("relay-b")
+    expect(pick.cursor).toBe(0)
+  })
+
+  test("one exit falls back to the first usable one when the chosen one cannot serve", () => {
+    const pick = nextExit(usable(["relay-b"]), all, {
+      strategy: "fixed",
+      activeId: "relay-b",
+      cursor: 0,
+    })
+
+    expect(pick.exit?.id).toBe("relay-a")
+  })
+
+  test("one exit serves nothing when nothing is usable", () => {
+    const pick = nextExit([], all, { strategy: "fixed", activeId: "relay-b", cursor: 4 })
+
+    expect(pick.exit).toBeUndefined()
+    expect(pick.cursor).toBe(4)
+  })
+
+  test("round robin moves on every request and wraps", () => {
+    let cursor = 0
+    const picked: string[] = []
+    for (let index = 0; index < 7; index += 1) {
+      const pick = nextExit(usable(), all, { strategy: "round-robin", cursor })
+      if (!pick.exit) throw new Error("no exit")
+      picked.push(pick.exit.id)
+      cursor = pick.cursor
+    }
+
+    expect(picked).toEqual(["relay-a", "relay-b", "relay-c", "relay-a", "relay-b", "relay-c", "relay-a"])
+  })
+
+  test("round robin only walks the usable list", () => {
+    const list = usable(["relay-b"])
+    let cursor = 0
+    const picked: string[] = []
+    for (let index = 0; index < 4; index += 1) {
+      const pick = nextExit(list, all, { strategy: "round-robin", cursor })
+      if (!pick.exit) throw new Error("no exit")
+      picked.push(pick.exit.id)
+      cursor = pick.cursor
+    }
+
+    expect(picked).toEqual(["relay-a", "relay-c", "relay-a", "relay-c"])
+  })
+
+  test("until exhausted serves the chosen exit while it lasts", () => {
+    const pick = nextExit(usable(), all, { strategy: "exhausted", activeId: "relay-b", cursor: 0 })
+
+    expect(pick.exit?.id).toBe("relay-b")
+  })
+
+  test("until exhausted moves to the exit after the chosen one", () => {
+    const pick = nextExit(usable(["relay-b"]), all, {
+      strategy: "exhausted",
+      activeId: "relay-b",
+      cursor: 0,
+    })
+
+    expect(pick.exit?.id).toBe("relay-c")
+  })
+
+  test("until exhausted wraps at the end of the list", () => {
+    const pick = nextExit(usable(["relay-c"]), all, {
+      strategy: "exhausted",
+      activeId: "relay-c",
+      cursor: 0,
+    })
+
+    expect(pick.exit?.id).toBe("relay-a")
+  })
+
+  test("until exhausted starts at the first usable exit when the old choice is gone", () => {
+    const pick = nextExit(usable(["relay-a"]), all, {
+      strategy: "exhausted",
+      activeId: "relay-gone",
+      cursor: 0,
+    })
+
+    expect(pick.exit?.id).toBe("relay-b")
+  })
+
+  test("fastest serves the exit with the lowest measured latency", () => {
+    const list = [candidate("relay-a", 900), candidate("relay-b", 120), candidate("relay-c", 400)]
+
+    expect(nextExit(list, list, { strategy: "fastest", cursor: 0 }).exit?.id).toBe("relay-b")
+  })
+
+  test("fastest puts exits without a measurement last", () => {
+    const list = [candidate("relay-a"), candidate("relay-b", 700)]
+
+    expect(nextExit(list, list, { strategy: "fastest", cursor: 0 }).exit?.id).toBe("relay-b")
+  })
+
+  test("fastest keeps list order on a tie", () => {
+    const list = [candidate("relay-a", 300), candidate("relay-b", 300)]
+
+    expect(nextExit(list, list, { strategy: "fastest", cursor: 0 }).exit?.id).toBe("relay-a")
   })
 })
 
@@ -133,6 +256,7 @@ describe("relayRequest", () => {
 
     expect(relayed.url).toBe("https://relay.example.com/")
     expect(relayed.method).toBe("POST")
+    expect(relayed.redirect).toBe("manual")
     expect(relayed.headers.get("x-relay-target")).toBe("https://opencode.ai")
     expect(relayed.headers.get("x-relay-path")).toBe("/inference/openai/v1/chat/completions?beta=true")
     expect(relayed.headers.get("x-relay-key")).toBe("access-secret")
@@ -226,6 +350,9 @@ describe("relayRequest", () => {
         "x-relay-path": "/stale",
         "x-relay-avoid": "9.9.9.9",
         "x-relay-control": "ping",
+        "x-bridge-exit": "stale-proxy",
+        "x-bridge-key": "stale-bridge",
+        "x-bridge-target": "https://evil.example",
       },
     })
 
@@ -236,175 +363,37 @@ describe("relayRequest", () => {
     expect(relayed.headers.get("x-relay-path")).toBe("/inference/openai/v1/models")
     expect(relayed.headers.get("x-relay-avoid")).toBeNull()
     expect(relayed.headers.get("x-relay-control")).toBeNull()
+    expect(relayed.headers.get("x-bridge-exit")).toBeNull()
+    expect(relayed.headers.get("x-bridge-key")).toBeNull()
+    expect(relayed.headers.get("x-bridge-target")).toBeNull()
   })
 })
 
-describe("readResponseState", () => {
-  test("reads the rotation from a 409", () => {
-    const response = new Response("{}", {
-      status: 409,
-      headers: { "x-relay-rotate": "1", "x-relay-egress": "1.2.3.4" },
+describe("proxyRequest", () => {
+  const bridge = {
+    bridge: "http://127.0.0.1:43121",
+    key: "bridge-secret",
+    id: "proxy-1",
+  }
+
+  test("points the request at loopback and names the target and the proxy", () => {
+    const original = new Request("https://opencode.ai/inference/openai/v1/models?x=1", {
+      headers: { authorization: "Bearer token" },
     })
 
-    expect(readResponseState(response)).toEqual({ rotate: true, spent: false, egress: "1.2.3.4" })
-  })
+    const proxied = proxyRequest(original, bridge)
 
-  test("a 409 without the rotate header does not rotate", () => {
-    const response = new Response("{}", { status: 409 })
-
-    expect(readResponseState(response)).toEqual({ rotate: false, spent: false })
-  })
-
-  test("reads the spent allowance from a 429", () => {
-    const response = new Response("{}", { status: 429, headers: { "x-relay-egress": "1.2.3.4" } })
-
-    expect(readResponseState(response)).toEqual({ rotate: false, spent: true, egress: "1.2.3.4" })
-  })
-
-  test("reads the egress of a plain answer", () => {
-    const response = new Response("{}", { status: 200, headers: { "x-relay-egress": "5.6.7.8" } })
-
-    expect(readResponseState(response)).toEqual({ rotate: false, spent: false, egress: "5.6.7.8" })
-  })
-
-  test("an answer without an egress reports none", () => {
-    const response = new Response("{}", { status: 200 })
-
-    expect(readResponseState(response)).toEqual({ rotate: false, spent: false })
-    expect(readResponseState(response).egress).toBeUndefined()
-  })
-})
-
-describe("isFreeUsageLimit", () => {
-  test("spots the free usage limit error", () => {
-    expect(isFreeUsageLimit('{"error":{"message":"Free usage limit reached"}}')).toBe(true)
-    expect(isFreeUsageLimit("You have exceeded your free usage limit for today.")).toBe(true)
-    expect(isFreeUsageLimit("free_usage_limit")).toBe(true)
-  })
-
-  test("ignores an unrelated error", () => {
-    expect(isFreeUsageLimit('{"error":{"message":"Internal server error"}}')).toBe(false)
-    expect(isFreeUsageLimit("")).toBe(false)
-    expect(isFreeUsageLimit("rate limit exceeded")).toBe(false)
-  })
-})
-
-describe("nextRelay", () => {
-  const relays = [{ id: "a" }, { id: "b" }, { id: "c" }]
-  const none = new Set<string>()
-
-  test("fixed serves the chosen relay, even when it is used up", () => {
-    const pick = nextRelay(relays, {
-      strategy: "fixed",
-      activeId: "b",
-      cursor: 0,
-      exhausted: new Set(["b"]),
-    })
-
-    expect(pick.relay?.id).toBe("b")
-    expect(pick.cursor).toBe(0)
-  })
-
-  test("fixed keeps the chosen relay when every relay is used up", () => {
-    const pick = nextRelay(relays, {
-      strategy: "fixed",
-      activeId: "b",
-      cursor: 0,
-      exhausted: new Set(["a", "b", "c"]),
-    })
-
-    expect(pick.relay?.id).toBe("b")
-  })
-
-  test("fixed falls back to the first relay when none is chosen and all are used up", () => {
-    const pick = nextRelay(relays, {
-      strategy: "fixed",
-      cursor: 0,
-      exhausted: new Set(["a", "b", "c"]),
-    })
-
-    expect(pick.relay?.id).toBe("a")
-  })
-
-  test("fixed uses the first usable relay when none is chosen", () => {
-    expect(nextRelay(relays, { strategy: "fixed", cursor: 0, exhausted: none }).relay?.id).toBe("a")
-    expect(
-      nextRelay(relays, { strategy: "fixed", cursor: 0, exhausted: new Set(["a"]) }).relay?.id,
-    ).toBe("b")
-  })
-
-  test("round robin moves on every request and wraps", () => {
-    let cursor = 0
-    const picked: string[] = []
-    for (let index = 0; index < 7; index += 1) {
-      const pick = nextRelay(relays, { strategy: "round-robin", cursor, exhausted: none })
-      if (!pick.relay) throw new Error("no relay")
-      picked.push(pick.relay.id)
-      cursor = pick.cursor
-    }
-
-    expect(picked).toEqual(["a", "b", "c", "a", "b", "c", "a"])
-  })
-
-  test("round robin skips a relay whose allowance is gone", () => {
-    let cursor = 0
-    const picked: string[] = []
-    for (let index = 0; index < 4; index += 1) {
-      const pick = nextRelay(relays, {
-        strategy: "round-robin",
-        cursor,
-        exhausted: new Set(["b"]),
-      })
-      if (!pick.relay) throw new Error("no relay")
-      picked.push(pick.relay.id)
-      cursor = pick.cursor
-    }
-
-    expect(picked).toEqual(["a", "c", "a", "c"])
-  })
-
-  test("round robin serves nothing when every relay is used up", () => {
-    const pick = nextRelay(relays, {
-      strategy: "round-robin",
-      cursor: 3,
-      exhausted: new Set(["a", "b", "c"]),
-    })
-
-    expect(pick.relay).toBeUndefined()
-    expect(pick.cursor).toBe(3)
-  })
-
-  test("until exhausted serves the chosen relay while it lasts", () => {
-    const pick = nextRelay(relays, {
-      strategy: "exhausted",
-      activeId: "b",
-      cursor: 0,
-      exhausted: none,
-    })
-
-    expect(pick.relay?.id).toBe("b")
-  })
-
-  test("until exhausted moves to the relay after the chosen one", () => {
-    const pick = nextRelay(relays, {
-      strategy: "exhausted",
-      activeId: "b",
-      cursor: 0,
-      exhausted: new Set(["b"]),
-    })
-
-    expect(pick.relay?.id).toBe("c")
-  })
-
-  test("until exhausted wraps at the end of the list", () => {
-    const pick = nextRelay(relays, {
-      strategy: "exhausted",
-      activeId: "c",
-      cursor: 0,
-      exhausted: new Set(["c"]),
-    })
-
-    expect(pick.relay?.id).toBe("a")
+    expect(proxied.url).toBe("http://127.0.0.1:43121/")
+    expect(proxied.headers.get(BRIDGE_KEY_HEADER)).toBe("bridge-secret")
+    expect(proxied.headers.get(BRIDGE_EXIT_HEADER)).toBe("proxy-1")
+    expect(proxied.headers.get(BRIDGE_TARGET_HEADER)).toBe(
+      "https://opencode.ai/inference/openai/v1/models?x=1",
+    )
+    expect(proxied.headers.get("authorization")).toBe("Bearer token")
+    expect(proxied.redirect).toBe("manual")
+    expect(proxyIdOf(proxied)).toBe("proxy-1")
+    expect(relayIdOf(proxied)).toBeUndefined()
+    expect(exitIdOf(proxied)).toBe("proxy-1")
   })
 })
 
@@ -415,6 +404,7 @@ describe("the relay marker", () => {
 
     expect(marked.headers.get(RELAY_ID_HEADER)).toBe("relay-1")
     expect(relayIdOf(marked)).toBe("relay-1")
+    expect(exitIdOf(marked)).toBe("relay-1")
   })
 
   test("replaces a marker the caller brought along", () => {
@@ -427,9 +417,107 @@ describe("the relay marker", () => {
     expect(marked.headers.get("x-relay-key")).toBe("access-secret")
   })
 
-  test("an unmarked request has no relay", () => {
+  test("an unmarked request has no exit", () => {
     const request = new Request("https://opencode.ai/inference/openai/v1/models")
 
     expect(relayIdOf(request)).toBeUndefined()
+    expect(proxyIdOf(request)).toBeUndefined()
+    expect(exitIdOf(request)).toBeUndefined()
+  })
+})
+
+describe("readResponseState", () => {
+  test("reads the rotation and the egress from a 409", () => {
+    const response = new Response("{}", {
+      status: 409,
+      headers: {
+        "x-relay-rotate": "1",
+        "x-relay-egress": "1.2.3.4",
+        "x-relay-instance": "i-1",
+        "x-relay-runtime": "bun",
+      },
+    })
+
+    expect(readResponseState(response)).toEqual({
+      rotate: true,
+      reachedExit: true,
+      egress: "1.2.3.4",
+      instance: "i-1",
+      runtime: "bun",
+    })
+  })
+
+  test("a 409 without the rotate header does not rotate", () => {
+    const response = new Response("{}", { status: 409 })
+
+    expect(readResponseState(response)).toEqual({ rotate: false, reachedExit: false })
+  })
+
+  test("a 429 is not judged here: only the body and a canary can tell", () => {
+    const response = new Response("{}", { status: 429, headers: { "x-relay-egress": "1.2.3.4" } })
+
+    expect(readResponseState(response)).toEqual({
+      rotate: false,
+      reachedExit: true,
+      egress: "1.2.3.4",
+    })
+  })
+
+  test("an answer without exit headers did not reach an exit", () => {
+    const response = new Response("{}", { status: 502 })
+
+    expect(readResponseState(response)).toEqual({ rotate: false, reachedExit: false })
+  })
+})
+
+describe("isFreeUsageLimit", () => {
+  test("spots the free usage limit error", () => {
+    expect(isFreeUsageLimit('{"error":{"message":"Free usage limit reached"}}')).toBe(true)
+    expect(isFreeUsageLimit("You have exceeded your free usage limit for today.")).toBe(true)
+    expect(isFreeUsageLimit("free_usage_limit")).toBe(true)
+    expect(isFreeUsageLimit('{"error":{"type":"FreeUsageLimitError"}}')).toBe(true)
+  })
+
+  test("ignores an unrelated error", () => {
+    expect(isFreeUsageLimit('{"error":{"message":"Internal server error"}}')).toBe(false)
+    expect(isFreeUsageLimit("")).toBe(false)
+    expect(isFreeUsageLimit("rate limit exceeded")).toBe(false)
+  })
+})
+
+describe("parseRetryAfter", () => {
+  test("reads seconds", () => {
+    expect(parseRetryAfter("120")).toBe(120_000)
+    expect(parseRetryAfter("0")).toBe(0)
+  })
+
+  test("reads an HTTP date", () => {
+    const now = Date.parse("2026-01-01T00:00:00Z")
+    expect(parseRetryAfter("Thu, 01 Jan 2026 00:10:00 GMT", now)).toBe(600_000)
+  })
+
+  test("a missing or unreadable value means the provider did not say", () => {
+    expect(parseRetryAfter(null)).toBe(0)
+    expect(parseRetryAfter("soon")).toBe(0)
+    expect(parseRetryAfter("-5")).toBe(0)
+  })
+})
+
+describe("readBody", () => {
+  test("reads the body from a copy and leaves the answer usable", async () => {
+    const response = new Response('{"hello":"world"}')
+
+    const body = await readBody(response)
+
+    expect(body).toBe('{"hello":"world"}')
+    expect(await response.text()).toBe('{"hello":"world"}')
+  })
+
+  test("cuts a long body", async () => {
+    const response = new Response("x".repeat(9000))
+
+    const body = await readBody(response, 2000, 4000)
+
+    expect(body?.length).toBe(4000)
   })
 })

@@ -6,11 +6,11 @@
  */
 import { createMemo, Show } from "solid-js"
 import { summarizePill } from "./present.ts"
-import { currentModels, currentStatus } from "./state.ts"
+import { currentStatus } from "./state.ts"
 
 /** The pill itself. */
 export function RelayPill(props: { readonly onOpen: () => void }) {
-  const line = createMemo(() => summarizePill(currentStatus(), currentModels()))
+  const line = createMemo(() => summarizePill(currentStatus()))
   return (
     <Show when={line()}>
       {(text) => (

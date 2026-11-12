@@ -1,13 +1,21 @@
 /**
- * Which models go through a relay, and the little protocol the relay speaks.
+ * Which models go through an exit, and the little protocol an exit speaks.
  *
- * The relay itself is a dumb forwarder: it only knows the upstream origin, the path
- * to call and the access token, and it answers with headers that say whether the
- * client should try another instance. Every decision about *whether* to route, and
- * every decision about *how* to talk to the relay, lives here.
+ * A relay is a dumb forwarder: it only knows the upstream origin, the path to
+ * call and the access token, and it answers with headers that say whether the
+ * client should try another instance. A proxy is even dumber: it only carries
+ * bytes. Every decision about *whether* to route, and every decision about
+ * *how* to talk to the exit, lives here.
  */
 
-import { UPSTREAM_HOST, type ModelInfo, type Selection, type Strategy } from "./types.ts"
+import {
+  UPSTREAM_HOST,
+  type ExitKind,
+  type ExitStatus,
+  type ModelInfo,
+  type Selection,
+  type Strategy,
+} from "./types.ts"
 
 /** One pricing tier of a model, in dollars per million tokens. */
 export interface ModelCost {
@@ -38,16 +46,21 @@ const HOP_BY_HOP = new Set([
 ])
 
 /**
- * The marker this plugin puts on a request.
+ * The marker this plugin puts on a relay request.
  *
  * It is how an answer is traced back to the relay that served it: with more
- * than one relay in use, the relay that answered is not always the one the
- * user chose. The relay drops every x-relay-* header before forwarding, so the
+ * than one exit in use, the exit that answered is not always the one the user
+ * chose. The relay drops every x-relay-* header before forwarding, so the
  * marker never reaches the provider.
  */
 export const RELAY_ID_HEADER = "x-relay-id"
 
-/** Relay headers we own, so a stale value from the caller never reaches the relay. */
+/** The marker a request sent through the local proxy bridge carries. */
+export const BRIDGE_EXIT_HEADER = "x-bridge-exit"
+export const BRIDGE_TARGET_HEADER = "x-bridge-target"
+export const BRIDGE_KEY_HEADER = "x-bridge-key"
+
+/** Exit headers we own, so a stale value from the caller never reaches the exit. */
 const RELAY_HEADERS = new Set([
   "x-relay-target",
   "x-relay-path",
@@ -55,6 +68,9 @@ const RELAY_HEADERS = new Set([
   "x-relay-avoid",
   "x-relay-control",
   RELAY_ID_HEADER,
+  BRIDGE_EXIT_HEADER,
+  BRIDGE_TARGET_HEADER,
+  BRIDGE_KEY_HEADER,
 ])
 
 /**
@@ -72,71 +88,102 @@ export function isFree(model: RoutableModel): boolean {
  * Whether a model is routed under the current selection.
  *
  * The custom list is matched by model id, so it keeps working when the provider
- * renames the display name of a model.
+ * renames the display name of a model. Only free models are ever routed: the
+ * plugin exists to multiply the free allowance, and a paid model would spend
+ * money through an exit that cannot make it cheaper.
  */
 export function isSelected(
   model: RoutableModel,
   selection: Selection,
   customModels: readonly string[],
 ): boolean {
-  if (selection === "all") return true
-  if (selection === "free") return isFree(model)
+  if (!isFree(model)) return false
+  if (selection === "free") return true
   return customModels.includes(model.id)
 }
 
+/** The least a routing candidate has to say about itself. */
+export interface ExitCandidate {
+  readonly id: string
+  readonly kind: ExitKind
+  readonly name: string
+  readonly status: ExitStatus
+  readonly latencyMs?: number
+}
+
+/** Why an exit is not in the usable list. */
+export interface ExitSkip {
+  readonly exit: ExitCandidate
+  readonly reason: string
+}
+
 /**
- * Which relay serves the next request.
+ * Which exit serves the next request.
  *
- * Every relay has an allowance of its own, and the strategy decides how those
- * allowances are spent: one relay always, one request each in turn, or one
- * until it is used up. The moving strategies skip a relay that is known to be
- * used up; the one-relay strategy keeps it, because that is what the user
- * asked for.
+ * The caller passes the exits that can serve *right now* (enabled, tested,
+ * answering, not cooling, not used up), so this function only applies the
+ * strategy. Keeping the filter outside makes the rule that decides usability
+ * testable on its own, and keeps the strategy honest: it can never pick an
+ * exit the state rejected.
+ *
+ * `cursor` only moves for round robin. The one-exit and until-exhausted
+ * strategies prefer the chosen exit and fall back to the first usable one; the
+ * state persists a new choice for until-exhausted when the old one runs out.
  */
-export function nextRelay<T extends { readonly id: string }>(
-  relays: readonly T[],
+export function nextExit<T extends ExitCandidate>(
+  usable: readonly T[],
+  all: readonly T[],
   options: {
     readonly strategy: Strategy
-    /** The relay the user chose, for the strategies that use one. */
+    /** The exit the user chose, for the strategies that prefer one. */
     readonly activeId?: string
     /** Where the last request went, for the strategy that moves on each time. */
     readonly cursor: number
-    /** The relays whose allowance is gone. */
-    readonly exhausted: ReadonlySet<string>
   },
-): { readonly relay: T | undefined; readonly cursor: number } {
-  const usable = relays.filter((relay) => !options.exhausted.has(relay.id))
+): { readonly exit: T | undefined; readonly cursor: number } {
+  if (usable.length === 0) return { exit: undefined, cursor: options.cursor }
 
   switch (options.strategy) {
     case "fixed": {
-      // One relay, the one the user chose. It keeps serving even when it is
-      // known to be used up: that is what a fixed relay means, and the menu
-      // says so rather than quietly moving traffic somewhere the user did not
-      // choose.
-      const chosen = relays.find((relay) => relay.id === options.activeId)
-      return { relay: chosen ?? usable[0] ?? relays[0], cursor: options.cursor }
+      // Prefer the exit the user chose. When it cannot serve, another one takes
+      // over: the alternative is spending the local allowance silently, which
+      // is the behavior this plugin exists to avoid.
+      const chosen = usable.find((exit) => exit.id === options.activeId)
+      return { exit: chosen ?? usable[0], cursor: options.cursor }
     }
     case "round-robin": {
-      if (usable.length === 0) return { relay: undefined, cursor: options.cursor }
       // The cursor moves on every request, so the requests are spread out.
       const index = ((options.cursor % usable.length) + usable.length) % usable.length
-      return { relay: usable[index], cursor: options.cursor + 1 }
+      return { exit: usable[index], cursor: options.cursor + 1 }
     }
     case "exhausted": {
-      // The relay the user chose is used until it is used up. When it is, the
-      // next one in the list takes over, and the state remembers that choice,
-      // so this fallback is only reached when the caller did not.
-      const chosen = usable.find((relay) => relay.id === options.activeId)
-      if (chosen) return { relay: chosen, cursor: options.cursor }
-      const index = relays.findIndex((relay) => relay.id === options.activeId)
-      for (let step = 1; index >= 0 && step <= relays.length; step++) {
-        const candidate = relays[(index + step) % relays.length]
-        if (candidate && usable.includes(candidate)) {
-          return { relay: candidate, cursor: options.cursor }
+      // The chosen exit is used until it is used up. When it is, the next
+      // usable one in the overall order takes over, so adding or pausing an
+      // exit does not send traffic to something the state already rejected.
+      const chosen = usable.find((exit) => exit.id === options.activeId)
+      if (chosen) return { exit: chosen, cursor: options.cursor }
+      const index = all.findIndex((exit) => exit.id === options.activeId)
+      for (let step = 1; index >= 0 && step <= all.length; step++) {
+        const candidate = all[(index + step) % all.length]
+        if (candidate && usable.some((exit) => exit.id === candidate.id)) {
+          return { exit: candidate, cursor: options.cursor }
         }
       }
-      // Every usable relay has been checked, so nothing is left to serve this.
-      return { relay: usable[0], cursor: options.cursor }
+      return { exit: usable[0], cursor: options.cursor }
+    }
+    case "fastest": {
+      // A relay with no measured latency is not assumed fast: it comes after
+      // every exit that has answered at least once. Ties keep list order.
+      let best = usable[0]
+      let bestMs = best?.latencyMs ?? Number.POSITIVE_INFINITY
+      for (const exit of usable.slice(1)) {
+        const ms = exit.latencyMs ?? Number.POSITIVE_INFINITY
+        if (ms < bestMs) {
+          best = exit
+          bestMs = ms
+        }
+      }
+      return { exit: best, cursor: options.cursor }
     }
   }
 }
@@ -155,13 +202,23 @@ export function selectModels(
   }))
 }
 
-/** Where a request goes, and which addresses the client already knows to be used up. */
+/** Where a relay request goes, and which addresses the client already knows to be used up. */
 export interface RelayTarget {
   readonly url: string
   readonly access: string
   /** This plugin's id for the relay, so an answer can be traced back to it. */
   readonly id?: string
   readonly avoid?: readonly string[]
+}
+
+/** Where a proxied request goes: the local bridge, and which proxy it must use. */
+export interface ProxyTarget {
+  /** The local bridge's origin, e.g. http://127.0.0.1:43121 */
+  readonly bridge: string
+  /** The bridge's per-process secret. */
+  readonly key: string
+  /** This plugin's id for the proxy. */
+  readonly id: string
 }
 
 /** The only origin a relay is allowed to forward to. */
@@ -171,9 +228,21 @@ const UPSTREAM_ORIGIN = `https://${UPSTREAM_HOST}`
 type StreamedRequestInit = RequestInit & { duplex?: "half" }
 
 /** A relay url as people write it: without a scheme, or with a trailing slash. */
-function normalizeRelayUrl(url: string): string {
+export function normalizeRelayUrl(url: string): string {
   const withScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(url) ? url : `https://${url}`
   return withScheme.endsWith("/") ? withScheme.slice(0, -1) : withScheme
+}
+
+/** Copy the headers of a request, dropping the hop-by-hop and exit-owned ones. */
+function forwardedHeaders(request: Request): Headers {
+  const headers = new Headers()
+  request.headers.forEach((value, name) => {
+    const lower = name.toLowerCase()
+    if (HOP_BY_HOP.has(lower)) return
+    if (RELAY_HEADERS.has(lower)) return
+    headers.set(name, value)
+  })
+  return headers
 }
 
 /**
@@ -183,18 +252,13 @@ function normalizeRelayUrl(url: string): string {
  * x-relay-* headers, so the request line carries the relay and the headers carry
  * the intent. The body is never read here: it is handed over as the stream it
  * already is, so a long inference is forwarded while it is still being produced.
+ * Redirects are never followed: a platform redirect would carry the access
+ * token to a host the user did not choose.
  */
 export function relayRequest(request: Request, target: RelayTarget): Request {
   const source = new URL(request.url, UPSTREAM_ORIGIN)
   const path = `${source.pathname}${source.search}`
-
-  const headers = new Headers()
-  request.headers.forEach((value, name) => {
-    const lower = name.toLowerCase()
-    if (HOP_BY_HOP.has(lower)) return
-    if (RELAY_HEADERS.has(lower)) return
-    headers.set(name, value)
-  })
+  const headers = forwardedHeaders(request)
 
   headers.set("x-relay-target", UPSTREAM_ORIGIN)
   headers.set("x-relay-path", path.startsWith("/") ? path : `/${path}`)
@@ -210,6 +274,7 @@ export function relayRequest(request: Request, target: RelayTarget): Request {
     method,
     headers,
     signal: request.signal,
+    redirect: "manual",
   }
   if (body !== null && method !== "GET" && method !== "HEAD") {
     init.body = body
@@ -219,35 +284,84 @@ export function relayRequest(request: Request, target: RelayTarget): Request {
   return new Request(normalizeRelayUrl(target.url), init)
 }
 
+/**
+ * Turn a provider request into one the local bridge serves.
+ *
+ * The bridge is the process that calls `fetch` with Bun's `proxy` option, so
+ * the hook only has to point the request at loopback and say which proxy to
+ * use. The target URL travels in a header, and the body stays the stream it
+ * already is.
+ */
+export function proxyRequest(request: Request, target: ProxyTarget): Request {
+  const headers = forwardedHeaders(request)
+  headers.set(BRIDGE_KEY_HEADER, target.key)
+  headers.set(BRIDGE_EXIT_HEADER, target.id)
+  headers.set(BRIDGE_TARGET_HEADER, request.url)
+
+  const method = request.method
+  const body = request.body
+  const init: StreamedRequestInit = {
+    method,
+    headers,
+    signal: request.signal,
+    redirect: "manual",
+  }
+  if (body !== null && method !== "GET" && method !== "HEAD") {
+    init.body = body
+    init.duplex = "half"
+  }
+  return new Request(target.bridge, init)
+}
+
 /** The relay a request was sent through, when this plugin marked it. */
 export function relayIdOf(request: Request): string | undefined {
   return request.headers.get(RELAY_ID_HEADER) ?? undefined
+}
+
+/** The proxy a request was sent through, when this plugin marked it. */
+export function proxyIdOf(request: Request): string | undefined {
+  return request.headers.get(BRIDGE_EXIT_HEADER) ?? undefined
+}
+
+/** The exit a request was sent through, whichever kind it was. */
+export function exitIdOf(request: Request): string | undefined {
+  return relayIdOf(request) ?? proxyIdOf(request)
 }
 
 /** What a relay answer says about the instance that served it. */
 export interface ResponseState {
   /** True when the instance is used up and the client should try another one. */
   readonly rotate: boolean
-  /** True when the free allowance of this address is exhausted. */
-  readonly spent: boolean
   /** The address the answer came from, when the relay reported one. */
   readonly egress?: string
+  /** The relay instance that answered, when it said. */
+  readonly instance?: string
+  /** The runtime behind the relay, when it said. */
+  readonly runtime?: string
+  /** True when the answer came from the upstream through an exit, not from the edge. */
+  readonly reachedExit: boolean
 }
 
 /**
  * Read the relay's verdict from the status and the headers alone.
  *
  * The body belongs to the caller, streaming, and reading it here would eat the
- * answer before it reaches OpenCode.
+ * answer before it reaches OpenCode. A 429 is deliberately *not* labelled
+ * spent here: only the body and a confirmation request can tell a used-up
+ * allowance from a rate limit on one request.
  */
 export function readResponseState(response: Response): ResponseState {
   const rotate = response.status === 409 && response.headers.get("x-relay-rotate") === "1"
-  const spent = response.status === 429
   const egress = response.headers.get("x-relay-egress") ?? undefined
+  const instance = response.headers.get("x-relay-instance") ?? undefined
+  const runtime = response.headers.get("x-relay-runtime") ?? undefined
+  const reachedExit = instance !== undefined || runtime !== undefined || egress !== undefined
   return {
     rotate,
-    spent,
+    reachedExit,
     ...(egress !== undefined ? { egress } : {}),
+    ...(instance !== undefined ? { instance } : {}),
+    ...(runtime !== undefined ? { runtime } : {}),
   }
 }
 
@@ -261,4 +375,42 @@ export function isFreeUsageLimit(body: string): boolean {
   const flat = body.toLowerCase().replace(/[^a-z0-9]/g, "")
   if (flat.includes("freeusagelimit")) return true
   return flat.includes("free") && flat.includes("usagelimit")
+}
+
+/**
+ * A Retry-After header in milliseconds.
+ *
+ * It is either a number of seconds or an HTTP date. A missing or unreadable
+ * value is zero, which means "the provider did not say", not "retry now".
+ */
+export function parseRetryAfter(value: string | null | undefined, now = Date.now()): number {
+  if (!value) return 0
+  const seconds = Number(value)
+  if (Number.isFinite(seconds)) return Math.max(0, Math.round(seconds * 1000))
+  const at = Date.parse(value)
+  if (!Number.isFinite(at)) return 0
+  return Math.max(0, at - now)
+}
+
+/** The text of an answer's body, read from a copy so the caller still gets it. */
+export async function readBody(
+  response: Response,
+  timeoutMs = 2000,
+  limit = 4000,
+): Promise<string | undefined> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    const copy = response.clone()
+    const text = await Promise.race([
+      copy.text(),
+      new Promise<undefined>((resolve) => {
+        timer = setTimeout(() => resolve(undefined), timeoutMs)
+      }),
+    ])
+    return text === undefined ? undefined : text.slice(0, limit)
+  } catch {
+    return undefined
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+  }
 }
