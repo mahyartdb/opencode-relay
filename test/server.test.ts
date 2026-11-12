@@ -3,6 +3,7 @@ import type { Server } from "node:http"
 import { startRelay, startTraceStub, traceUrl } from "../tools/relay-harness.ts"
 import { ROTATE_DELAY_MS } from "../src/server/hooks.ts"
 import { relayRequest } from "../src/lib/routing.ts"
+import { API_TIMEOUT_MS } from "../src/server/tester.ts"
 import plugin from "../src/server/index.ts"
 
 /**
@@ -175,13 +176,30 @@ function firstExit(status: StatusAnswer): StatusAnswer["exits"][number] {
   return exit
 }
 
-/** Whether the provider can be reached at all. */
+/** How long to wait before asking again, so a failed probe is retried, not trusted. */
+const PROBE_RETRY_MS = 500
+
+/**
+ * Whether the provider can be reached at all.
+ *
+ * The probe keeps asking until the api check's own budget runs out. A one-shot
+ * attempt shorter than the check says "no network" under load while the check
+ * itself still succeeds a moment later, and the test then asserts the wrong
+ * branch of its answer.
+ */
 async function canReach(url: string): Promise<boolean> {
-  try {
-    const answer = await fetch(url, { signal: AbortSignal.timeout(5000) })
-    return answer.status < 500
-  } catch {
-    return false
+  const deadline = Date.now() + API_TIMEOUT_MS
+  for (;;) {
+    const left = deadline - Date.now()
+    if (left <= 0) return false
+    try {
+      const answer = await fetch(url, { signal: AbortSignal.timeout(left) })
+      if (answer.status < 500) return true
+    } catch {
+      // A failed probe only means "ask again", while the budget lasts.
+    }
+    const wait = Math.min(PROBE_RETRY_MS, deadline - Date.now())
+    if (wait > 0) await Bun.sleep(wait)
   }
 }
 

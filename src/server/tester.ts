@@ -41,7 +41,8 @@ export const HEALTH_INTERVAL_MS = 10 * 60_000
 
 /** How long a check may take before it is called a failure. */
 const PING_TIMEOUT_MS = 15_000
-const API_TIMEOUT_MS = 30_000
+/** Exported so a test that gates on a check can be exactly as patient as it. */
+export const API_TIMEOUT_MS = 30_000
 const DEEP_TIMEOUT_MS = 60_000
 const CANARY_TIMEOUT_MS = 25_000
 
