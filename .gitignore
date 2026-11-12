@@ -1,0 +1,11 @@
+node_modules/
+*.log
+.DS_Store
+dist/
+*.tsbuildinfo
+.env
+.env.*
+!.env.example
+
+# Local worker sandboxes used while developing.
+.worker/

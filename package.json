@@ -1,0 +1,69 @@
+{
+  "name": "opencode-relay",
+  "version": "0.1.0",
+  "description": "Route OpenCode's own free models through your own Vercel relays, so the daily allowance follows the relay instead of your IP.",
+  "type": "module",
+  "license": "MIT",
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "vercel",
+    "relay"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/B3hnamR/opencode-relay.git"
+  },
+  "exports": {
+    ".": "./dist/index.js",
+    "./server": "./dist/index.js",
+    "./tui": "./dist/tui.js",
+    "./rpc": "./dist/rpc.js"
+  },
+  "files": [
+    "dist",
+    "relay",
+    "README.md",
+    "LICENSE",
+    "NOTICE.md"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "bun run build"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@babel/core": "7.29.7",
+    "@babel/preset-typescript": "7.27.1",
+    "@opentui/core": "0.8.4",
+    "@opentui/solid": "0.8.4",
+    "@types/bun": "^1.4.3",
+    "babel-preset-solid": "1.9.16",
+    "esbuild-plugin-solid": "0.6.0",
+    "effect": "4.1.0",
+    "solid-js": "1.9.16",
+    "tsup": "8.5.1",
+    "typescript": "^5.9.3"
+  },
+  "peerDependencies": {
+    "@opencode/plugin": ">=2.2.7 <3",
+    "effect": ">=4.1.0 <5",
+    "solid-js": ">=1.9.0 <2",
+    "@opentui/core": ">=0.8.1 <0.9",
+    "@opentui/solid": ">=0.8.1 <0.9"
+  },
+  "peerDependenciesMeta": {
+    "@opentui/core": {
+      "optional": true
+    },
+    "@opentui/solid": {
+      "optional": true
+    },
+    "solid-js": {
+      "optional": true
+    }
+  }
+}
