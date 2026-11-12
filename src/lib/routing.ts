@@ -7,7 +7,7 @@
  * every decision about *how* to talk to the relay, lives here.
  */
 
-import { UPSTREAM_HOST, type ModelInfo, type Selection } from "./types.ts"
+import { UPSTREAM_HOST, type ModelInfo, type Selection, type Strategy } from "./types.ts"
 
 /** One pricing tier of a model, in dollars per million tokens. */
 export interface ModelCost {
@@ -37,6 +37,16 @@ const HOP_BY_HOP = new Set([
   "upgrade",
 ])
 
+/**
+ * The marker this plugin puts on a request.
+ *
+ * It is how an answer is traced back to the relay that served it: with more
+ * than one relay in use, the relay that answered is not always the one the
+ * user chose. The relay drops every x-relay-* header before forwarding, so the
+ * marker never reaches the provider.
+ */
+export const RELAY_ID_HEADER = "x-relay-id"
+
 /** Relay headers we own, so a stale value from the caller never reaches the relay. */
 const RELAY_HEADERS = new Set([
   "x-relay-target",
@@ -44,6 +54,7 @@ const RELAY_HEADERS = new Set([
   "x-relay-key",
   "x-relay-avoid",
   "x-relay-control",
+  RELAY_ID_HEADER,
 ])
 
 /**
@@ -73,6 +84,63 @@ export function isSelected(
   return customModels.includes(model.id)
 }
 
+/**
+ * Which relay serves the next request.
+ *
+ * Every relay has an allowance of its own, and the strategy decides how those
+ * allowances are spent: one relay always, one request each in turn, or one
+ * until it is used up. The moving strategies skip a relay that is known to be
+ * used up; the one-relay strategy keeps it, because that is what the user
+ * asked for.
+ */
+export function nextRelay<T extends { readonly id: string }>(
+  relays: readonly T[],
+  options: {
+    readonly strategy: Strategy
+    /** The relay the user chose, for the strategies that use one. */
+    readonly activeId?: string
+    /** Where the last request went, for the strategy that moves on each time. */
+    readonly cursor: number
+    /** The relays whose allowance is gone. */
+    readonly exhausted: ReadonlySet<string>
+  },
+): { readonly relay: T | undefined; readonly cursor: number } {
+  const usable = relays.filter((relay) => !options.exhausted.has(relay.id))
+
+  switch (options.strategy) {
+    case "fixed": {
+      // One relay, the one the user chose. It keeps serving even when it is
+      // known to be used up: that is what a fixed relay means, and the menu
+      // says so rather than quietly moving traffic somewhere the user did not
+      // choose.
+      const chosen = relays.find((relay) => relay.id === options.activeId)
+      return { relay: chosen ?? usable[0] ?? relays[0], cursor: options.cursor }
+    }
+    case "round-robin": {
+      if (usable.length === 0) return { relay: undefined, cursor: options.cursor }
+      // The cursor moves on every request, so the requests are spread out.
+      const index = ((options.cursor % usable.length) + usable.length) % usable.length
+      return { relay: usable[index], cursor: options.cursor + 1 }
+    }
+    case "exhausted": {
+      // The relay the user chose is used until it is used up. When it is, the
+      // next one in the list takes over, and the state remembers that choice,
+      // so this fallback is only reached when the caller did not.
+      const chosen = usable.find((relay) => relay.id === options.activeId)
+      if (chosen) return { relay: chosen, cursor: options.cursor }
+      const index = relays.findIndex((relay) => relay.id === options.activeId)
+      for (let step = 1; index >= 0 && step <= relays.length; step++) {
+        const candidate = relays[(index + step) % relays.length]
+        if (candidate && usable.includes(candidate)) {
+          return { relay: candidate, cursor: options.cursor }
+        }
+      }
+      // Every usable relay has been checked, so nothing is left to serve this.
+      return { relay: usable[0], cursor: options.cursor }
+    }
+  }
+}
+
 /** Describe the models for the UI: what they cost and whether they are routed. */
 export function selectModels(
   models: readonly RoutableModel[],
@@ -91,6 +159,8 @@ export function selectModels(
 export interface RelayTarget {
   readonly url: string
   readonly access: string
+  /** This plugin's id for the relay, so an answer can be traced back to it. */
+  readonly id?: string
   readonly avoid?: readonly string[]
 }
 
@@ -129,6 +199,7 @@ export function relayRequest(request: Request, target: RelayTarget): Request {
   headers.set("x-relay-target", UPSTREAM_ORIGIN)
   headers.set("x-relay-path", path.startsWith("/") ? path : `/${path}`)
   headers.set("x-relay-key", target.access)
+  if (target.id !== undefined) headers.set(RELAY_ID_HEADER, target.id)
   if (target.avoid && target.avoid.length > 0) {
     headers.set("x-relay-avoid", target.avoid.join(","))
   }
@@ -146,6 +217,11 @@ export function relayRequest(request: Request, target: RelayTarget): Request {
   }
 
   return new Request(normalizeRelayUrl(target.url), init)
+}
+
+/** The relay a request was sent through, when this plugin marked it. */
+export function relayIdOf(request: Request): string | undefined {
+  return request.headers.get(RELAY_ID_HEADER) ?? undefined
 }
 
 /** What a relay answer says about the instance that served it. */

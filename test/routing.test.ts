@@ -3,8 +3,11 @@ import {
   isFree,
   isFreeUsageLimit,
   isSelected,
+  nextRelay,
   readResponseState,
+  relayIdOf,
   relayRequest,
+  RELAY_ID_HEADER,
   selectModels,
   type RelayTarget,
   type RoutableModel,
@@ -283,5 +286,150 @@ describe("isFreeUsageLimit", () => {
     expect(isFreeUsageLimit('{"error":{"message":"Internal server error"}}')).toBe(false)
     expect(isFreeUsageLimit("")).toBe(false)
     expect(isFreeUsageLimit("rate limit exceeded")).toBe(false)
+  })
+})
+
+describe("nextRelay", () => {
+  const relays = [{ id: "a" }, { id: "b" }, { id: "c" }]
+  const none = new Set<string>()
+
+  test("fixed serves the chosen relay, even when it is used up", () => {
+    const pick = nextRelay(relays, {
+      strategy: "fixed",
+      activeId: "b",
+      cursor: 0,
+      exhausted: new Set(["b"]),
+    })
+
+    expect(pick.relay?.id).toBe("b")
+    expect(pick.cursor).toBe(0)
+  })
+
+  test("fixed keeps the chosen relay when every relay is used up", () => {
+    const pick = nextRelay(relays, {
+      strategy: "fixed",
+      activeId: "b",
+      cursor: 0,
+      exhausted: new Set(["a", "b", "c"]),
+    })
+
+    expect(pick.relay?.id).toBe("b")
+  })
+
+  test("fixed falls back to the first relay when none is chosen and all are used up", () => {
+    const pick = nextRelay(relays, {
+      strategy: "fixed",
+      cursor: 0,
+      exhausted: new Set(["a", "b", "c"]),
+    })
+
+    expect(pick.relay?.id).toBe("a")
+  })
+
+  test("fixed uses the first usable relay when none is chosen", () => {
+    expect(nextRelay(relays, { strategy: "fixed", cursor: 0, exhausted: none }).relay?.id).toBe("a")
+    expect(
+      nextRelay(relays, { strategy: "fixed", cursor: 0, exhausted: new Set(["a"]) }).relay?.id,
+    ).toBe("b")
+  })
+
+  test("round robin moves on every request and wraps", () => {
+    let cursor = 0
+    const picked: string[] = []
+    for (let index = 0; index < 7; index += 1) {
+      const pick = nextRelay(relays, { strategy: "round-robin", cursor, exhausted: none })
+      if (!pick.relay) throw new Error("no relay")
+      picked.push(pick.relay.id)
+      cursor = pick.cursor
+    }
+
+    expect(picked).toEqual(["a", "b", "c", "a", "b", "c", "a"])
+  })
+
+  test("round robin skips a relay whose allowance is gone", () => {
+    let cursor = 0
+    const picked: string[] = []
+    for (let index = 0; index < 4; index += 1) {
+      const pick = nextRelay(relays, {
+        strategy: "round-robin",
+        cursor,
+        exhausted: new Set(["b"]),
+      })
+      if (!pick.relay) throw new Error("no relay")
+      picked.push(pick.relay.id)
+      cursor = pick.cursor
+    }
+
+    expect(picked).toEqual(["a", "c", "a", "c"])
+  })
+
+  test("round robin serves nothing when every relay is used up", () => {
+    const pick = nextRelay(relays, {
+      strategy: "round-robin",
+      cursor: 3,
+      exhausted: new Set(["a", "b", "c"]),
+    })
+
+    expect(pick.relay).toBeUndefined()
+    expect(pick.cursor).toBe(3)
+  })
+
+  test("until exhausted serves the chosen relay while it lasts", () => {
+    const pick = nextRelay(relays, {
+      strategy: "exhausted",
+      activeId: "b",
+      cursor: 0,
+      exhausted: none,
+    })
+
+    expect(pick.relay?.id).toBe("b")
+  })
+
+  test("until exhausted moves to the relay after the chosen one", () => {
+    const pick = nextRelay(relays, {
+      strategy: "exhausted",
+      activeId: "b",
+      cursor: 0,
+      exhausted: new Set(["b"]),
+    })
+
+    expect(pick.relay?.id).toBe("c")
+  })
+
+  test("until exhausted wraps at the end of the list", () => {
+    const pick = nextRelay(relays, {
+      strategy: "exhausted",
+      activeId: "c",
+      cursor: 0,
+      exhausted: new Set(["c"]),
+    })
+
+    expect(pick.relay?.id).toBe("a")
+  })
+})
+
+describe("the relay marker", () => {
+  test("marks the request with the relay that serves it", () => {
+    const request = new Request("https://opencode.ai/inference/openai/v1/models")
+    const marked = relayRequest(request, { ...target, id: "relay-1" })
+
+    expect(marked.headers.get(RELAY_ID_HEADER)).toBe("relay-1")
+    expect(relayIdOf(marked)).toBe("relay-1")
+  })
+
+  test("replaces a marker the caller brought along", () => {
+    const request = new Request("https://opencode.ai/inference/openai/v1/models", {
+      headers: { "x-relay-id": "stale", "x-relay-key": "stale-key" },
+    })
+    const marked = relayRequest(request, { ...target, id: "relay-2" })
+
+    expect(marked.headers.get(RELAY_ID_HEADER)).toBe("relay-2")
+    expect(marked.headers.get("x-relay-key")).toBe("access-secret")
+  })
+
+  test("an unmarked request has no relay", () => {
+    const request = new Request("https://opencode.ai/inference/openai/v1/models")
+
+    expect(relayIdOf(request)).toBeUndefined()
   })
 })

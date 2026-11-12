@@ -43,6 +43,9 @@ const StoredRelay = Schema.Struct({
 const StoredSettings = Schema.Struct({
   enabled: Schema.Boolean,
   selection: Schema.Literals(["all", "free", "custom"]),
+  // Written before the strategies existed, so a stored value may not have it.
+  // Reading it as optional keeps an older installation's rules intact.
+  strategy: Schema.optionalKey(Schema.Literals(["fixed", "round-robin", "exhausted"])),
   customModels: Schema.Array(Schema.String),
   activeRelayId: Schema.optionalKey(Schema.String),
 })
@@ -81,6 +84,7 @@ function settingsJson(settings: Settings): Schema.JsonObject {
   const json: Record<string, Schema.Json> = {
     enabled: settings.enabled,
     selection: settings.selection,
+    strategy: settings.strategy ?? "fixed",
     customModels: [...settings.customModels],
   }
   if (settings.activeRelayId !== undefined) json.activeRelayId = settings.activeRelayId
@@ -150,9 +154,12 @@ export async function readSettings(storage: StorageDomain): Promise<Settings | u
   const decoded = Schema.decodeUnknownOption(StoredSettings)(raw)
   if (Option.isNone(decoded)) return undefined
   const settings = decoded.value
+  // The strategy was added after the first release, so an older stored value
+  // has none and starts on the fixed relay.
   return {
     enabled: settings.enabled,
     selection: settings.selection,
+    strategy: settings.strategy ?? "fixed",
     customModels: [...settings.customModels],
     ...(settings.activeRelayId !== undefined ? { activeRelayId: settings.activeRelayId } : {}),
   }

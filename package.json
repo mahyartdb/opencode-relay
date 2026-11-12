@@ -4,6 +4,7 @@
   "description": "Route OpenCode's own free models through your own Vercel relays, so the daily allowance follows the relay instead of your IP.",
   "type": "module",
   "license": "MIT",
+  "packageManager": "bun@1.4.2",
   "keywords": [
     "opencode",
     "opencode-plugin",

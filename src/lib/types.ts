@@ -133,6 +133,32 @@ export function toRelaySummary(relay: RelayRecord): RelaySummary {
 /** Which models are routed through a relay. */
 export type Selection = "all" | "free" | "custom"
 
+/**
+ * How the relays are used.
+ *
+ * A relay has an allowance of its own, and so has every address a relay sends
+ * from. These are the ways to spend them.
+ */
+export const STRATEGIES = ["fixed", "round-robin", "exhausted"] as const
+
+export type Strategy = (typeof STRATEGIES)[number]
+
+/** What a strategy means, in words the user can act on. */
+export const STRATEGY_LABELS: Record<Strategy, { readonly title: string; readonly description: string }> = {
+  fixed: {
+    title: "One relay",
+    description: "Every request goes through the relay you chose, even after it is used up",
+  },
+  "round-robin": {
+    title: "Round robin",
+    description: "The requests are spread over the relays in turn",
+  },
+  exhausted: {
+    title: "Until it is exhausted",
+    description: "One relay is used until its allowance is gone, then the next one",
+  },
+}
+
 /** A model of the OpenCode provider, with the free flag the user asked about. */
 export interface ModelInfo {
   readonly id: string
@@ -148,6 +174,8 @@ export interface Status {
   /** False when the plugin is off: requests go direct. */
   readonly enabled: boolean
   readonly selection: Selection
+  /** How the relays are used. */
+  readonly strategy: Strategy
   /** Model ids routed when `selection` is `custom`. */
   readonly customModels: readonly string[]
   /** The relay currently in use, if any. */
@@ -156,6 +184,8 @@ export interface Status {
   readonly relays: readonly RelaySummary[]
   /** Accounts available to deploy with. */
   readonly accounts: readonly AccountSummary[]
+  /** Relays whose allowance is gone and that are not used until brought back. */
+  readonly exhausted: readonly string[]
   /** Last routing note, e.g. why a request went direct. */
   readonly note?: string
 }
@@ -175,7 +205,9 @@ export interface AccountPlan {
   readonly plan: string
   readonly team?: string
   readonly teams: number
-  readonly projects: number
+  /** How many projects were seen on the first page, which is all one call reads. */
+  readonly projectsSampled: number
+  /** True when Vercel has more projects than the sampled page held. */
   readonly projectsMore: boolean
   readonly limits?: PlanLimits
 }

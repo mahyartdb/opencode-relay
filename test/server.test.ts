@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, describe, expect, setDefaultTimeout, test } from "bun:test"
 import type { Server } from "node:http"
 import { startRelay, startTraceStub, traceUrl } from "../tools/relay-harness.ts"
+import { ROTATE_DELAY_MS } from "../src/server/hooks.ts"
 import plugin from "../src/server/index.ts"
 
 /**
@@ -366,6 +367,424 @@ describe("the server half", () => {
 
     await call("setEnabled", { enabled: true })
     expect(emitted.some((entry) => entry.includes("routing enabled"))).toBe(true)
+
+    await dispose?.()
+  })
+
+  test("the first relay becomes the chosen one", async () => {
+    const { context, call } = makeContext()
+    const dispose = await plugin.setup(context as never)
+
+    const added = (await call("addRelay", { name: "local", url, access: ACCESS })) as { id: string }
+    const status = (await call("status")) as { activeRelay?: { id: string } }
+    expect(status.activeRelay?.id).toBe(added.id)
+
+    await dispose?.()
+  })
+
+  test("remembers the strategy across a restart", async () => {
+    const { context, store, call } = makeContext()
+    const dispose = await plugin.setup(context as never)
+    await call("setStrategy", { strategy: "round-robin" })
+    const status = (await call("status")) as { strategy: string }
+    expect(status.strategy).toBe("round-robin")
+    await dispose?.()
+
+    const again = makeContext()
+    for (const [key, value] of store) again.store.set(key, value)
+    const dispose2 = await plugin.setup(again.context as never)
+    const restored = (await again.call("status")) as { strategy: string }
+    expect(restored.strategy).toBe("round-robin")
+    await dispose2?.()
+  })
+
+  test("an installation from before the strategies keeps its rules", async () => {
+    const { context, store, call } = makeContext()
+    const dispose = await plugin.setup(context as never)
+    await call("addRelay", { name: "local", url, access: ACCESS })
+    await call("setEnabled", { enabled: true })
+    await call("setSelection", { selection: "custom", models: ["iceman-free"] })
+    await dispose?.()
+
+    // The strategy was added later, so an older stored value has no such key.
+    const settings = store.get("settings") as Record<string, unknown>
+    delete settings.strategy
+
+    const again = makeContext()
+    for (const [key, value] of store) again.store.set(key, value)
+    const dispose2 = await plugin.setup(again.context as never)
+    const status = (await again.call("status")) as {
+      enabled: boolean
+      selection: string
+      strategy: string
+      customModels: string[]
+    }
+    expect(status.enabled).toBe(true)
+    expect(status.selection).toBe("custom")
+    expect(status.customModels).toEqual(["iceman-free"])
+    expect(status.strategy).toBe("fixed")
+    await dispose2?.()
+  })
+
+  test("a stored choice that points at nothing falls back to the first relay", async () => {
+    const { context, store, call } = makeContext()
+    const dispose = await plugin.setup(context as never)
+    const added = (await call("addRelay", { name: "local", url, access: ACCESS })) as { id: string }
+    await dispose?.()
+
+    const settings = store.get("settings") as Record<string, unknown>
+    settings.activeRelayId = "relay-that-is-gone"
+
+    const again = makeContext()
+    for (const [key, value] of store) again.store.set(key, value)
+    const dispose2 = await plugin.setup(again.context as never)
+    const status = (await again.call("status")) as { activeRelay?: { id: string } }
+    expect(status.activeRelay?.id).toBe(added.id)
+    await dispose2?.()
+  })
+
+  test("round robin spreads requests and sidelines a relay that is used up", async () => {
+    const { context, hooks, call } = makeContext()
+    const dispose = await plugin.setup(context as never)
+
+    await call("addRelay", { name: "one", url, access: ACCESS })
+    await call("addRelay", { name: "two", url, access: ACCESS })
+    const status = (await call("status")) as { relays: readonly { id: string; name: string }[] }
+    const first = status.relays[0]
+    const second = status.relays[1]
+    if (!first || !second) throw new Error("the relays were not stored")
+
+    await call("setEnabled", { enabled: true })
+    await call("setSelection", { selection: "all" })
+    await call("setStrategy", { strategy: "round-robin" })
+
+    const send = async () => {
+      const input = {
+        model: { id: "iceman-free", providerID: "opencode" },
+        request: new Request("https://opencode.ai/inference/openai/v1/models"),
+      }
+      await hooks.get("http.request")?.(input as never)
+      return input.request
+    }
+
+    const one = await send()
+    const two = await send()
+    expect(one.headers.get("x-relay-id")).toBe(first.id)
+    expect(two.headers.get("x-relay-id")).toBe(second.id)
+
+    // The second relay answers 429, so it is the one that is used up, even
+    // though the first relay is the one the user chose.
+    const answer = new Response("free usage limit", {
+      status: 429,
+      headers: { "x-relay-egress": "9.9.9.9" },
+    })
+    await hooks.get("http.response")?.({
+      model: { id: "iceman-free", providerID: "opencode" },
+      request: two,
+      response: answer,
+    } as never)
+    const after = (await call("status")) as { exhausted: string[] }
+    expect(after.exhausted).toEqual([second.id])
+
+    // The next request skips the exhausted relay and lands on the first one.
+    const three = await send()
+    expect(three.headers.get("x-relay-id")).toBe(first.id)
+    expect(three.headers.get("x-relay-avoid")).toBeNull()
+
+    // Bringing it back makes it usable again, and its spent address is still
+    // avoided, because that is a fact about the address and not about the relay.
+    const restored = (await call("resetExhausted")) as { restored: string[] }
+    expect(restored.restored).toEqual([second.id])
+    // The rotation starts over, so the first request goes to the first relay
+    // and the next one reaches the relay that was just brought back.
+    const four = await send()
+    expect(four.headers.get("x-relay-id")).toBe(first.id)
+    const five = await send()
+    expect(five.headers.get("x-relay-id")).toBe(second.id)
+    expect(five.headers.get("x-relay-avoid")).toBe("9.9.9.9")
+    const clean = (await call("status")) as { exhausted: string[] }
+    expect(clean.exhausted).toEqual([])
+
+    await dispose?.()
+  })
+
+  test("removing the chosen relay hands the choice to the next one", async () => {
+    const { context, call } = makeContext()
+    const dispose = await plugin.setup(context as never)
+
+    const one = (await call("addRelay", { name: "one", url, access: ACCESS })) as { id: string }
+    const two = (await call("addRelay", { name: "two", url, access: ACCESS })) as { id: string }
+    await call("useRelay", { id: one.id })
+    const removed = (await call("removeRelay", { id: one.id, deleteProject: false })) as {
+      removed: boolean
+      projectDeleted: boolean
+    }
+    expect(removed).toEqual({ removed: true, projectDeleted: false })
+
+    const status = (await call("status")) as { activeRelay?: { id: string } }
+    expect(status.activeRelay?.id).toBe(two.id)
+
+    await dispose?.()
+  })
+
+  test("a used-up answer is retried on the one-relay strategy too", async () => {
+    const { context, hooks, call } = makeContext()
+    const dispose = await plugin.setup(context as never)
+
+    const only = (await call("addRelay", { name: "only", url, access: ACCESS })) as { id: string }
+    await call("useRelay", { id: only.id })
+    await call("setEnabled", { enabled: true })
+    await call("setSelection", { selection: "all" })
+    expect(((await call("status")) as { strategy: string }).strategy).toBe("fixed")
+
+    const request = {
+      sessionID: "session-fixed",
+      model: { id: "iceman-free", providerID: "opencode" },
+      request: new Request("https://opencode.ai/inference/openai/v1/models"),
+    }
+    await hooks.get("http.request")?.(request as never)
+    expect(request.request.headers.get("x-relay-id")).toBe(only.id)
+
+    const limited: {
+      sessionID: string
+      model: { id: string }
+      error: { status: number; response: { body: string } }
+      attempt: number
+      decision: { retry: boolean; delay?: number }
+    } = {
+      sessionID: "session-fixed",
+      model: { id: "iceman-free" },
+      error: { status: 429, response: { body: '{"error":{"message":"Free usage limit reached"}}' } },
+      attempt: 1,
+      decision: { retry: false },
+    }
+    await hooks.get("retry")?.(limited as never)
+    expect(limited.decision).toEqual({ retry: true, delay: ROTATE_DELAY_MS })
+
+    await dispose?.()
+  })
+
+  test("asks for another attempt when the instance behind the relay is used up", async () => {
+    const { context, hooks, call } = makeContext()
+    const dispose = await plugin.setup(context as never)
+    const retry = hooks.get("retry")
+
+    // Only a request this plugin routed can be blamed on a relay.
+    const directRotation = {
+      sessionID: "session-direct",
+      model: { id: "iceman-free" },
+      error: { status: 409 },
+      attempt: 1,
+      decision: { retry: false },
+    }
+    await retry?.(directRotation as never)
+    expect(directRotation.decision).toEqual({ retry: false })
+
+    await call("addRelay", { name: "local", url, access: ACCESS })
+    await call("setEnabled", { enabled: true })
+    await call("setSelection", { selection: "all" })
+    const request = {
+      sessionID: "session-1",
+      model: { id: "iceman-free", providerID: "opencode" },
+      request: new Request("https://opencode.ai/inference/openai/v1/models"),
+    }
+    await hooks.get("http.request")?.(request as never)
+
+    // The instance behind the relay is used up, so another attempt is asked
+    // for, and the attempt count is not allowed to grow without end.
+    const first: {
+      sessionID: string
+      model: { id: string }
+      error: { status: number }
+      attempt: number
+      decision: { retry: boolean; delay?: number }
+    } = {
+      sessionID: "session-1",
+      model: { id: "iceman-free" },
+      error: { status: 409 },
+      attempt: 1,
+      decision: { retry: false },
+    }
+    await retry?.(first as never)
+    expect(first.decision).toEqual({ retry: true, delay: ROTATE_DELAY_MS })
+
+    const last = {
+      sessionID: "session-1",
+      model: { id: "iceman-free" },
+      error: { status: 409 },
+      attempt: 9,
+      decision: { retry: false },
+    }
+    await retry?.(last as never)
+    expect(last.decision).toEqual({ retry: false })
+
+    const limited: {
+      sessionID: string
+      model: { id: string }
+      error: { status: number; response: { body: string } }
+      attempt: number
+      decision: { retry: boolean; delay?: number }
+    } = {
+      sessionID: "session-1",
+      model: { id: "iceman-free" },
+      error: { status: 429, response: { body: '{"error":{"message":"Free usage limit reached"}}' } },
+      attempt: 1,
+      decision: { retry: false },
+    }
+    await retry?.(limited as never)
+    expect(limited.decision).toEqual({ retry: true, delay: ROTATE_DELAY_MS })
+
+    // The same answer for a request that never went through a relay is not the
+    // relay's fault, so nothing is retried.
+    const direct = {
+      sessionID: "session-2",
+      model: { id: "gpt-6.1-sol" },
+      error: { status: 429, response: { body: '{"error":{"message":"Free usage limit reached"}}' } },
+      attempt: 1,
+      decision: { retry: false },
+    }
+    await retry?.(direct as never)
+    expect(direct.decision).toEqual({ retry: false })
+
+    await dispose?.()
+  })
+
+  test("never routes through a relay that did not answer", async () => {
+    const { context, hooks, call } = makeContext()
+    const dispose = await plugin.setup(context as never)
+
+    // Port 9 is the discard port: nothing listens there, so the check fails.
+    const dead = (await call("addRelay", {
+      name: "dead end",
+      url: "http://127.0.0.1:9",
+      access: ACCESS,
+    })) as { id: string; reachable: boolean }
+    expect(dead.reachable).toBe(false)
+    await call("useRelay", { id: dead.id })
+    await call("setEnabled", { enabled: true })
+    await call("setSelection", { selection: "all" })
+
+    const input = {
+      sessionID: "session-dead",
+      model: { id: "iceman-free", providerID: "opencode" },
+      request: new Request("https://opencode.ai/inference/openai/v1/models"),
+    }
+    await hooks.get("http.request")?.(input as never)
+    // The session keeps working: the request goes where it would have gone
+    // without the plugin, rather than to a relay that cannot answer.
+    expect(input.request.url).toBe("https://opencode.ai/inference/openai/v1/models")
+
+    const status = (await call("status")) as { skipped: readonly string[]; note?: string }
+    expect(status.skipped).toContain(dead.id)
+    expect(status.note).toContain("dead end did not answer")
+
+    await dispose?.()
+  })
+
+  test("a relay that cannot be reached is skipped after one failed request", async () => {
+    const { context, hooks, call } = makeContext()
+    const dispose = await plugin.setup(context as never)
+
+    await call("addRelay", { name: "local", url, access: ACCESS })
+    const status = (await call("status")) as { relays: readonly { id: string }[] }
+    const id = relayId(status)
+    await call("useRelay", { id })
+    await call("setEnabled", { enabled: true })
+    await call("setSelection", { selection: "all" })
+
+    const first = {
+      sessionID: "session-1",
+      model: { id: "iceman-free", providerID: "opencode" },
+      request: new Request("https://opencode.ai/inference/openai/v1/models"),
+    }
+    await hooks.get("http.request")?.(first as never)
+    expect(first.request.url).toContain(url)
+
+    // A failure with no status never reached the relay. Another attempt is
+    // asked for, and the relay is left alone for a while.
+    const retryInput: {
+      sessionID: string
+      model: { id: string }
+      error: { status?: number; message: string }
+      attempt: number
+      decision: { retry: boolean; delay?: number }
+    } = {
+      sessionID: "session-1",
+      model: { id: "iceman-free" },
+      error: { message: "fetch failed" },
+      attempt: 1,
+      decision: { retry: false },
+    }
+    await hooks.get("retry")?.(retryInput as never)
+    expect(retryInput.decision).toEqual({ retry: true, delay: ROTATE_DELAY_MS })
+
+    const second = {
+      sessionID: "session-1",
+      model: { id: "iceman-free", providerID: "opencode" },
+      request: new Request("https://opencode.ai/inference/openai/v1/models"),
+    }
+    await hooks.get("http.request")?.(second as never)
+    expect(second.request.url).toBe("https://opencode.ai/inference/openai/v1/models")
+
+    const after = (await call("status")) as { skipped: readonly string[] }
+    expect(after.skipped).toContain(id)
+
+    await dispose?.()
+  })
+
+  test("a relay that answers with a server error is skipped too", async () => {
+    const { context, hooks, call } = makeContext()
+    const dispose = await plugin.setup(context as never)
+
+    await call("addRelay", { name: "local", url, access: ACCESS })
+    const status = (await call("status")) as { relays: readonly { id: string }[] }
+    const id = relayId(status)
+    await call("useRelay", { id })
+    await call("setEnabled", { enabled: true })
+    await call("setSelection", { selection: "all" })
+
+    const input = {
+      sessionID: "session-1",
+      model: { id: "iceman-free", providerID: "opencode" },
+      request: new Request("https://opencode.ai/inference/openai/v1/models"),
+    }
+    await hooks.get("http.request")?.(input as never)
+
+    const retryInput: {
+      sessionID: string
+      model: { id: string }
+      error: { status: number; message: string }
+      attempt: number
+      decision: { retry: boolean; delay?: number }
+    } = {
+      sessionID: "session-1",
+      model: { id: "iceman-free" },
+      error: { status: 502, message: "Upstream request failed" },
+      attempt: 1,
+      decision: { retry: false },
+    }
+    await hooks.get("retry")?.(retryInput as never)
+    expect(retryInput.decision).toEqual({ retry: true, delay: ROTATE_DELAY_MS })
+
+    const after = (await call("status")) as { skipped: readonly string[] }
+    expect(after.skipped).toContain(id)
+
+    await dispose?.()
+  })
+
+  test("a test of a relay says whether it answered and how fast", async () => {
+    const { context, call } = makeContext()
+    const dispose = await plugin.setup(context as never)
+
+    const added = (await call("addRelay", { name: "local", url, access: ACCESS })) as { id: string }
+    const result = (await call("testRelay", { id: added.id })) as {
+      reachable: boolean
+      status: number
+      ms: number
+    }
+    expect(result.reachable).toBe(true)
+    expect(result.status).toBe(200)
+    expect(result.ms).toBeGreaterThanOrEqual(0)
 
     await dispose?.()
   })

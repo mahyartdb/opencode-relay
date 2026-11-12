@@ -8,7 +8,8 @@
 // Changes made here:
 //   - RELAY_TOKEN replaces POLYGATE_RELAY_TOKEN.
 //   - RELAY_ALLOWED_HOSTS replaces POLYGATE_ALLOWED_HOSTS and defaults to opencode.ai only, so a deployed relay
-//     is not a general-purpose open proxy.
+//     is not a general-purpose open proxy. A "*" entry is refused unless RELAY_ALLOW_ANY_HOST=1 is set.
+//   - An upstream failure is answered with a generic 502; the detail stays in the deployment log.
 //   - The x-relay-* header protocol is unchanged, so a relay deployed by Polygate and a relay deployed by this
 //     plugin are interchangeable.
 import crypto from 'node:crypto';
@@ -62,11 +63,12 @@ const ALLOWED = (process.env.RELAY_ALLOWED_HOSTS || 'opencode.ai')
   .map((s) => s.trim().toLowerCase())
   .filter(Boolean);
 
-// Any public HTTPS host is allowed unless RELAY_ALLOWED_HOSTS narrows it (comma separated; "*.example.com" matches its
-// subdomains). Addresses and local names never are, so the relay cannot be pointed at a private network.
+// A wildcard turns the relay into a forwarder for any public host, so it is refused unless the operator asks for it
+// explicitly. Addresses and local names are never allowed, so the relay cannot be pointed at a private network.
+const ANY_HOST = process.env.RELAY_ALLOW_ANY_HOST === '1';
 const hostAllowed = (h) =>
   !(/^[\d.]+$/.test(h) || h.includes(':') || h === 'localhost' || /\.(localhost|local|internal|lan)$/.test(h)) &&
-  ALLOWED.some((a) => a === '*' || a === h || (a.startsWith('*.') && h.endsWith(a.slice(1))));
+  ALLOWED.some((a) => (a === '*' ? ANY_HOST : a === h || (a.startsWith('*.') && h.endsWith(a.slice(1)))));
 
 // Headers the platform adds about the caller; dropping them keeps the caller's address, location and account token
 // away from the provider.
@@ -241,7 +243,10 @@ export default {
         { status: r.status, headers: out },
       );
     } catch (e) {
-      return json(502, { error: String((e && e.message) || e) });
+      // The detail is useful in the deployment log and is not needed by the
+      // caller, so it stays here instead of travelling back over the wire.
+      console.error('[relay] upstream request failed', e);
+      return json(502, { error: 'Upstream request failed' });
     } finally {
       if (!handedOver) finish();
     }

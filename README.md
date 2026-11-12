@@ -64,30 +64,78 @@ Then point OpenCode at the folder:
 
 ## Use
 
-Type `/relay` in the prompt. The command opens a menu:
+Type `/relay` in the prompt and press enter, pick "/relay" from the list that
+appears when you type a slash, or click the footer pill. The menu stays open
+after every action, so a visit can make several changes; Esc or Close leaves it.
+
+### Routing
 
 - **Turn routing on / off** - routing starts off. Nothing is changed until you
   turn it on.
 - **Choose models to route** - route every model, only the free ones, or pick
   them one by one. A model is free when it costs nothing to run, which is what
   puts it on the free allowance.
+- **Choose how the relays are used** - the strategy decides which relay serves
+  a request:
+  - **One relay** - every request goes through the chosen relay, even after it
+    is marked used up. Nothing moves without you.
+  - **Round robin** - one request per relay, in list order, skipping the relays
+    whose allowance is gone. When a relay answers 429 it is sidelined, and the
+    next request goes to the next usable relay.
+  - **Until it is exhausted** - the chosen relay carries every request until it
+    reports that its allowance is gone, then the next relay takes over.
+
+A relay that does not answer is skipped for a minute, and the request goes
+direct instead. With one relay that means direct until it answers again; with
+a rotation the next relay takes the request. The menu and the footer say when
+this is happening, so a quiet fallback is never mistaken for a working relay.
+Routing can slow a session down or spend the direct allowance, but it does not
+take the session down because one relay is unreachable.
+
+### Relays
+
+- **Choose a relay** - switch which relay is chosen.
+- **Test a relay** - press `t` in the relay list, or `t` in the main menu to
+  test the chosen relay. The answer is a toast with the address the relay used
+  and how many milliseconds it took, and the list stays open.
 - **Deploy a relay** - pick a Vercel account and a region. Each relay is its
   own Vercel project running in one region, because a Vercel project on the
-  Hobby plan runs in exactly one region.
-- **Choose a relay** - switch which relay is active.
-- **Add a Vercel account** - you need a Vercel API token with permission to
-  create projects. The token is stored on your machine and sent only to
-  Vercel.
-- **Remove an account / a relay** - removing a relay can also delete its Vercel
-  project, so the relay stops running and stops costing anything.
-- **Track an existing relay** - use a relay you deployed yourself.
+  Hobby plan runs in exactly one region. With one account the account is used
+  without asking.
+- **Track an existing relay** - use a relay you deployed yourself, by its
+  address and access token.
 - **Update the active relay** - redeploy the current code over the relay that is
   already running.
-- **Test the active relay** - checks that the relay answers and reports the
-  address it sends from.
+- **Bring the used-up relays back** - a relay sidelined by a 429 stays out until
+  you say it may be tried again. This entry puts every such relay back.
+- **Remove a relay** - removing a relay can also delete its Vercel project, so
+  the relay stops running and stops costing anything.
 
-A small pill in the footer shows whether routing is on, which relay is active,
-and how many models are routed.
+### Accounts
+
+- **Add a Vercel account** - you need a Vercel API token with permission to
+  create projects. The token is stored on your machine and sent only to Vercel.
+- **Remove an account** - the relays it deployed keep running; only the token
+  and the name are forgotten.
+
+### Keys
+
+| Key | What it does |
+| --- | --- |
+| Up / Down | Move through a list |
+| Enter | Choose |
+| `t` | Test the relay (relay list, and the main menu for the chosen relay) |
+| Esc | Leave the current page, or the menu |
+
+A small pill in the footer shows whether routing is on, how many relays are
+ready, how many models are routed, and how many relays are used up or not
+answering. When the chosen relay is not answering, the pill says so and says
+that requests go direct. Clicking it opens the same menu.
+
+Routing is off until you turn it on, and turning it off again is one entry in
+the menu: "Turn routing off". Requests then go straight to OpenCode, exactly
+as they did before the plugin was installed, and no relay is used at all.
+
 ## What it costs
 
 The relays run on Vercel. On the Hobby plan a project runs in one region and
@@ -105,6 +153,16 @@ deploys only when you ask it to.
   Vercel.
 - The relay strips the headers that describe the caller, so your address and
   location never reach the provider.
+- `RELAY_ALLOWED_HOSTS` defaults to `opencode.ai`. A wildcard entry makes the
+  relay a forwarder for any public host, so it is refused unless
+  `RELAY_ALLOW_ANY_HOST=1` is set as well. Only do that if you mean it.
+- Tokens are stored as they are, unencrypted, in OpenCode's plugin storage for
+  the local user. That is a deliberate trade: no key to lose, nothing to
+  recover. Anyone who can read your user profile can read them, so revoke the
+  Vercel token and redeploy a relay if a machine is lost or shared.
+- The plugin is developed and tested against OpenCode 2.2.7. The package
+  declares `@opencode/plugin >=2.2.7 <3`; a newer minor may change the plugin
+  API.
 
 ## How it is built
 
@@ -116,6 +174,9 @@ deploys only when you ask it to.
   - `state.ts` - the accounts, the relays and the routing rules
   - `storage.ts` - how that state is written and read back
 - `src/tui/` - the terminal part: the `/relay` command, its dialogs, the status pill
+  - `dialogs.tsx` - the flows, one conversation per action
+  - `present.ts` - the menu entries and the pill line, as pure functions
+  - `pill.tsx` - the clickable footer line
 - `src/rpc.ts` - the contract the two halves share, typed with Standard Schema
 - `src/lib/types.ts` - the shapes both halves agree on
 - `src/lib/routing.ts` - which models are routed, and how a request is rewritten
@@ -128,6 +189,10 @@ deploys only when you ask it to.
 The plugin ships compiled JavaScript. OpenCode compiles plugin TUI parts with
 its own Solid transform, but only outside `node_modules`, so a published
 package has to arrive already compiled.
+
+The package has one server entry (the package root) and one terminal entry
+(`./tui`). `./server` is an alias of the root, kept for hosts that ask for a
+server entry by name.
 
 ## Development
 

@@ -30,6 +30,8 @@ export interface DeployRelayResult {
 export interface RelayProbe {
   readonly reachable: boolean
   readonly status: number
+  /** How long the answer took, in milliseconds. */
+  readonly ms: number
   readonly egress?: string
   readonly runtime?: string
 }
@@ -167,7 +169,7 @@ export async function inspectVercel(account: VercelAccount): Promise<AccountPlan
   const result: AccountPlan = {
     plan,
     teams: teams.length,
-    projects: projects.length,
+    projectsSampled: projects.length,
     projectsMore,
     ...(teamSlug ? { team: teamSlug } : {}),
     ...(limits ? { limits } : {}),
@@ -284,6 +286,8 @@ export async function deleteVercelProject(account: VercelAccount, project: strin
 }
 
 export async function probeRelay(url: string, access: string): Promise<RelayProbe> {
+  const started = performance.now()
+  const elapsed = () => Math.max(0, Math.round(performance.now() - started))
   try {
     const res = await fetch(url, {
       method: "GET",
@@ -295,7 +299,7 @@ export async function probeRelay(url: string, access: string): Promise<RelayProb
     })
     const status = res.status
     if (!res.ok) {
-      return { reachable: false, status }
+      return { reachable: false, status, ms: elapsed() }
     }
     let data: unknown
     try {
@@ -309,10 +313,11 @@ export async function probeRelay(url: string, access: string): Promise<RelayProb
     return {
       reachable: true,
       status,
+      ms: elapsed(),
       ...(egress !== undefined ? { egress } : {}),
       ...(runtime !== undefined ? { runtime } : {}),
     }
   } catch {
-    return { reachable: false, status: 0 }
+    return { reachable: false, status: 0, ms: elapsed() }
   }
 }

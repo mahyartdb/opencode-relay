@@ -15,15 +15,18 @@ export default Plugin.define({
   setup(context) {
     const client = relayClient(context)
 
-    // The pill and the menu share one snapshot, so the footer can never claim
-    // something different from the dialog the user just used.
-    const releaseSlot = context.ui.slot({ append: "prompt.footer.status", render: renderRelayPill })
-
     const openMenu = () => {
       void openRelayMenu(context, client).catch((error: unknown) => {
         reportError(context, "Relay", error)
       })
     }
+
+    // The pill and the menu share one snapshot, so the footer can never claim
+    // something different from the dialog the user just used.
+    const releaseSlot = context.ui.slot({
+      append: "prompt.footer.status",
+      render: () => renderRelayPill(openMenu),
+    })
 
     // The command palette entry opens the menu directly.
     context.keymap.layer(() => ({

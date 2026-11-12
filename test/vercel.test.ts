@@ -50,7 +50,7 @@ describe("inspectVercel", () => {
     expect(plan.plan).toBe("pro")
     expect(plan.team).toBe("acme")
     expect(plan.teams).toBe(2)
-    expect(plan.projects).toBe(3)
+    expect(plan.projectsSampled).toBe(3)
     expect(plan.projectsMore).toBe(true)
     expect(plan.limits).toEqual(PLAN_LIMITS["pro"])
     expect(calls.length).toBe(2)
@@ -168,7 +168,8 @@ describe("probeRelay", () => {
     }) as unknown as typeof fetch
 
     const probe = await probeRelay("https://relay.example.com", "access-secret")
-    expect(probe).toEqual({ reachable: true, status: 200, egress: "1.2.3.4", runtime: "bun" })
+    expect(probe).toMatchObject({ reachable: true, status: 200, egress: "1.2.3.4", runtime: "bun" })
+    expect(probe.ms).toBeGreaterThanOrEqual(0)
   })
 
   test("returns {reachable:false,status:0} on network error", async () => {
@@ -177,7 +178,8 @@ describe("probeRelay", () => {
     }) as unknown as typeof fetch
 
     const probe = await probeRelay("https://relay.example.com", "access-secret")
-    expect(probe).toEqual({ reachable: false, status: 0 })
+    expect(probe).toMatchObject({ reachable: false, status: 0 })
+    expect(probe.ms).toBeGreaterThanOrEqual(0)
   })
 })
 

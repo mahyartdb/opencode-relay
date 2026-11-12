@@ -15,6 +15,9 @@ import { Rpc } from "@opencode/plugin/rpc"
 /** Which models are routed through a relay. */
 const Selection = Schema.Literals(["all", "free", "custom"])
 
+/** How the relays are used. */
+const Strategy = Schema.Literals(["fixed", "round-robin", "exhausted"])
+
 /** A relay as the TUI sees it. The access token never leaves the server. */
 const RelaySummary = Schema.Struct({
   id: Schema.String,
@@ -57,10 +60,14 @@ export const Relay = Rpc.define({
         Schema.Struct({
           enabled: Schema.Boolean,
           selection: Selection,
+          strategy: Strategy,
           customModels: Schema.Array(Schema.String),
           activeRelay: Schema.optional(RelaySummary),
           relays: Schema.Array(RelaySummary),
           accounts: Schema.Array(AccountSummary),
+          exhausted: Schema.Array(Schema.String),
+          /** Relays that are not used right now because they did not answer. */
+          skipped: Schema.Array(Schema.String),
           note: Schema.optional(Schema.String),
         }),
       ),
@@ -92,7 +99,8 @@ export const Relay = Rpc.define({
           plan: Schema.optional(Schema.String),
           team: Schema.optional(Schema.String),
           teams: Schema.Number,
-          projects: Schema.Number,
+          projectsSampled: Schema.Number,
+          projectsMore: Schema.Boolean,
           limits: Schema.optional(
             Schema.Struct({
               regionsPerProject: Schema.Number,
@@ -175,7 +183,11 @@ export const Relay = Rpc.define({
         }),
       ),
       output: Schema.toStandardSchemaV1(
-        Schema.Struct({ removed: Schema.Boolean }),
+        Schema.Struct({
+          removed: Schema.Boolean,
+          /** True when the project was asked for and Vercel confirmed it is gone. */
+          projectDeleted: Schema.Boolean,
+        }),
       ),
     },
 
@@ -199,6 +211,8 @@ export const Relay = Rpc.define({
         Schema.Struct({
           reachable: Schema.Boolean,
           status: Schema.Number,
+          /** How long the relay took to answer, in milliseconds. */
+          ms: Schema.Number,
           egress: Schema.optional(Schema.String),
           runtime: Schema.optional(Schema.String),
         }),
@@ -234,6 +248,20 @@ export const Relay = Rpc.define({
           selection: Schema.String,
           customModels: Schema.Array(Schema.String),
         }),
+      ),
+    },
+
+    /** Choose how the relays are used. */
+    setStrategy: {
+      input: Schema.toStandardSchemaV1(Schema.Struct({ strategy: Strategy })),
+      output: Schema.toStandardSchemaV1(Schema.Struct({ strategy: Strategy })),
+    },
+
+    /** Bring the relays whose allowance is gone back into use. */
+    resetExhausted: {
+      input: Schema.toStandardSchemaV1(Schema.Struct({})),
+      output: Schema.toStandardSchemaV1(
+        Schema.Struct({ restored: Schema.Array(Schema.String) }),
       ),
     },
   },

@@ -5,37 +5,17 @@
  * is better than a placeholder nobody can act on.
  */
 import { createMemo, Show } from "solid-js"
-import { currentModels, currentStatus, type RelayModel, type RelayStatus } from "./state.ts"
-
-/** How many models the current selection routes. */
-function routedCount(status: RelayStatus, models: readonly RelayModel[]): number {
-  if (status.selection === "custom") return status.customModels.length
-  if (status.selection === "free") return models.filter((model) => model.free).length
-  return models.length
-}
-
-/** The line the footer shows, or undefined when there is nothing worth saying. */
-function summarize(status: RelayStatus | undefined, models: readonly RelayModel[]): string | undefined {
-  if (!status) return undefined
-  const relay = status.activeRelay
-  if (!status.enabled) {
-    if (!relay && status.relays.length === 0) return undefined
-    return "relay off"
-  }
-  if (!relay) return "relay on, no relay"
-  const count = routedCount(status, models)
-  // The command is named, so the footer says how to open the menu.
-  return `relay ${relay.name} · ${count} model${count === 1 ? "" : "s"} · /relay`
-}
+import { summarizePill } from "./present.ts"
+import { currentModels, currentStatus } from "./state.ts"
 
 /** The pill itself. */
-export function RelayPill() {
-  const line = createMemo(() => summarize(currentStatus(), currentModels()))
+export function RelayPill(props: { readonly onOpen: () => void }) {
+  const line = createMemo(() => summarizePill(currentStatus(), currentModels()))
   return (
     <Show when={line()}>
       {(text) => (
         <box flexDirection="row" flexShrink={1}>
-          <text wrapMode="none" truncate>
+          <text wrapMode="none" truncate onMouseUp={props.onOpen}>
             {text()}
           </text>
         </box>
@@ -45,6 +25,6 @@ export function RelayPill() {
 }
 
 /** The pill as the slot renders it; the entry point keeps its own file free of markup. */
-export function renderRelayPill() {
-  return <RelayPill />
+export function renderRelayPill(onOpen: () => void) {
+  return <RelayPill onOpen={onOpen} />
 }

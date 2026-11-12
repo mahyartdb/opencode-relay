@@ -10,10 +10,12 @@ import type { RpcHandlers } from "@opencode/plugin/promise/rpc"
 import { Relay } from "../rpc.ts"
 import {
   regionLabel,
+  STRATEGY_LABELS,
   toAccountSummary,
   toRelaySummary,
   type AccountPlan,
   type RelayRecord,
+  type Strategy,
 } from "../lib/types.ts"
 import { selectModels } from "../lib/routing.ts"
 import { redact } from "../lib/redact.ts"
@@ -59,6 +61,8 @@ function describeState(
   total: number,
   catalog: ModelCatalog,
   notes: readonly string[],
+  exhausted: readonly string[],
+  skipped: readonly string[],
 ): string {
   if (!settings.enabled) return "Routing is off: requests go straight to OpenCode."
   if (!active) return "Routing is on, but no relay is chosen."
@@ -66,8 +70,8 @@ function describeState(
   const where = place.length > 0 ? ` in ${place}` : ""
   const models =
     total === 0
-      ? "no model is routed"
-      : `${routed} of ${total} OpenCode models are routed`
+      ? "no model"
+      : `${routed} of ${total} OpenCode models`
   const problems: string[] = []
   const failure = catalog.lastFailure()
   if (failure) {
@@ -75,8 +79,33 @@ function describeState(
     // user from believing nothing is routed when in fact nothing is known.
     problems.push("The model list could not be read, so no model is known to be free.")
   }
+  if (exhausted.length > 0) {
+    problems.push(`${exhausted.length} relay${exhausted.length === 1 ? " is" : "s are"} used up.`)
+  }
+  const activeSkipped = skipped.includes(active.name)
+  // The chosen relay gets its own sentence below, so naming it twice would be
+  // noise. The other relays that are down still need to be named.
+  const otherSkipped = activeSkipped ? skipped.filter((name) => name !== active.name) : skipped
+  if (otherSkipped.length > 0) {
+    // A relay that does not answer is named, because a request that quietly
+    // goes direct still spends the direct allowance the user was saving.
+    problems.push(
+      otherSkipped.length === 1
+        ? `${otherSkipped[0]} did not answer, so it is skipped.`
+        : `${otherSkipped.join(", ")} did not answer, so they are skipped.`,
+    )
+  }
   problems.push(...notes)
-  const note = `Routing ${models} through ${active.name}${where}.`
+  // A round robin answer does not come from one relay, so naming one would be
+  // a half truth.
+  const note =
+    settings.strategy === "round-robin"
+      ? `Routing ${models} across the relays in turn.`
+      : activeSkipped
+        ? settings.strategy === "fixed"
+          ? `${active.name}${where} did not answer, so requests go direct until it answers again.`
+          : `${active.name}${where} did not answer, so the next relay that answers takes over.`
+        : `Routing ${models} through ${active.name}${where} (${STRATEGY_LABELS[settings.strategy].title.toLowerCase()}).`
   return problems.length === 0 ? note : `${note} ${problems.join(" ")}`
 }
 
@@ -95,14 +124,37 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
         settings.customModels,
       )
       const routed = list.filter((model) => model.routed).length
+      // A relay is skipped when it failed its last check or when a request
+      // could not reach it a moment ago. Both are reported, because routing is
+      // only real when a relay actually serves the request.
+      const skipped = [
+        ...new Set([
+          ...state.coolingRelays(),
+          ...state.relays()
+            .filter((relay) => relay.status === "unreachable")
+            .map((relay) => relay.id),
+        ]),
+      ]
       return {
         enabled: settings.enabled,
         selection: settings.selection,
+        strategy: settings.strategy,
         customModels: [...settings.customModels],
         ...(active ? { activeRelay: toRelaySummary(active) } : {}),
         relays: state.relays().map((relay) => toRelaySummary(relay)),
         accounts: state.accounts().map((account) => toAccountSummary(account)),
-        note: describeState(settings, active, routed, list.length, catalog, state.notes()),
+        exhausted: state.exhaustedRelays(),
+        skipped,
+        note: describeState(
+          settings,
+          active,
+          routed,
+          list.length,
+          catalog,
+          state.notes(),
+          state.exhaustedRelays(),
+          skipped.map((id) => state.relay(id)?.name ?? id),
+        ),
       }
     },
 
@@ -143,7 +195,8 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
         ...(plan.plan ? { plan: plan.plan } : {}),
         ...(plan.team ? { team: plan.team } : {}),
         teams: plan.teams,
-        projects: plan.projects,
+        projectsSampled: plan.projectsSampled,
+        projectsMore: plan.projectsMore,
         ...(plan.limits ? { limits: plan.limits } : {}),
       }
     },
@@ -241,10 +294,20 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
     /** Remove a relay, and optionally delete its Vercel project. */
     removeRelay: async (input) => {
       const relay = state.relay(input.id)
-      if (!relay) return { removed: false }
-      if (input.deleteProject) {
+      if (!relay) return { removed: false, projectDeleted: false }
+      // The answer must say whether the project really went, because the user
+      // asked for it and a failed deletion means it is still running.
+      let projectDeleted = false
+      if (input.deleteProject && relay.project.length > 0) {
         const account = state.account(relay.accountId)
-        if (account && relay.project.length > 0) {
+        if (!account) {
+          // A tracked relay has no account, and a deployed relay whose account
+          // was removed can no longer be deleted from here. Saying so is better
+          // than a success message about a project that is still running.
+          state.noteFailure(
+            `The Vercel project of ${relay.name} was not deleted: its account is no longer stored.`,
+          )
+        } else {
           try {
             await deleteVercelProject(
               {
@@ -253,6 +316,7 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
               },
               relay.project,
             )
+            projectDeleted = true
           } catch (err) {
             // The relay is gone either way, and a project left behind in the
             // dashboard is a smaller problem than a failed removal. The user is
@@ -265,7 +329,7 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
       }
       await state.removeRelay(input.id)
       await announce("relay removed")
-      return { removed: true }
+      return { removed: true, projectDeleted }
     },
 
     /** Redeploy the current relay code, keeping the URL and access token. */
@@ -307,13 +371,14 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
     /** Ask a relay whether it answers, and which address it sends from. */
     testRelay: async (input) => {
       const relay = state.relay(input.id)
-      if (!relay) return { reachable: false, status: 0 }
+      if (!relay) return { reachable: false, status: 0, ms: 0 }
       const probe = await probeRelay(relay.url, relay.access)
       const changed = await state.setRelayStatus(relay.id, probe.reachable ? "ready" : "unreachable")
       if (changed) await announce("relay status changed")
       return {
         reachable: probe.reachable,
         status: probe.status,
+        ms: probe.ms,
         ...(probe.egress !== undefined ? { egress: probe.egress } : {}),
         ...(probe.runtime !== undefined ? { runtime: probe.runtime } : {}),
       }
@@ -338,6 +403,20 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
       const settings = await state.setSelection(input.selection, input.models)
       await announce("selection changed")
       return { selection: settings.selection, customModels: [...settings.customModels] }
+    },
+
+    /** Choose how the relays are used. */
+    setStrategy: async (input) => {
+      await state.setStrategy(input.strategy)
+      await announce("strategy changed")
+      return { strategy: input.strategy }
+    },
+
+    /** Bring the relays whose allowance is gone back into use. */
+    resetExhausted: async () => {
+      const restored = state.restoreExhausted()
+      await announce("exhausted relays restored")
+      return { restored }
     },
   }
 }
