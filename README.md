@@ -14,6 +14,11 @@ own allowance, so a few exits multiply what you get out of the free tier.
 Only the `opencode` provider is routed. Every other provider and integration is
 left untouched, and only models that cost nothing are ever routed.
 
+Models that mirror the same ids under another provider - for example a custom
+gateway whose model ids also read `opencode/...` - are not routed even when the
+bare id matches. The provider decides, not the name of the model, so select the
+model under the `opencode` provider to have it routed.
+
 ## Install
 
 The package is distributed from GitHub rather than npm. The installer clones it,
@@ -181,15 +186,20 @@ forget it.
 | alt+enter | Confirm a pasted list or configuration |
 
 The footer pill shows whether routing is on, the chosen exit or strategy, how
-many models are routed, and how many exits are used up. When no exit can serve,
-it says whether requests go direct or fail. Clicking it opens the same menu.
+many requests have gone through exits, and how many exits are used up; it never
+presents the number of selected models as traffic. When no exit can serve, it
+says whether requests go direct or fail. Clicking it opens the same menu, and
+the preview there shows the last decision: which model was asked for, and why
+it went through an exit or straight to OpenCode.
 
 ## Security and privacy
 
 - The local proxy bridge allows only `https://opencode.ai` and its subdomains.
   A relay forwards only to hosts on its `RELAY_ALLOWED_HOSTS` allowlist, which
   defaults to the exact host `opencode.ai` (a wildcard entry requires
-  `RELAY_ALLOW_ANY_HOST=1`). Redirects are never followed.
+  `RELAY_ALLOW_ANY_HOST=1`). The relay and the bridge never follow upstream
+  redirects. The OpenCode 2.2.7 host may follow a redirect returned by a
+  relay, so only track relays you trust.
 - The proxy bridge listens on loopback only and requires a random per-process
   secret. A request without it is rejected.
 - A relay has its own access token, sent as `x-relay-key`; requests without it
@@ -219,6 +229,7 @@ no subscription.
 - `src/server/` - the server half
   - `index.ts` - wiring: state, catalog, bridge, tester, handlers, hooks
   - `handlers.ts` - one handler per RPC method
+  - `decide.ts` - the one routing decision, shared by the hook and the preview
   - `hooks.ts` - request, response, and retry routing
   - `state.ts` - exits, strategies, cooldowns, spent addresses, persistence
   - `storage.ts` - the stored shapes and legacy migration

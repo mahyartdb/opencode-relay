@@ -130,6 +130,8 @@ const Status = Schema.Struct({
 /** What a routing preview says, without sending or advancing anything. */
 const RoutePreview = Schema.Struct({
   modelId: Schema.optional(Schema.String),
+  /** The provider the model belongs to, when one was named. */
+  providerID: Schema.optional(Schema.String),
   routed: Schema.Boolean,
   reason: Schema.String,
   direct: Direct,
@@ -459,7 +461,11 @@ export const Relay = Rpc.define({
     /** Show where the next request would go, without sending or advancing anything. */
     preview: {
       input: Schema.toStandardSchemaV1(
-        Schema.Struct({ modelId: Schema.optional(Schema.String) }),
+        Schema.Struct({
+          modelId: Schema.optional(Schema.String),
+          /** The provider the model belongs to; only `opencode` is routed. */
+          providerID: Schema.optional(Schema.String),
+        }),
       ),
       output: Schema.toStandardSchemaV1(RoutePreview),
     },

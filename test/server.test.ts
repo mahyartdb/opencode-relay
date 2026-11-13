@@ -1,9 +1,8 @@
 import { afterAll, beforeAll, describe, expect, setDefaultTimeout, test } from "bun:test"
-import type { Server } from "node:http"
+import { createServer, type Server } from "node:http"
 import { startRelay, startTraceStub, traceUrl } from "../tools/relay-harness.ts"
 import { ROTATE_DELAY_MS } from "../src/server/hooks.ts"
 import { relayRequest } from "../src/lib/routing.ts"
-import { API_TIMEOUT_MS } from "../src/server/tester.ts"
 import plugin from "../src/server/index.ts"
 
 /**
@@ -23,7 +22,12 @@ setDefaultTimeout(60_000)
 
 const ACCESS = "test-access-token"
 
-type Handler = (input: never) => Promise<void> | void
+type Handler = (input: any) => Promise<void> | void
+
+/** The options OpenCode 2.2.7 accepts when a session hook is registered. */
+type HookOptions = { readonly providerID?: string }
+
+type Registration = { callback: Handler; options?: HookOptions }
 
 interface StatusAnswer {
   readonly enabled: boolean
@@ -43,6 +47,7 @@ interface StatusAnswer {
     readonly project?: string
     readonly statusLabel: string
     readonly lastError?: string
+    readonly stats: { readonly requests: number }
   }[]
   readonly exhausted: readonly string[]
   readonly paused: readonly string[]
@@ -61,7 +66,7 @@ interface StatusAnswer {
 /** A stand-in for the parts of the OpenCode server the plugin uses. */
 function makeContext(models = true) {
   const store = new Map<string, unknown>()
-  const hooks = new Map<string, Handler>()
+  const registrations = new Map<string, Registration[]>()
   const handlers = new Map<string, (input: unknown, context: unknown) => Promise<unknown>>()
   const commands = new Map<string, { readonly name: string; readonly execute: () => Promise<void> }>()
   const emitted: string[] = []
@@ -85,21 +90,21 @@ function makeContext(models = true) {
         return {
           data: [
             {
-              id: "opencode/iceman-free",
+              id: "iceman-free",
               modelID: "iceman-free",
               providerID: "opencode",
               name: "Iceman Free",
               cost: [{ input: 0, output: 0, cache: { read: 0, write: 0 } }],
             },
             {
-              id: "opencode/gpt-6.1-sol",
+              id: "gpt-6.1-sol",
               modelID: "gpt-6.1-sol",
               providerID: "opencode",
               name: "GPT 6.1 Sol",
               cost: [{ input: 2, output: 6, cache: { read: 0.2, write: 0 } }],
             },
             {
-              id: "anthropic/claude",
+              id: "claude",
               modelID: "claude",
               providerID: "anthropic",
               name: "Claude",
@@ -110,8 +115,10 @@ function makeContext(models = true) {
       },
     },
     session: {
-      hook: async (name: string, callback: Handler) => {
-        hooks.set(name, callback)
+      hook: async (name: string, callback: Handler, options?: HookOptions) => {
+        const list = registrations.get(name) ?? []
+        list.push({ callback, options })
+        registrations.set(name, list)
         return { dispose: async () => {} }
       },
     },
@@ -156,7 +163,23 @@ function makeContext(models = true) {
     })
   }
 
-  return { context, store, hooks, call, emitted, commands }
+  // The facade mimics how OpenCode 2.2.7 triggers a registered hook: the
+  // registrations of a name run in order, a registration scoped to a provider
+  // only fires for that provider's requests, and the comparison is exact.
+  const hooks = {
+    get(name: string) {
+      const list = registrations.get(name) ?? []
+      return async (input: any) => {
+        for (const registration of list) {
+          const scope = registration.options?.providerID
+          if (scope !== undefined && input?.model?.providerID !== scope) continue
+          return registration.callback(input)
+        }
+      }
+    },
+  }
+
+  return { context, store, hooks, registrations, call, emitted, commands }
 }
 
 type App = ReturnType<typeof makeContext> & { readonly dispose: () => Promise<void> }
@@ -188,13 +211,13 @@ const PROBE_RETRY_MS = 500
  * branch of its answer.
  */
 async function canReach(url: string): Promise<boolean> {
-  const deadline = Date.now() + API_TIMEOUT_MS
+  const deadline = Date.now() + 5_000
   for (;;) {
     const left = deadline - Date.now()
     if (left <= 0) return false
     try {
       const answer = await fetch(url, { signal: AbortSignal.timeout(left) })
-      if (answer.status < 500) return true
+      if (answer.status === 200) return true
     } catch {
       // A failed probe only means "ask again", while the budget lasts.
     }
@@ -234,6 +257,19 @@ describe("the server half", () => {
     delete process.env.RELAY_TOKEN
   })
 
+  test("registers every session hook for the opencode provider", async () => {
+    const app = await start()
+    try {
+      expect(app.registrations.get("http.request")?.[0]?.options).toEqual({ providerID: "opencode" })
+      expect(app.registrations.get("http.response")?.[0]?.options).toEqual({
+        providerID: "opencode",
+      })
+      expect(app.registrations.get("retry")?.[0]?.options).toEqual({ providerID: "opencode" })
+    } finally {
+      await app.dispose()
+    }
+  })
+
   test("starts off and leaves requests alone", async () => {
     const app = await start()
     try {
@@ -264,6 +300,9 @@ describe("the server half", () => {
       await app.call("useExit", { id: firstExit(status).id })
       await app.call("setEnabled", { enabled: true })
 
+      const enabled = (await app.call("status")) as StatusAnswer
+      expect(enabled.enabled).toBe(true)
+
       const input = {
         sessionID: "other",
         model: { id: "claude", providerID: "anthropic" },
@@ -271,12 +310,17 @@ describe("the server half", () => {
       }
       await app.hooks.get("http.request")?.(input as never)
       expect(input.request.url).toBe("https://api.anthropic.com/v1/messages")
+
+      // The host would not even call the callback for another provider, and the
+      // plugin's own guard does not rewrite it either: both have to hold.
+      await app.registrations.get("http.request")?.[0]?.callback(input)
+      expect(input.request.url).toBe("https://api.anthropic.com/v1/messages")
     } finally {
       await app.dispose()
     }
   })
 
-  test("routes a free model through the relay", async () => {
+  test("rewrites a free model's request for the relay", async () => {
     const app = await start()
     try {
       await app.call("addRelay", { name: "local", url, access: ACCESS })
@@ -303,6 +347,59 @@ describe("the server half", () => {
       expect(after.exits[0]?.status).toBe("reachable")
     } finally {
       await app.dispose()
+    }
+  })
+
+  test("a routed request really reaches a local relay and comes back", async () => {
+    // A relay of this process's own: no network, no deployment, and every
+    // request that arrives is recorded so the test can prove the rewritten
+    // request actually left the plugin instead of staying at the provider.
+    const seen: { url?: string; headers: Record<string, string | string[] | undefined> }[] = []
+    const fake = createServer((req, res) => {
+      if (req.headers["x-relay-control"] === "ping") {
+        res.writeHead(200, { "content-type": "application/json" })
+        res.end(JSON.stringify({ egress: "127.0.0.1", runtime: "test", instance: "fake" }))
+        return
+      }
+      seen.push({ url: req.url, headers: req.headers })
+      res.writeHead(200, { "content-type": "application/json", "x-relay-runtime": "test" })
+      res.end(JSON.stringify({ data: [{ id: "iceman-free" }] }))
+    })
+    await new Promise<void>((resolve) => fake.listen(0, "127.0.0.1", resolve))
+    const address = fake.address()
+    if (address === null || typeof address === "string") throw new Error("the relay has no port")
+    const relayUrl = `http://127.0.0.1:${address.port}`
+
+    const app = await start()
+    try {
+      await app.call("addRelay", { name: "fake", url: relayUrl, access: ACCESS })
+      const status = (await app.call("status")) as StatusAnswer
+      await app.call("useExit", { id: firstExit(status).id })
+      await app.call("setEnabled", { enabled: true })
+
+      const input = {
+        sessionID: "e2e",
+        model: { id: "iceman-free", providerID: "opencode" },
+        request: new Request("https://opencode.ai/inference/openai/v1/models"),
+      }
+      await app.hooks.get("http.request")?.(input as never)
+
+      const answer = await fetch(input.request)
+      expect(answer.status).toBe(200)
+      const body = (await answer.json()) as { data: { id: string }[] }
+      expect(body.data[0]?.id).toBe("iceman-free")
+
+      expect(seen).toHaveLength(1)
+      expect(seen[0]?.headers["x-relay-target"]).toBe("https://opencode.ai")
+      expect(seen[0]?.headers["x-relay-path"]).toBe("/inference/openai/v1/models")
+      expect(seen[0]?.headers["x-relay-key"]).toBe(ACCESS)
+
+      const after = (await app.call("status")) as StatusAnswer
+      expect(after.exits[0]?.stats.requests).toBe(1)
+    } finally {
+      await app.dispose()
+      fake.closeAllConnections()
+      await new Promise<void>((resolve) => fake.close(() => resolve()))
     }
   })
 
@@ -338,6 +435,33 @@ describe("the server half", () => {
       }
       await app.hooks.get("http.request")?.(free as never)
       expect(free.request.url).toBe(`${url}/`)
+    } finally {
+      await app.dispose()
+    }
+  })
+
+  test("a prefixed model id is not mistaken for a free opencode model", async () => {
+    const app = await start()
+    try {
+      await app.call("addRelay", { name: "local", url, access: ACCESS })
+      const status = (await app.call("status")) as StatusAnswer
+      await app.call("useExit", { id: firstExit(status).id })
+      await app.call("setEnabled", { enabled: true })
+
+      const input = {
+        sessionID: "prefixed",
+        model: { id: "opencode/iceman-free", providerID: "opencode" },
+        request: new Request("https://opencode.ai/inference/openai/v1/models"),
+      }
+      await app.hooks.get("http.request")?.(input as never)
+      expect(input.request.url).toBe("https://opencode.ai/inference/openai/v1/models")
+
+      const after = (await app.call("status")) as StatusAnswer
+      expect(after.lastDecision).toMatchObject({
+        modelId: "opencode/iceman-free",
+        routed: false,
+      })
+      expect(after.lastDecision?.reason).toContain("not a free model")
     } finally {
       await app.dispose()
     }
@@ -612,7 +736,7 @@ describe("the server half", () => {
       // was the problem, not the exit.
       const retry = {
         sessionID: "suspect",
-        model: { id: "iceman-free" },
+        model: { id: "iceman-free", providerID: "opencode" },
         error: {
           status: 429,
           response: { body: '{"error":{"message":"Free usage limit reached"}}' },
@@ -676,7 +800,7 @@ describe("the server half", () => {
 
       const retry = {
         sessionID: "transport",
-        model: { id: "iceman-free" },
+        model: { id: "iceman-free", providerID: "opencode" },
         error: { message: "fetch failed" },
         attempt: 1,
         decision: { retry: false } as { retry: boolean; delay?: number },
@@ -716,7 +840,7 @@ describe("the server half", () => {
 
       const retry = {
         sessionID: "failing",
-        model: { id: "iceman-free" },
+        model: { id: "iceman-free", providerID: "opencode" },
         error: { status: 502, message: "Upstream request failed" },
         attempt: 1,
         decision: { retry: false } as { retry: boolean; delay?: number },
@@ -736,7 +860,7 @@ describe("the server half", () => {
     try {
       const retry = {
         sessionID: "direct",
-        model: { id: "iceman-free" },
+        model: { id: "iceman-free", providerID: "opencode" },
         error: { status: 409 },
         attempt: 1,
         decision: { retry: false },
@@ -769,24 +893,84 @@ describe("the server half", () => {
   })
 
   test("the preview says where the next request would go, and why not elsewhere", async () => {
+    type Preview = {
+      routed: boolean
+      reason: string
+      exit?: { id: string }
+      skipped: readonly { name: string; reason: string }[]
+    }
     const app = await start()
     try {
       await app.call("addRelay", { name: "local", url, access: ACCESS })
       await app.call("setEnabled", { enabled: true })
-      const preview = (await app.call("preview", {})) as {
-        routed: boolean
-        reason: string
-        exit?: { id: string }
-        skipped: readonly { name: string; reason: string }[]
-      }
-      expect(preview.routed).toBe(true)
-      expect(preview.exit).toBeDefined()
-      expect(preview.reason).toContain("through")
+
+      // No model was named: the answer is about a free model, and says so
+      // instead of promising the next request of any kind goes through.
+      const free = (await app.call("preview", {})) as Preview
+      expect(free.routed).toBe(true)
+      expect(free.exit).toBeDefined()
+      expect(free.reason).toContain("free opencode model")
+      expect(free.reason).toContain("other providers go direct")
+
+      const chosen = (await app.call("preview", {
+        modelId: "iceman-free",
+        providerID: "opencode",
+      })) as Preview
+      expect(chosen.routed).toBe(true)
+
+      const other = (await app.call("preview", {
+        modelId: "iceman-free",
+        providerID: "polygate",
+      })) as Preview
+      expect(other.routed).toBe(false)
+      expect(other.reason).toContain("polygate")
+      expect(other.reason).toContain("opencode")
+
+      const paid = (await app.call("preview", {
+        modelId: "gpt-6.1-sol",
+        providerID: "opencode",
+      })) as Preview
+      expect(paid.routed).toBe(false)
+      expect(paid.reason).toContain("not a free model")
 
       await app.call("setEnabled", { enabled: false })
-      const off = (await app.call("preview", {})) as { routed: boolean; reason: string }
+      const off = (await app.call("preview", {})) as Preview
       expect(off.routed).toBe(false)
       expect(off.reason).toContain("Routing is off")
+    } finally {
+      await app.dispose()
+    }
+  })
+
+  test("a named model says it would still go direct with routing off", async () => {
+    type Preview = {
+      routed: boolean
+      reason: string
+      skipped: readonly { name: string; reason: string }[]
+    }
+    const app = await start()
+    try {
+      await app.call("addRelay", { name: "local", url, access: ACCESS })
+      await app.call("setEnabled", { enabled: false })
+
+      // The provider decides before the switch does: even with routing on,
+      // a polygate model would never be routed. Hiding that behind the
+      // routing-off answer would leave the user to turn routing on and then
+      // discover the model still goes direct.
+      const other = (await app.call("preview", {
+        modelId: "iceman-free",
+        providerID: "polygate",
+      })) as Preview
+      expect(other.routed).toBe(false)
+      expect(other.reason).toContain("polygate")
+      expect(other.reason).toContain("Routing is off")
+
+      const chosen = (await app.call("preview", {
+        modelId: "iceman-free",
+        providerID: "opencode",
+      })) as Preview
+      expect(chosen.routed).toBe(false)
+      expect(chosen.reason).toContain("Routing is off")
     } finally {
       await app.dispose()
     }

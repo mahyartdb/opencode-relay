@@ -20,6 +20,7 @@ function exit(overrides: Partial<ExitSummaryLike> & { readonly id: string }): Ex
     statusLabel: "ready",
     enabled: true,
     url: `https://${overrides.id}.example`,
+    stats: { requests: 0 },
     ...overrides,
   }
 }
@@ -54,15 +55,24 @@ describe("statusLabel", () => {
 
 describe("describeSelection", () => {
   test("never mentions a mode that routes paid models", () => {
-    expect(describeSelection(status({ selection: "free" }))).toBe("Now: the free models only")
+    expect(describeSelection(status({ selection: "free" }))).toBe(
+      "Now: every free model of the opencode provider",
+    )
     expect(describeSelection(status({ selection: "custom", customModels: [] }))).toBe(
       "Now: nothing is routed",
     )
     expect(describeSelection(status({ selection: "custom", customModels: ["a"] }))).toBe(
-      "Now: 1 chosen model",
+      "Now: 1 chosen free model of the opencode provider",
     )
     expect(describeSelection(status({ selection: "custom", customModels: ["a", "b"] }))).toBe(
-      "Now: 2 chosen models",
+      "Now: 2 chosen free models of the opencode provider",
+    )
+  })
+
+  test("names the provider the free models belong to", () => {
+    expect(describeSelection(status({ selection: "free" }))).toContain("opencode provider")
+    expect(describeSelection(status({ selection: "custom", customModels: ["a"] }))).toContain(
+      "opencode provider",
     )
   })
 })
@@ -184,8 +194,8 @@ describe("exitList", () => {
       }),
     )
 
-    expect(list[0]?.description).toBe("relay - Frankfurt - ready - 210 ms - chosen")
-    expect(list[1]?.description).toBe("proxy - used up - ready")
+    expect(list[0]?.description).toBe("relay - Frankfurt - ready - 210 ms - 0 requests - chosen")
+    expect(list[1]?.description).toBe("proxy - used up - ready - 0 requests")
     expect(list[0]?.value).toEqual({ id: "fra", name: "Frankfurt", kind: "relay" })
   })
 
@@ -198,7 +208,7 @@ describe("exitList", () => {
       }),
     )
 
-    expect(list[0]?.description).toBe("proxy - paused - not answering - ready")
+    expect(list[0]?.description).toBe("proxy - paused - not answering - ready - 0 requests")
   })
 })
 
@@ -211,6 +221,15 @@ describe("describeExit", () => {
 
     expect(line).toContain("used up")
     expect(line).toContain("relay")
+  })
+
+  test("shows the traffic the exit carried, not the selected models", () => {
+    expect(
+      describeExit(
+        exit({ id: "fra", name: "Frankfurt", regionLabel: "Frankfurt", stats: { requests: 3 } }),
+        status(),
+      ),
+    ).toBe("relay - Frankfurt - ready - 3 requests")
   })
 })
 
@@ -225,7 +244,7 @@ describe("summarizePill", () => {
     expect(summarizePill(status({ exits: [] }))).toBe("relay on - no exit - /relay")
   })
 
-  test("names the chosen exit and counts the routed models", () => {
+  test("names the chosen exit and reports the traffic it carried", () => {
     expect(
       summarizePill(
         status({
@@ -233,15 +252,37 @@ describe("summarizePill", () => {
           routedCount: 1,
         }),
       ),
-    ).toBe("relay Frankfurt - 1 model - /relay")
+    ).toBe("relay Frankfurt - no requests yet - /relay")
+
+    expect(
+      summarizePill(
+        status({
+          activeExit: { id: "fra", name: "Frankfurt", kind: "relay" },
+          exits: [exit({ id: "fra", stats: { requests: 3 } })],
+        }),
+      ),
+    ).toBe("relay Frankfurt - 3 requests - /relay")
+  })
+
+  test("does not present selected models as traffic", () => {
+    const pill = summarizePill(
+      status({
+        routedCount: 8,
+        exits: [exit({ id: "fra", stats: { requests: 0 } })],
+        activeExit: { id: "fra", name: "Frankfurt", kind: "relay" },
+      }),
+    )
+
+    expect(pill).toContain("no requests yet")
+    expect(pill).not.toContain("8 models")
   })
 
   test("names the strategy when no single exit serves", () => {
     expect(summarizePill(status({ strategy: "round-robin" }))).toBe(
-      "relay round robin - 8 models - /relay",
+      "relay round robin - no requests yet - /relay",
     )
     expect(summarizePill(status({ strategy: "fastest" }))).toBe(
-      "relay fastest exit - 8 models - /relay",
+      "relay fastest exit - no requests yet - /relay",
     )
   })
 
@@ -254,7 +295,7 @@ describe("summarizePill", () => {
           exhausted: ["p1"],
         }),
       ),
-    ).toBe("relay Frankfurt - 8 models - 1 used up - /relay")
+    ).toBe("relay Frankfurt - no requests yet - 1 used up - /relay")
   })
 
   test("does not pretend an exit can serve when none can", () => {

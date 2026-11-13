@@ -283,7 +283,7 @@ async function runAction(
     case "direct":
       return chooseDirect(context, client, status)
     case "preview":
-      return showPreview(context, client)
+      return showPreview(context, client, status)
     case "exits":
       return manageExits(context, client)
     case "deploy":
@@ -383,10 +383,22 @@ async function chooseDirect(context: Context, client: RelayClient, status: Relay
 }
 
 /** Show where the next request would go, without sending anything. */
-async function showPreview(context: Context, client: RelayClient): Promise<void> {
-  const result = await callRpc(context, "Relay", () => client.preview({}))
+async function showPreview(context: Context, client: RelayClient, status: RelayStatus): Promise<void> {
+  // The model the prompt is pointed at, so the preview is about the request
+  // the user is about to make. A model of another provider previews as "only
+  // the opencode provider is routed", which is the truth and not a claim that
+  // this model would go through an exit.
+  const current = context.ui.model.current()
+  const result = await callRpc(context, "Relay", () =>
+    client.preview({
+      ...(current ? { modelId: current.modelID, providerID: current.providerID } : {}),
+    }),
+  )
   if (!result) return
   const lines = [result.reason]
+  if (status.lastDecision) {
+    lines.push("", `Last request: ${status.lastDecision.modelId} - ${status.lastDecision.reason}`)
+  }
   if (result.skipped.length > 0) {
     lines.push("", "Left out:")
     for (const exit of result.skipped) lines.push(`  ${exit.name}: ${exit.reason}`)
@@ -458,7 +470,7 @@ async function chooseModels(context: Context, client: RelayClient, status: Relay
       {
         title: "Route every free model",
         value: "free",
-        description: `${free.length} models${models.length > free.length ? `; ${models.length - free.length} paid models are never routed` : ""}`,
+        description: `Every free model of the opencode provider${models.length > free.length ? `; ${models.length - free.length} paid models are never routed` : ""}`,
       },
       {
         title: "Choose free models one by one",
@@ -494,7 +506,7 @@ async function pickModels(
     >[] = models.map((model) => ({
       title: model.name,
       value: { kind: "model", id: model.id },
-      description: `${model.id} - free - ${picked.has(model.id) ? "routed" : "not routed"}`,
+      description: `opencode/${model.id} - free - ${picked.has(model.id) ? "routed" : "not routed"}`,
     }))
     options.push({ title: "Done", value: { kind: "done" }, description: "Save this selection" })
     const choice = await context.ui.dialog.select({

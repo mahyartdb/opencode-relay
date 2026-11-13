@@ -3,9 +3,11 @@
  * exit cannot serve it.
  *
  * These are the only places where the plugin changes anything about a request.
- * Only the OpenCode provider's own requests are touched, and only when the
- * plugin is on, an exit is picked and the model is free. Everything else is
- * left exactly as it was.
+ * Only the OpenCode provider's own requests are touched, and only a request
+ * whose model is free and chosen is ever rewritten; everything else is left
+ * exactly as it was. What the plugin *decided* about a request - including a
+ * request it left alone - is recorded either way, so the status note and the
+ * preview can say the truth instead of guessing.
  *
  * The response hook is where a free allowance is confirmed. A 429 alone is not
  * proof: OpenCode also refuses individual requests. The exit is only retired
@@ -15,7 +17,6 @@ import type { Context } from "@opencode/plugin/promise/plugin"
 import { PROVIDER_ID, nextResetAt } from "../lib/types.ts"
 import {
   isFreeUsageLimit,
-  isSelected,
   parseRetryAfter,
   proxyRequest,
   readBody,
@@ -24,6 +25,7 @@ import {
   exitIdOf,
 } from "../lib/routing.ts"
 import type { ProxyBridge } from "./bridge.ts"
+import { decideModel } from "./decide.ts"
 import type { ModelCatalog } from "./models.ts"
 import {
   REFUSED_COOLDOWN_MS,
@@ -81,43 +83,49 @@ export async function registerHooks(
     async (input) => {
       if (input.model.providerID !== PROVIDER_ID) return
       const settings = state.settings()
-      if (!settings.enabled) return
       const sessionID = input.sessionID ?? ""
       const modelId = input.model.id
       // Every request starts with a clean slate: an answer from an earlier
       // request must never be blamed on an exit this one did not use.
       state.forgetRelayed(sessionID, modelId)
-      const list = await catalog.list()
-      const model = catalog.resolve(list, modelId, settings.selection)
-      if (!isSelected(model, settings.selection, settings.customModels)) return
+
+      // The one decision, shared with the preview, so the menu and the hook
+      // can never disagree about why a request went direct.
+      const decision = await decideModel(
+        { state, catalog, bridgeReady: bridge.ready },
+        { providerID: input.model.providerID, modelId, advance: true },
+      )
+      if (!decision.routed) {
+        state.noteDecision({ modelId, routed: false, reason: decision.reason })
+        // Only a request that was meant to be routed and could not be is a
+        // failure. Switching off, another provider, an unlisted model and a
+        // model outside the chosen list are direct by policy, which is the
+        // documented behavior, not an error worth failing the request over.
+        if (
+          settings.direct === "never" &&
+          (decision.kind === "no-exit" || decision.kind === "bridge")
+        ) {
+          throw new Error(
+            `${decision.reason} The plugin is set to never go direct, so the request was not sent.`,
+          )
+        }
+        return
+      }
+      const exit = decision.exit
+      // Only a routed decision carries an exit; without one there is nothing
+      // to rewrite, and sending it unchanged would be a silent direct request.
+      if (!exit) return
 
       // The request is remembered before it is rewritten, so a test later can
       // look exactly like the request OpenCode Free is willing to answer.
+      // It is taken here, and only for routed models: a sample of a request
+      // that never went through an exit would make a test look like traffic
+      // this plugin never sent.
       state.noteSample({
         modelID: modelId,
         path: `${new URL(input.request.url).pathname}${new URL(input.request.url).search}`,
         headers: headerRecord(input.request),
       })
-
-      // The strategy decides which exit serves this request: one exit always,
-      // one request each in turn, one until its allowance is gone, or the
-      // fastest measured one. Only a routed model moves the rotation on.
-      const pick = state.pickExit()
-      const exit = pick.exit
-      if (!exit) {
-        const reclaimed = pick.reason
-        state.noteDecision({
-          modelId,
-          routed: false,
-          reason: settings.direct === "never" ? `${reclaimed} Direct routing is not allowed.` : reclaimed,
-        })
-        if (settings.direct === "never") {
-          throw new Error(
-            `${reclaimed} The plugin is set to never go direct, so the request was not sent.`,
-          )
-        }
-        return
-      }
 
       // The exit is chosen here; the in-memory timing starts now. A request that
       // never reaches the exit still has a started mark, which the response
@@ -133,18 +141,6 @@ export async function registerHooks(
             avoid: state.spentEgresses(),
           })
         } else {
-          if (!bridge.ready) {
-            state.markFailure(exit.id, "The local proxy bridge is not running.")
-            state.noteDecision({
-              modelId,
-              routed: false,
-              reason: "The local proxy bridge is not running, so the request went direct.",
-            })
-            if (settings.direct === "never") {
-              throw new Error("The local proxy bridge is not running, and the plugin is set to never go direct.")
-            }
-            return
-          }
           input.request = proxyRequest(input.request, {
             bridge: bridge.origin,
             key: bridge.key,

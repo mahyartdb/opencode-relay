@@ -50,7 +50,7 @@ export default Plugin.define({
 
     // The wrapper reads the binding, not the value: the real announce only exists
     // once the registration is built, and the handlers must call that one.
-    const handlers = createHandlers({ state, catalog, tester, announce: (reason) => announce(reason) })
+    const handlers = createHandlers({ state, catalog, bridge, tester, announce: (reason) => announce(reason) })
     const registration = await context.rpc.register(Relay, handlers)
     announce = async (reason: string) => {
       await registration.events.emit("changed", { reason })

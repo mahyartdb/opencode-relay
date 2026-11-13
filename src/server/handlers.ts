@@ -13,6 +13,7 @@ import { randomBytes, randomUUID } from "node:crypto"
 import type { RpcHandlers } from "@opencode/plugin/promise/rpc"
 import { Relay } from "../rpc.ts"
 import {
+  PROVIDER_ID,
   REGIONS,
   displayUrl,
   regionLabel,
@@ -39,6 +40,8 @@ import {
   probeRelay,
 } from "../lib/vercel.ts"
 import { projectName, relaySource } from "../lib/relay-source.ts"
+import type { ProxyBridge } from "./bridge.ts"
+import { decideModel } from "./decide.ts"
 import type { ModelCatalog } from "./models.ts"
 import type { RelayState, Settings } from "./state.ts"
 import type { Tester } from "./tester.ts"
@@ -47,6 +50,7 @@ import type { Tester } from "./tester.ts"
 export interface HandlerDeps {
   readonly state: RelayState
   readonly catalog: ModelCatalog
+  readonly bridge: ProxyBridge
   readonly tester: Tester
   /** Announces that something changed, so the terminal part can refresh. */
   readonly announce: (reason: string) => Promise<void>
@@ -85,12 +89,14 @@ function describeState(options: {
   readonly active: ExitSummary | undefined
   readonly routed: number
   readonly modelCount: number
+  /** Requests that have gone through an exit since the process started. */
+  readonly requests: number
   readonly catalog: ModelCatalog
   readonly notes: readonly string[]
   readonly exhausted: readonly string[]
   readonly skipped: readonly string[]
 }): string {
-  const { settings, exits, active, routed, modelCount, catalog, notes, exhausted, skipped } = options
+  const { settings, exits, active, routed, modelCount, requests, catalog, notes, exhausted, skipped } = options
   if (!settings.enabled) return "Routing is off: requests go straight to OpenCode."
   if (exits.length === 0) return "Routing is on, but there is no relay or proxy yet."
 
@@ -104,8 +110,16 @@ function describeState(options: {
       exit.status !== "bad",
   ).length
 
-  const models = modelCount === 0 ? "no model" : `${routed} free model${routed === 1 ? "" : "s"}`
-  const problems: string[] = []
+  const models = modelCount === 0 ? "no model" : `${routed} free ${PROVIDER_ID} model${routed === 1 ? "" : "s"}`
+  // How many requests actually went through an exit, which is the number the
+  // user asks for. The count of selected models is not that number: with
+  // routing off, or on a provider that is not routed, it can be large while
+  // nothing has ever left through an exit.
+  const traffic =
+    requests === 0
+      ? "No request has gone through an exit yet."
+      : `${requests} request${requests === 1 ? "" : "s"} ${requests === 1 ? "has" : "have"} gone through an exit.`
+  const problems: string[] = [traffic]
   if (catalog.lastFailure()) {
     problems.push("The model list could not be read, so no model is known to be free.")
   }
@@ -207,7 +221,7 @@ async function deployOne(options: {
 
 /** The handlers of the relay contract. */
 export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
-  const { state, catalog, tester, announce } = deps
+  const { state, catalog, bridge, tester, announce } = deps
 
   /** Check whatever is still untested after a list was imported or added. */
   const checkUntested = (): void => {
@@ -237,6 +251,9 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
       const exhausted = state.exhaustedExits()
       const skipped = state.coolingExits()
       const exits = state.summaries()
+      // The traffic the plugin actually sent: this is what the status note
+      // reports, not how many models happen to be selected.
+      const requests = exits.reduce((sum, exit) => sum + exit.stats.requests, 0)
       const active = state.activeExit()
       const activeSummary = active === undefined ? undefined : state.summaryOf(active.id)
       const paused = exits.filter((exit) => !exit.enabled).map((exit) => exit.id)
@@ -261,6 +278,7 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
           active: activeSummary,
           routed,
           modelCount: list.length,
+          requests,
           catalog,
           notes: state.notes(),
           exhausted,
@@ -719,43 +737,64 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
     /** Show where the next request would go, without sending or advancing anything. */
     preview: async (input) => {
       const settings = state.settings()
-      const pick = state.pickExit({ advance: false })
-      const exit = pick.exit === undefined ? undefined : state.summaryOf(pick.exit.id)
-      const skipped = [...pick.skipped]
-      if (!settings.enabled) {
+      if (input.modelId !== undefined) {
+        // The same decision the request hook takes, for the model that was
+        // named. Without the provider the model belongs to, a model of another
+        // provider that happens to share an id would be previewed as routed
+        // when it never would be. The decision is asked even with routing off:
+        // a named model brings a provider, and the provider is the reason it
+        // would still go direct once routing is turned on.
+        const decision = await decideModel(
+          { state, catalog, bridgeReady: bridge.ready },
+          {
+            providerID: input.providerID ?? PROVIDER_ID,
+            modelId: input.modelId,
+            advance: false,
+          },
+        )
+        const decided = decision.exit
+        const exit = decided === undefined ? undefined : state.summaryOf(decided.id)
+        // "Routing is off" is appended only when it is not already the whole
+        // answer: for an opencode model decideModel says it itself, and
+        // saying it twice would be noise.
+        const reason =
+          decision.routed && decided !== undefined
+            ? `The next request would go through ${decided.name}.`
+            : decision.kind === "off" || settings.enabled
+              ? decision.reason
+              : `${decision.reason} Routing is off, so the request goes straight to OpenCode.`
         return {
-          ...(input.modelId !== undefined ? { modelId: input.modelId } : {}),
+          modelId: input.modelId,
+          ...(input.providerID !== undefined ? { providerID: input.providerID } : {}),
+          routed: decision.routed,
+          reason,
+          direct: settings.direct,
+          ...(exit !== undefined ? { exit } : {}),
+          skipped: [...decision.skipped],
+        }
+      }
+      // No model was named, so the provider cannot be judged. With routing off
+      // nothing is routed, whatever the model, and the one answer covers all.
+      if (!settings.enabled) {
+        const pick = state.pickExit({ advance: false })
+        return {
+          ...(input.providerID !== undefined ? { providerID: input.providerID } : {}),
           routed: false,
           reason: "Routing is off: requests go straight to OpenCode.",
           direct: settings.direct,
-          skipped,
+          skipped: [...pick.skipped],
         }
       }
-      if (input.modelId !== undefined) {
-        const list = await catalog.list()
-        const model = catalog.resolve(list, input.modelId, settings.selection)
-        if (!isFree(model)) {
-          return {
-            modelId: input.modelId,
-            routed: false,
-            reason: `${model.name} is not free, so the plugin never routes it.`,
-            direct: settings.direct,
-            skipped,
-          }
-        }
-        if (settings.selection === "custom" && !settings.customModels.includes(model.id)) {
-          return {
-            modelId: input.modelId,
-            routed: false,
-            reason: `${model.name} is not in the chosen list.`,
-            direct: settings.direct,
-            skipped,
-          }
-        }
-      }
+      // No model was named, so only the exit can be answered for. Claiming
+      // that "the next request" goes through an exit would be a promise about
+      // a request that has not been described yet: a paid model, a model
+      // outside the chosen list and every other provider still go direct.
+      const pick = state.pickExit({ advance: false })
+      const picked = pick.exit
+      const exit = picked === undefined ? undefined : state.summaryOf(picked.id)
+      const skipped = [...pick.skipped]
       if (exit === undefined) {
         return {
-          ...(input.modelId !== undefined ? { modelId: input.modelId } : {}),
           routed: false,
           reason:
             settings.direct === "never"
@@ -766,10 +805,18 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
           skipped,
         }
       }
+      if (exit.kind === "proxy" && !bridge.ready) {
+        return {
+          routed: false,
+          reason: `The local proxy bridge is not running, so ${exit.name} cannot carry the request.`,
+          direct: settings.direct,
+          exit,
+          skipped,
+        }
+      }
       return {
-        ...(input.modelId !== undefined ? { modelId: input.modelId } : {}),
         routed: true,
-        reason: `The next request goes through ${exit.name}.`,
+        reason: `A free ${PROVIDER_ID} model would go through ${exit.name}. Paid models, models outside your chosen list, and other providers go direct.`,
         direct: settings.direct,
         exit,
         skipped,

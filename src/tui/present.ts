@@ -54,6 +54,8 @@ export interface ExitSummaryLike {
   readonly latencyMs?: number
   readonly exhaustedUntil?: number
   readonly lastError?: string
+  /** How many requests have gone through this exit, when the status carried them. */
+  readonly stats?: { readonly requests: number }
 }
 
 /** The part of the status the menu and the pill read. */
@@ -77,6 +79,12 @@ export interface StatusLike {
   readonly skipped?: readonly string[]
   readonly routedCount: number
   readonly modelCount: number
+  /** What the last request's routing decision was, when one was recorded. */
+  readonly lastDecision?: {
+    readonly modelId: string
+    readonly routed: boolean
+    readonly reason: string
+  }
 }
 
 /** The three words a status is shown with. */
@@ -99,10 +107,10 @@ export function statusLabel(status: string): string {
 
 /** What the menu says about the current selection. */
 export function describeSelection(status: StatusLike): string {
-  if (status.selection === "free") return "Now: the free models only"
+  if (status.selection === "free") return "Now: every free model of the opencode provider"
   if (status.customModels.length === 0) return "Now: nothing is routed"
   const count = status.customModels.length
-  return `Now: ${count} chosen model${count === 1 ? "" : "s"}`
+  return `Now: ${count} chosen free model${count === 1 ? "" : "s"} of the opencode provider`
 }
 
 /** The exits that are neither paused nor out of use right now. */
@@ -268,6 +276,11 @@ export function describeExit(exit: ExitSummaryLike, status: StatusLike): string 
   if ((status.skipped ?? []).includes(exit.id)) parts.push("not answering")
   parts.push(statusLabel(exit.status))
   if (exit.latencyMs !== undefined) parts.push(`${exit.latencyMs} ms`)
+  // The traffic this exit has carried, which is what the user wants to see
+  // next to a name. The count of selected models is not traffic and is never
+  // shown here.
+  const requests = exit.stats?.requests ?? 0
+  parts.push(`${requests} request${requests === 1 ? "" : "s"}`)
   if (status.activeExit?.id === exit.id) parts.push("chosen")
   return parts.join(" - ")
 }
@@ -303,7 +316,7 @@ export function summarizePill(status: StatusLike | undefined): string | undefine
       ? "relay on - no exit can serve - requests fail - /relay"
       : "relay on - no exit can serve - requests direct - /relay"
   }
-  const count = status.routedCount
+  const count = status.exits.reduce((sum, exit) => sum + (exit.stats?.requests ?? 0), 0)
   const used = status.exhausted.length
   const usedNote = used > 0 ? ` - ${used} used up` : ""
   // With round robin or fastest there is no single exit to name, so the
@@ -314,5 +327,9 @@ export function summarizePill(status: StatusLike | undefined): string | undefine
       : status.strategy === "fastest"
         ? "fastest exit"
         : (status.activeExit?.name ?? "next usable exit")
-  return `relay ${name} - ${count} model${count === 1 ? "" : "s"}${usedNote} - /relay`
+  // The pill reports traffic: how many requests went through an exit. How
+  // many models are selected is not how many requests went anywhere, and
+  // showing it here would read as traffic when none has happened.
+  const traffic = count === 0 ? "no requests yet" : `${count} request${count === 1 ? "" : "s"}`
+  return `relay ${name} - ${traffic}${usedNote} - /relay`
 }

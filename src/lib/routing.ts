@@ -250,10 +250,14 @@ function forwardedHeaders(request: Request): Headers {
  *
  * The relay answers on the root of its own url and reads the real call from the
  * x-relay-* headers, so the request line carries the relay and the headers carry
- * the intent. The body is never read here: it is handed over as the stream it
- * already is, so a long inference is forwarded while it is still being produced.
- * Redirects are never followed: a platform redirect would carry the access
- * token to a host the user did not choose.
+ * the intent. The body is handed over as the stream it already is, which keeps
+ * the *shape* of a streamed body, but on OpenCode 2.2.7 the host rebuilds a
+ * replaced request with `HttpClientRequest.fromWeb` and re-buffers
+ * `clone().arrayBuffer()`, so the body is read in full before anything is
+ * sent. `redirect: "manual"` and the signal are best-effort for the same
+ * reason: the host drops both when it rebuilds. The relay never follows an
+ * upstream redirect itself, so a platform redirect still cannot carry the
+ * access token to a host the user did not choose.
  */
 export function relayRequest(request: Request, target: RelayTarget): Request {
   const source = new URL(request.url, UPSTREAM_ORIGIN)
@@ -289,8 +293,13 @@ export function relayRequest(request: Request, target: RelayTarget): Request {
  *
  * The bridge is the process that calls `fetch` with Bun's `proxy` option, so
  * the hook only has to point the request at loopback and say which proxy to
- * use. The target URL travels in a header, and the body stays the stream it
- * already is.
+ * use. The target URL travels in a header. The body is handed over as the
+ * stream it already is, which keeps the *shape* of a streamed body, but on
+ * OpenCode 2.2.7 the host rebuilds a replaced request with
+ * `HttpClientRequest.fromWeb` and re-buffers `clone().arrayBuffer()`, so it is
+ * read in full before the bridge is even called. `redirect: "manual"` and the
+ * signal are best-effort for the same reason: the host drops both when it
+ * rebuilds, and the bridge never follows a redirect of its own.
  */
 export function proxyRequest(request: Request, target: ProxyTarget): Request {
   const headers = forwardedHeaders(request)
