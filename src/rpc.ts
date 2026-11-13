@@ -118,6 +118,14 @@ const Status = Schema.Struct({
   paused: Schema.Array(Schema.String),
   /** Exits that are not used right now because they did not answer. */
   skipped: Schema.Array(Schema.String),
+  /**
+   * The exit the picker would use for the next request, with the live cooldown
+   * state applied. Absent when no exit can serve, and from a server that
+   * predates the field.
+   */
+  servingExitId: Schema.optional(Schema.String),
+  /** The exits the picker would leave out, with the live cooldown state applied. */
+  skippedExitIds: Schema.optional(Schema.Array(Schema.String)),
   scanning: Schema.optional(ScanProgress),
   lastDecision: Schema.optional(LastDecision),
   note: Schema.optional(Schema.String),

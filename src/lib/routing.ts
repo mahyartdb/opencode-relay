@@ -410,12 +410,32 @@ export async function readBody(
   let timer: ReturnType<typeof setTimeout> | undefined
   try {
     const copy = response.clone()
-    const text = await Promise.race([
-      copy.text(),
-      new Promise<undefined>((resolve) => {
-        timer = setTimeout(() => resolve(undefined), timeoutMs)
-      }),
-    ])
+    const body = copy.body
+    if (body === null) return ""
+    // The body is read through its reader, not `text()`, so the timeout can
+    // cancel the read itself: a clone that is no longer awaited must not keep
+    // buffering a long or never-ending body in the background.
+    const reader = body.getReader()
+    const decoder = new TextDecoder()
+    const read = (async (): Promise<string> => {
+      let text = ""
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (done) break
+        if (value !== undefined) text += decoder.decode(value, { stream: true })
+      }
+      return text + decoder.decode()
+    })()
+    // The timeout wins the race, so the read's rejection (if cancellation
+    // causes one) would otherwise be unhandled.
+    read.catch(() => {})
+    const timedOut = new Promise<undefined>((resolve) => {
+      timer = setTimeout(() => {
+        void reader.cancel().catch(() => {})
+        resolve(undefined)
+      }, timeoutMs)
+    })
+    const text = await Promise.race([read, timedOut])
     return text === undefined ? undefined : text.slice(0, limit)
   } catch {
     return undefined

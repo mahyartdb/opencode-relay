@@ -31,7 +31,7 @@ import {
   type Strategy,
 } from "../lib/types.ts"
 import { isFree, selectModels } from "../lib/routing.ts"
-import { parseProxyList, parseProxyUrl } from "../lib/proxy.ts"
+import { parseProxyList, parseProxyUrl, proxyKey } from "../lib/proxy.ts"
 import { redact } from "../lib/redact.ts"
 import {
   deleteVercelProject,
@@ -71,6 +71,9 @@ function newAccessToken(): string {
   return randomBytes(24).toString("hex")
 }
 
+/** The largest configuration the import will read, before it is parsed. */
+const IMPORT_LIMIT_BYTES = 2 * 1024 * 1024
+
 /** A proxy's default name: its address, which is what the user recognizes. */
 function proxyName(host: string, port: number, index: number, prefix?: string): string {
   const address = `${host}:${port}`
@@ -86,7 +89,15 @@ function accountOf(state: RelayState, relay: RelayRecord): Account | undefined {
 function describeState(options: {
   readonly settings: Settings
   readonly exits: readonly ExitSummary[]
+  /** The exit the user chose, when there is one. */
   readonly active: ExitSummary | undefined
+  /**
+   * The exit the picker would actually use for the next request, derived from
+   * the same predicate the request hook takes, or undefined when no exit can
+   * serve and the request goes direct. The note must never name an exit the
+   * picker would reject.
+   */
+  readonly serving: ExitSummary | undefined
   readonly routed: number
   readonly modelCount: number
   /** Requests that have gone through an exit since the process started. */
@@ -96,19 +107,10 @@ function describeState(options: {
   readonly exhausted: readonly string[]
   readonly skipped: readonly string[]
 }): string {
-  const { settings, exits, active, routed, modelCount, requests, catalog, notes, exhausted, skipped } = options
+  const { settings, exits, active, serving, routed, modelCount, requests, catalog, notes, exhausted, skipped } =
+    options
   if (!settings.enabled) return "Routing is off: requests go straight to OpenCode."
   if (exits.length === 0) return "Routing is on, but there is no relay or proxy yet."
-
-  const usable = exits.filter(
-    (exit) =>
-      exit.enabled &&
-      !exhausted.includes(exit.id) &&
-      !skipped.includes(exit.id) &&
-      exit.status !== "unreachable" &&
-      exit.status !== "blocked" &&
-      exit.status !== "bad",
-  ).length
 
   const models = modelCount === 0 ? "no model" : `${routed} free ${PROVIDER_ID} model${routed === 1 ? "" : "s"}`
   // How many requests actually went through an exit, which is the number the
@@ -141,7 +143,7 @@ function describeState(options: {
   }
   problems.push(...notes)
 
-  if (usable === 0) {
+  if (serving === undefined) {
     const fallback =
       settings.direct === "never"
         ? "The plugin is set to never go direct, so requests fail."
@@ -155,12 +157,13 @@ function describeState(options: {
       ? "across the exits in turn"
       : settings.strategy === "fastest"
         ? "through the fastest exit"
-        : active !== undefined
-          ? `through ${active.name}`
-          : "through the exits"
-  const activeSkipped = active !== undefined && skipped.includes(active.id)
-  const note = activeSkipped
-    ? `${active.name} did not answer, so the next usable exit takes over.`
+        : `through ${serving.name}`
+  // The chosen exit is only named when it is the one that did not answer and
+  // another takes over; otherwise the note names the exit that will serve.
+  const chosenSkipped =
+    active !== undefined && active.id !== serving.id && skipped.includes(active.id)
+  const note = chosenSkipped
+    ? `${active.name} did not answer, so ${serving.name} takes over.`
     : `Routing ${models} ${where} (${settings.strategy === "exhausted" ? "until it is exhausted" : settings.strategy}).`
   return problems.length === 0 ? note : `${note} ${problems.join(" ")}`
 }
@@ -201,6 +204,10 @@ async function deployOne(options: {
     createdAt: Date.now(),
   }
   await state.addRelay(relay)
+  // The moment the probe started and the epoch it saw: a live verdict while it
+  // is in flight makes its answer stale, however recent its own start looks.
+  const checkedAt = Date.now()
+  const healthEpoch = state.healthEpoch(relay.id)
   const probe = await probeRelay(relay.url, relay.access)
   await state.setHealth(relay.id, {
     status: probe.reachable ? "reachable" : "unreachable",
@@ -208,6 +215,8 @@ async function deployOne(options: {
     ...(probe.egress !== undefined ? { egress: probe.egress } : {}),
     ...(probe.runtime !== undefined ? { runtime: probe.runtime } : {}),
     ...(probe.reachable ? {} : { lastError: "The relay did not answer its first check." }),
+    checkedAt,
+    healthEpoch,
   })
   return {
     id: relay.id,
@@ -223,7 +232,7 @@ async function deployOne(options: {
 export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
   const { state, catalog, bridge, tester, announce } = deps
 
-  /** Check whatever is still untested after a list was imported or added. */
+  /** Check the exits that were just added, in the background. */
   const checkUntested = (): void => {
     const run = async (): Promise<void> => {
       await tester.scan("api")
@@ -257,6 +266,15 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
       const active = state.activeExit()
       const activeSummary = active === undefined ? undefined : state.summaryOf(active.id)
       const paused = exits.filter((exit) => !exit.enabled).map((exit) => exit.id)
+      // The exit the picker would use for the next request, from the very same
+      // predicate the request hook applies. The note and the TUI are derived
+      // from this, so neither can name an exit that is paused, untested or
+      // cooling while another one (or no exit at all) actually serves. The
+      // live cooldown map never leaves this process, so this payload is the
+      // only place the TUI can learn the picker's answer.
+      const pick = state.pickExit({ advance: false })
+      const serving = pick.exit
+      const servingSummary = serving === undefined ? undefined : state.summaryOf(serving.id)
       return {
         enabled: settings.enabled,
         selection: settings.selection,
@@ -270,12 +288,15 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
         exhausted,
         paused,
         skipped,
+        ...(serving !== undefined ? { servingExitId: serving.id } : {}),
+        skippedExitIds: pick.skipped.map((entry) => entry.id),
         ...(state.scanning() !== undefined ? { scanning: state.scanning() } : {}),
         ...(state.lastDecision() !== undefined ? { lastDecision: state.lastDecision() } : {}),
         note: describeState({
           settings,
           exits,
           active: activeSummary,
+          serving: servingSummary,
           routed,
           modelCount: list.length,
           requests,
@@ -419,6 +440,10 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
         createdAt: Date.now(),
       }
       await state.addRelay(relay)
+      // Stamped when the probe starts: a live verdict while it is in flight
+      // wins over whatever the probe answers.
+      const checkedAt = Date.now()
+      const healthEpoch = state.healthEpoch(relay.id)
       const probe = await probeRelay(relay.url, relay.access)
       await state.setHealth(relay.id, {
         status: probe.reachable ? "reachable" : "unreachable",
@@ -426,6 +451,8 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
         ...(probe.egress !== undefined ? { egress: probe.egress } : {}),
         ...(probe.runtime !== undefined ? { runtime: probe.runtime } : {}),
         ...(probe.reachable ? {} : { lastError: "The relay did not answer its first check." }),
+        checkedAt,
+        healthEpoch,
       })
       await announce("relay added")
       return {
@@ -514,12 +541,18 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
           message: redact(describe(err), [account.token, relay.access]),
         })
       }
+      // Stamped when the probe starts: a live verdict while it is in flight
+      // wins over whatever the probe answers.
+      const checkedAt = Date.now()
+      const healthEpoch = state.healthEpoch(relay.id)
       const probe = await probeRelay(relay.url, relay.access)
       await state.setHealth(relay.id, {
         status: probe.reachable ? "reachable" : "unreachable",
         latencyMs: probe.ms,
         ...(probe.egress !== undefined ? { egress: probe.egress } : {}),
         ...(probe.runtime !== undefined ? { runtime: probe.runtime } : {}),
+        checkedAt,
+        healthEpoch,
       })
       await announce("relay updated")
       return { id: relay.id, reachable: probe.reachable }
@@ -543,10 +576,16 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
             access: relay.access,
             relaySource: relaySource(),
           })
+          // Stamped when the probe starts: a live verdict while it is in
+          // flight wins over whatever the probe answers.
+          const checkedAt = Date.now()
+          const healthEpoch = state.healthEpoch(relay.id)
           const probe = await probeRelay(relay.url, relay.access)
           await state.setHealth(relay.id, {
             status: probe.reachable ? "reachable" : "unreachable",
             latencyMs: probe.ms,
+            checkedAt,
+            healthEpoch,
           })
           updated += 1
         } catch (err) {
@@ -617,15 +656,15 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
         }
       }
       const parsed = parseProxyList(input.text)
-      const existing = new Set(state.proxies().map((proxy) => proxy.url.toLowerCase()))
+      const existing = new Set(state.proxies().map((proxy) => proxyKey(proxy.url)))
       let duplicates = parsed.duplicates
       const records: ProxyRecord[] = []
       for (const proxy of parsed.proxies) {
-        if (existing.has(proxy.url.toLowerCase())) {
+        if (existing.has(proxyKey(proxy.url))) {
           duplicates += 1
           continue
         }
-        existing.add(proxy.url.toLowerCase())
+        existing.add(proxyKey(proxy.url))
         records.push({
           kind: "proxy",
           id: randomUUID(),
@@ -853,6 +892,12 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
 
     /** Read exits and rules back in. Accounts are never imported. */
     importConfig: async (input) => {
+      // The cap is bytes, not UTF-16 code units: the message says "2 MB", and a
+      // page of non-Latin text is more bytes than characters.
+      if (Buffer.byteLength(input.json, "utf8") > IMPORT_LIMIT_BYTES) {
+        state.noteFailure("The configuration is larger than 2 MB and was not imported.")
+        return { relays: 0, proxies: 0, invalid: 1 }
+      }
       let parsed: unknown
       try {
         parsed = JSON.parse(input.json)
@@ -866,6 +911,13 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
       let proxies = 0
 
       const relayEntries = Array.isArray(record["relays"]) ? record["relays"] : []
+      // Importing the same export twice must not duplicate anything: a relay
+      // is the same one when its address and access token match, a proxy when
+      // its URL matches (credentials included, case-sensitively). Duplicates
+      // are skipped silently; the counts say how many exits were added.
+      const seenRelays = new Set(
+        state.relays().map((relay) => JSON.stringify([relay.url, relay.access])),
+      )
       for (const entry of relayEntries) {
         if (!entry || typeof entry !== "object") {
           invalid += 1
@@ -880,13 +932,20 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
           continue
         }
         const normalized = url.startsWith("http") ? url : `https://${url}`
+        const stored = normalized.endsWith("/") ? normalized.slice(0, -1) : normalized
+        const identity = JSON.stringify([stored, access])
+        if (seenRelays.has(identity)) continue
+        seenRelays.add(identity)
         await state.addRelay({
           kind: "relay",
           id: randomUUID(),
           name,
-          project: typeof relay["project"] === "string" ? relay["project"] : "",
+          // An imported relay is tracked only: accounts are never imported, so
+          // the exported project name has no account behind it here. Keeping
+          // it would offer Update and Delete-project actions that always fail.
+          project: "",
           region: typeof relay["region"] === "string" ? relay["region"] : "",
-          url: normalized.endsWith("/") ? normalized.slice(0, -1) : normalized,
+          url: stored,
           access,
           accountId: "",
           enabled: true,
@@ -897,6 +956,7 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
       }
 
       const proxyEntries = Array.isArray(record["proxies"]) ? record["proxies"] : []
+      const seenProxies = new Set(state.proxies().map((proxy) => proxyKey(proxy.url)))
       const imported: ProxyRecord[] = []
       for (const entry of proxyEntries) {
         const url = typeof entry === "string"
@@ -913,6 +973,9 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
           invalid += 1
           continue
         }
+        const key = proxyKey(proxy.url)
+        if (seenProxies.has(key)) continue
+        seenProxies.add(key)
         const wanted =
           entry && typeof entry === "object"
             ? (entry as Record<string, unknown>)["name"]
@@ -951,7 +1014,10 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
         }
       }
       await announce("configuration imported")
-      if (relays > 0 || proxies > 0) checkUntested()
+      // Imported exits stay untested on purpose. The tester replays the last
+      // real request's headers (authorization and cookie included), so a shared
+      // or tampered config must not be able to aim that at a URL of its
+      // choosing. The user tests an imported exit explicitly.
       return { relays, proxies, invalid }
     },
   }

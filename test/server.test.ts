@@ -3,6 +3,8 @@ import { createServer, type Server } from "node:http"
 import { startRelay, startTraceStub, traceUrl } from "../tools/relay-harness.ts"
 import { ROTATE_DELAY_MS } from "../src/server/hooks.ts"
 import { relayRequest } from "../src/lib/routing.ts"
+import { createHandlers } from "../src/server/handlers.ts"
+import { RelayState } from "../src/server/state.ts"
 import plugin from "../src/server/index.ts"
 
 /**
@@ -45,6 +47,7 @@ interface StatusAnswer {
     readonly enabled: boolean
     readonly url: string
     readonly project?: string
+    readonly accountId?: string
     readonly statusLabel: string
     readonly lastError?: string
     readonly stats: { readonly requests: number }
@@ -52,9 +55,14 @@ interface StatusAnswer {
   readonly exhausted: readonly string[]
   readonly paused: readonly string[]
   readonly skipped: readonly string[]
+  /** The exit the picker would use for the next request, when one can serve. */
+  readonly servingExitId?: string
+  /** Exits the picker would leave out, with its live cooldown state applied. */
+  readonly skippedExitIds?: readonly string[]
   readonly note: string
   readonly routedCount: number
   readonly modelCount: number
+  readonly scanning?: { readonly total: number; readonly done: number }
   readonly lastDecision?: {
     readonly modelId: string
     readonly routed: boolean
@@ -197,6 +205,43 @@ function firstExit(status: StatusAnswer): StatusAnswer["exits"][number] {
   const exit = status.exits[0]
   if (!exit) throw new Error("no exit")
   return exit
+}
+
+/** A relay as storage holds it, so a status test can choose its health exactly. */
+function storedRelay(
+  id: string,
+  name: string,
+  status: "untested" | "reachable" | "unreachable",
+): Record<string, unknown> {
+  return {
+    kind: "relay",
+    id,
+    name,
+    project: "",
+    region: "",
+    url: "http://127.0.0.1:9",
+    access: ACCESS,
+    accountId: "",
+    enabled: true,
+    status,
+    createdAt: Date.now(),
+  }
+}
+
+/**
+ * Routing rules that start off, so the plugin does not scan untested exits on
+ * startup before the test asks for its first status.
+ */
+function storedSettings(activeExitId: string): Record<string, unknown> {
+  return {
+    enabled: false,
+    selection: "free",
+    strategy: "fixed",
+    customModels: [],
+    direct: "allow",
+    healthChecks: true,
+    activeExitId,
+  }
 }
 
 /** How long to wait before asking again, so a failed probe is retried, not trusted. */
@@ -580,6 +625,99 @@ describe("the server half", () => {
     }
   })
 
+  test("the status payload names the exit the picker would serve", async () => {
+    const store = new Map<string, unknown>()
+    store.set("relays", [
+      storedRelay("chosen", "chosen", "reachable"),
+      storedRelay("backup", "backup", "reachable"),
+    ])
+    store.set("settings", storedSettings("chosen"))
+    const app = await start(true, store)
+    try {
+      await app.call("setEnabled", { enabled: true })
+      const status = (await app.call("status")) as StatusAnswer
+      expect(status.servingExitId).toBe("chosen")
+      expect(status.skippedExitIds).toEqual([])
+      // The note is derived from the same picker result, so it cannot disagree.
+      expect(status.note).toContain("through chosen")
+    } finally {
+      await app.dispose()
+    }
+  })
+
+  test("the status names the exit that will serve, not an unusable chosen one", async () => {
+    const store = new Map<string, unknown>()
+    store.set("relays", [
+      // The old note counted an untested exit as usable, so it named the chosen
+      // one even though the picker would skip it and use the backup.
+      storedRelay("chosen", "chosen", "untested"),
+      storedRelay("backup", "backup", "reachable"),
+    ])
+    store.set("settings", storedSettings("chosen"))
+    const app = await start(true, store)
+    try {
+      await app.call("setEnabled", { enabled: true })
+      const status = (await app.call("status")) as StatusAnswer
+      expect(status.exits.find((exit) => exit.id === "chosen")?.status).toBe("untested")
+      expect(status.note).toContain("through backup")
+      expect(status.note).not.toContain("through chosen")
+      // The payload carries the picker's answer itself, not only the note.
+      expect(status.servingExitId).toBe("backup")
+      expect(status.skippedExitIds).toEqual(["chosen"])
+    } finally {
+      await app.dispose()
+    }
+  })
+
+  test("with every exit untested, the status says the request goes direct", async () => {
+    const store = new Map<string, unknown>()
+    store.set("relays", [storedRelay("fresh", "fresh", "untested")])
+    store.set("settings", storedSettings("fresh"))
+    const app = await start(true, store)
+    try {
+      await app.call("setEnabled", { enabled: true })
+      const status = (await app.call("status")) as StatusAnswer
+      expect(status.note).toContain("no exit can serve")
+      expect(status.note).toContain("Requests go direct")
+      expect(status.note).not.toContain("through fresh")
+      // The picker names nothing, and says which exit it left out.
+      expect(status.servingExitId).toBeUndefined()
+      expect(status.skippedExitIds).toEqual(["fresh"])
+    } finally {
+      await app.dispose()
+    }
+  })
+
+  test("a paused chosen exit is not named while another exit serves", async () => {
+    const store = new Map<string, unknown>()
+    store.set("relays", [
+      storedRelay("chosen", "chosen", "reachable"),
+      storedRelay("backup", "backup", "reachable"),
+    ])
+    store.set("settings", storedSettings("chosen"))
+    const app = await start(true, store)
+    try {
+      await app.call("setEnabled", { enabled: true })
+      await app.call("setExitEnabled", { id: "chosen", enabled: false })
+
+      const status = (await app.call("status")) as StatusAnswer
+      expect(status.paused).toContain("chosen")
+      expect(status.note).toContain("through backup")
+      expect(status.note).not.toContain("through chosen")
+      expect(status.servingExitId).toBe("backup")
+
+      // Pause the last usable exit too: now the note must not promise routing
+      // through anything at all.
+      await app.call("setExitEnabled", { id: "backup", enabled: false })
+      const none = (await app.call("status")) as StatusAnswer
+      expect(none.note).toContain("no exit can serve")
+      expect(none.note).toContain("Requests go direct")
+      expect(none.servingExitId).toBeUndefined()
+    } finally {
+      await app.dispose()
+    }
+  })
+
   test("the access token and a proxy password never leave the server", async () => {
     const app = await start()
     try {
@@ -778,6 +916,71 @@ describe("the server half", () => {
       expect(status.note).toContain("no exit can serve")
     } finally {
       await app.dispose()
+    }
+  })
+
+  test("a probe that started before a live verdict cannot overwrite it", async () => {
+    // The relay answers the first-check probe slowly. While the probe is out, a
+    // live verdict refuses the exit; the probe's "reachable" is stale and must
+    // not clear the live "blocked".
+    let release: (() => void) | undefined
+    let arrived: (() => void) | undefined
+    const reached = new Promise<void>((resolve) => {
+      arrived = resolve
+    })
+    const fake = createServer((_request, response) => {
+      release = () => {
+        response.writeHead(200, { "content-type": "application/json" })
+        response.end(JSON.stringify({ egress: "127.0.0.1", runtime: "test" }))
+      }
+      arrived?.()
+    })
+    await new Promise<void>((resolve) => fake.listen(0, "127.0.0.1", resolve))
+    const address = fake.address()
+    if (address === null || typeof address === "string") throw new Error("the fake relay has no port")
+
+    const store = new Map<string, unknown>()
+    const storage = {
+      get: async (key: string) => store.get(key),
+      set: async (key: string, value: unknown) => {
+        store.set(key, value)
+      },
+      remove: async (key: string) => {
+        store.delete(key)
+      },
+      scan: async () => ({ entries: [] }),
+    }
+    const state = new RelayState(storage as never)
+    const handlers = createHandlers({
+      state,
+      catalog: {} as never,
+      bridge: {} as never,
+      tester: {} as never,
+      announce: async () => {},
+    })
+
+    try {
+      const adding = handlers.addRelay(
+        { name: "slow", url: `http://127.0.0.1:${address.port}`, access: ACCESS },
+        {} as never,
+      )
+      await reached
+      const relay = state.exits()[0]
+      if (!relay) throw new Error("the relay was not added")
+      expect(relay.status).toBe("untested")
+
+      // The live verdict lands while the probe is still in flight.
+      state.markBlocked(relay.id, "OpenCode refused this exit.")
+      release?.()
+
+      const added = (await adding) as { reachable: boolean }
+      expect(added.reachable).toBe(true)
+      expect(state.exit(relay.id)?.status).toBe("blocked")
+      // The stale answer did not even leave a check time on the live record.
+      expect(state.exit(relay.id)?.lastCheck).toBeUndefined()
+    } finally {
+      fake.closeAllConnections()
+      await new Promise<void>((resolve) => fake.close(() => resolve()))
     }
   })
 
@@ -1078,6 +1281,168 @@ describe("the server half", () => {
       expect(status.exits.some((exit) => exit.kind === "proxy")).toBe(true)
     } finally {
       await target.dispose()
+    }
+  })
+
+  test("importing a configuration does not probe the imported relay", async () => {
+    let requests = 0
+    const fake = createServer((_request, response) => {
+      requests += 1
+      response.writeHead(200, { "content-type": "application/json" })
+      response.end("{}")
+    })
+    await new Promise<void>((resolve) => fake.listen(0, "127.0.0.1", resolve))
+    const address = fake.address()
+    if (address === null || typeof address === "string") {
+      throw new Error("the fake relay has no port")
+    }
+    const relayUrl = `http://127.0.0.1:${address.port}`
+
+    const app = await start()
+    try {
+      const config = JSON.stringify({
+        version: 1,
+        relays: [
+          { name: "imported relay", url: relayUrl, access: ACCESS, region: "", project: "vercel-project" },
+        ],
+        proxies: [],
+        settings: { healthChecks: true },
+      })
+      const imported = (await app.call("importConfig", { json: config })) as {
+        relays: number
+        proxies: number
+        invalid: number
+      }
+      expect(imported).toEqual({ relays: 1, proxies: 0, invalid: 0 })
+
+      // The old import started a background scan immediately, which replayed
+      // the last real request's headers (authorization included) to whatever
+      // URL the config named. A scan would reach this stub in milliseconds.
+      await Bun.sleep(250)
+      expect(requests).toBe(0)
+
+      const status = (await app.call("status")) as StatusAnswer
+      expect(status.scanning).toBeUndefined()
+      expect(firstExit(status).status).toBe("untested")
+    } finally {
+      await app.dispose()
+      fake.closeAllConnections()
+      await new Promise<void>((resolve) => fake.close(() => resolve()))
+    }
+  })
+
+  test("an imported relay is tracked only, never an update target", async () => {
+    const app = await start()
+    try {
+      const config = JSON.stringify({
+        version: 1,
+        relays: [
+          {
+            name: "imported relay",
+            url: "http://127.0.0.1:9",
+            access: ACCESS,
+            region: "fra1",
+            project: "vercel-project",
+          },
+        ],
+      })
+      const imported = (await app.call("importConfig", { json: config })) as {
+        relays: number
+        proxies: number
+        invalid: number
+      }
+      expect(imported).toEqual({ relays: 1, proxies: 0, invalid: 0 })
+
+      const status = (await app.call("status")) as StatusAnswer
+      const relay = status.exits.find((exit) => exit.kind === "relay")
+      expect(relay?.project).toBe("")
+      expect(relay?.accountId).toBe("")
+
+      // With no project and no account there is nothing update-all can deploy.
+      const updated = (await app.call("updateAllRelays", {})) as {
+        updated: number
+        failed: unknown[]
+      }
+      expect(updated).toEqual({ updated: 0, failed: [] })
+    } finally {
+      await app.dispose()
+    }
+  })
+
+  test("an oversized configuration is refused by its byte length", async () => {
+    const store = new Map<string, unknown>()
+    store.set("relays", [storedRelay("one", "one", "reachable")])
+    store.set("settings", storedSettings("one"))
+    const app = await start(true, store)
+    try {
+      // Valid JSON, under the cap in characters but over it in bytes: the
+      // message says 2 MB, so the cap has to count bytes, not UTF-16 units.
+      const json = JSON.stringify({ version: 1, padding: "é".repeat(1_200_000) })
+      expect(json.length).toBeLessThan(2 * 1024 * 1024)
+      expect(Buffer.byteLength(json, "utf8")).toBeGreaterThan(2 * 1024 * 1024)
+
+      const imported = (await app.call("importConfig", { json })) as {
+        relays: number
+        proxies: number
+        invalid: number
+      }
+      expect(imported).toEqual({ relays: 0, proxies: 0, invalid: 1 })
+
+      await app.call("setEnabled", { enabled: true })
+      const status = (await app.call("status")) as StatusAnswer
+      expect(status.note).toContain("larger than 2 MB")
+    } finally {
+      await app.dispose()
+    }
+  })
+
+  test("a configuration imported twice is not duplicated", async () => {
+    const config = JSON.stringify({
+      version: 1,
+      relays: [
+        {
+          name: "imported relay",
+          url: "http://127.0.0.1:9",
+          access: ACCESS,
+          region: "",
+          project: "",
+        },
+      ],
+      // The passwords differ in case, so they authenticate differently and
+      // both must survive the import and its deduplication.
+      proxies: [
+        { name: "capital", url: "http://user:PaSs@1.2.3.4:8080" },
+        "http://user:pass@1.2.3.4:8080",
+      ],
+      settings: {
+        selection: "free",
+        strategy: "fixed",
+        direct: "allow",
+        customModels: [],
+        healthChecks: true,
+      },
+    })
+    const app = await start()
+    try {
+      const first = (await app.call("importConfig", { json: config })) as {
+        relays: number
+        proxies: number
+        invalid: number
+      }
+      expect(first).toEqual({ relays: 1, proxies: 2, invalid: 0 })
+
+      // The same export again: nothing is added, and the counts say so.
+      const second = (await app.call("importConfig", { json: config })) as {
+        relays: number
+        proxies: number
+        invalid: number
+      }
+      expect(second).toEqual({ relays: 0, proxies: 0, invalid: 0 })
+
+      const status = (await app.call("status")) as StatusAnswer
+      expect(status.exits).toHaveLength(3)
+    } finally {
+      await app.dispose()
     }
   })
 

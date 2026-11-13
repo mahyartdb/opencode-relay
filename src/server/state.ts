@@ -92,6 +92,15 @@ export const REFUSED_COOLDOWN_MS = 15 * 60_000
 /** How long a short rate limit is left alone. */
 export const RATE_LIMIT_COOLDOWN_MS = 60_000
 
+/**
+ * How long a session and model are still blamed on the exit that served them.
+ *
+ * A retry normally follows its answer within seconds, but a slow request can
+ * take minutes: the request hook clears the note at the start of every new
+ * request, so a generous window cannot blame the wrong exit.
+ */
+const ATTRIBUTION_TTL_MS = 30 * 60_000
+
 /** A sample of a real OpenCode request, kept in memory so a test can look like one. */
 export interface RequestSample {
   readonly at: number
@@ -135,6 +144,13 @@ export interface HealthUpdate {
   readonly lastError?: string
   readonly exhaustedUntil?: number
   readonly checkedAt?: number
+  /**
+   * The epoch this check saw when it started.
+   *
+   * Every live verdict bumps the epoch, so a check that began before one is
+   * stale even when its `checkedAt` looks newer than the record's last check.
+   */
+  readonly healthEpoch?: number
 }
 
 /** One exit with its skip reason, for a preview. */
@@ -161,6 +177,8 @@ export class RelayState {
   private readonly spendReasons = new Map<string, string>()
   /** Exits that did not answer, and how many times in a row. */
   private readonly cooling = new Map<string, { until: number; failures: number }>()
+  /** How many live verdicts each exit has taken, so a check in flight can tell it is stale. */
+  private readonly epochs = new Map<string, number>()
   /** Requests and answers seen through each exit since the process started. */
   private readonly stats = new Map<string, ExitStats>()
   /** Requests that went through an exit, so a retry knows a failure came from one. */
@@ -366,6 +384,24 @@ export class RelayState {
   async setHealth(id: string, update: HealthUpdate): Promise<boolean> {
     const current = this.exit(id)
     if (!current) return false
+    // A live verdict bumps the epoch, so a check that started before it is
+    // stale however new its own `checkedAt` looks: applying its answer would
+    // overwrite what a real request just proved. Callers that do not stamp an
+    // epoch keep their old behavior.
+    if (update.healthEpoch !== undefined && update.healthEpoch !== this.healthEpoch(id)) {
+      return false
+    }
+    // Two checks can overlap and finish out of order. An answer stamped before
+    // the one already on record is stale, and applying it could retire an exit
+    // a newer check had just cleared. Callers that do not stamp a check keep
+    // their old behavior.
+    if (
+      update.checkedAt !== undefined &&
+      current.lastCheck !== undefined &&
+      update.checkedAt < current.lastCheck
+    ) {
+      return false
+    }
     const checkedAt = update.checkedAt ?? Date.now()
     // A stale reset time would keep a record looking used up after a test
     // proved it works again, so it only travels with an exhausted status.
@@ -397,6 +433,16 @@ export class RelayState {
     return this.setHealth(id, { status })
   }
 
+  /** How many live verdicts this exit has taken, for a check to stamp itself. */
+  healthEpoch(id: string): number {
+    return this.epochs.get(id) ?? 0
+  }
+
+  /** A live verdict makes every check already in flight out of date. */
+  private bumpHealthEpoch(id: string): void {
+    this.epochs.set(id, this.healthEpoch(id) + 1)
+  }
+
   /** Pause an exit, or bring it back. A paused exit is kept and never used. */
   async setExitEnabled(id: string, enabled: boolean): Promise<boolean> {
     const current = this.exit(id)
@@ -416,6 +462,7 @@ export class RelayState {
   markRateLimited(id: string, until: number, note?: string): void {
     const exit = this.exit(id)
     if (!exit) return
+    this.bumpHealthEpoch(id)
     this.cooling.set(id, { until, failures: this.cooling.get(id)?.failures ?? 0 })
     const next: ExitRecord = {
       ...exit,
@@ -429,6 +476,10 @@ export class RelayState {
   markBlocked(id: string, note?: string): void {
     const exit = this.exit(id)
     if (!exit) return
+    this.bumpHealthEpoch(id)
+    // A refusal is a live failure like any other: rest the exit briefly instead
+    // of retiring it, so the next request can prove the refusal has passed.
+    this.rest(id)
     const next: ExitRecord = {
       ...exit,
       status: "blocked",
@@ -466,6 +517,7 @@ export class RelayState {
       await writeProxies(this.storage, this.proxyList)
     }
     this.cooling.delete(id)
+    this.epochs.delete(id)
     this.stats.delete(id)
     for (const [key, entry] of this.relayed) {
       if (entry.exitId === id) this.relayed.delete(key)
@@ -574,8 +626,18 @@ export class RelayState {
     if (!exit.enabled) return false
     if (exit.status === "exhausted" && (exit.exhaustedUntil ?? 0) > now) return false
     if (exit.status === "untested") return false
-    if (exit.status === "unreachable" || exit.status === "blocked" || exit.status === "bad") return false
     const cool = this.cooling.get(exit.id)
+    // A live failure rests the exit for a while, but it is not a retirement:
+    // once the rest is over the exit is worth another try, and the next failure
+    // arms a longer one. A failure with no rest on record came from a test, and
+    // only another test may clear it.
+    if (exit.status === "unreachable" || exit.status === "blocked" || exit.status === "bad") {
+      return cool !== undefined && cool.until <= now
+    }
+    // A rate-limited exit is resting, not retired: it serves again once the
+    // cooldown has passed, and never stays unusable just because its last
+    // verdict was "limited".
+    if (exit.status === "limited" && cool !== undefined && cool.until > now) return false
     if (cool !== undefined && cool.until > now) return false
     return true
   }
@@ -605,10 +667,12 @@ export class RelayState {
    * until it is used up, or the fastest measured one. An exit that is known not
    * to answer, is paused, or is cooling never serves a request; the caller
    * decides what happens then (direct, or a clear failure).
+   *
+   * `now` is for asking about another moment, as the other predicates here do.
    */
-  pickExit(options: { readonly advance?: boolean } = {}): PickResult {
+  pickExit(options: { readonly advance?: boolean; readonly now?: number } = {}): PickResult {
     const advance = options.advance ?? true
-    const now = Date.now()
+    const now = options.now ?? Date.now()
     const all = this.exits()
     const usable: ExitRecord[] = []
     const skipped: SkippedExit[] = []
@@ -664,12 +728,10 @@ export class RelayState {
    * keeps failing should not be tried on every request.
    */
   markFailure(id: string, note?: string, status: ExitStatus = "unreachable"): void {
-    const previous = this.cooling.get(id)?.failures ?? 0
-    const failures = previous + 1
-    const wait = Math.min(COOLDOWN_BASE_MS * 2 ** (failures - 1), COOLDOWN_MAX_MS)
-    this.cooling.set(id, { until: Date.now() + wait, failures })
+    this.rest(id)
     const exit = this.exit(id)
     if (exit) {
+      this.bumpHealthEpoch(id)
       const next: ExitRecord = {
         ...exit,
         status,
@@ -677,6 +739,14 @@ export class RelayState {
       }
       void this.replaceExit(next).catch(() => {})
     }
+  }
+
+  /** Arm the next rest for this exit, twice as long as the one before. */
+  private rest(id: string): void {
+    const previous = this.cooling.get(id)?.failures ?? 0
+    const failures = previous + 1
+    const wait = Math.min(COOLDOWN_BASE_MS * 2 ** (failures - 1), COOLDOWN_MAX_MS)
+    this.cooling.set(id, { until: Date.now() + wait, failures })
   }
 
   /** How long this exit has been failing, for a note. */
@@ -738,6 +808,10 @@ export class RelayState {
     this.cooling.delete(id)
     const exit = this.exit(id)
     if (!exit) return
+    // A success is live evidence too, so every check already in flight is out
+    // of date. The tester stamps an epoch when its check starts, so its own
+    // answer was never in flight against this verdict; only an older check is.
+    this.bumpHealthEpoch(id)
     // The in-memory record is what the menu and the fastest strategy read. A
     // write per successful request would be a lot of disk traffic for a field
     // that a restart can afford to find slightly stale.
@@ -788,10 +862,14 @@ export class RelayState {
   markExhausted(id: string, until: number, note?: string): void {
     const exit = this.exit(id)
     if (!exit) return
+    // A used-up verdict is live evidence: a check that began before it must not
+    // bring the exit back with an answer of its own.
+    this.bumpHealthEpoch(id)
     const next: ExitRecord = {
       ...exit,
       status: "exhausted",
       exhaustedUntil: until,
+      lastCheck: Date.now(),
       ...(note !== undefined ? { lastError: note.slice(0, 240) } : {}),
     }
     if (next.kind === "relay") {
@@ -907,14 +985,14 @@ export class RelayState {
    * Remember that a request for this session and model went through an exit.
    *
    * The retry hook is not told which request failed, so the request hook leaves
-   * this note and the retry hook reads it. Entries are short lived: a retry
-   * happens within seconds, and anything older is not this failure.
+   * this note and the retry hook reads it. A new request clears the note first,
+   * so the window only has to outlast a slow answer, however long that is.
    */
   noteRelayed(sessionID: string, modelID: string, exitId: string): void {
     const now = Date.now()
     if (this.relayed.size > 200) {
       for (const [key, entry] of this.relayed) {
-        if (now - entry.at > 60_000) this.relayed.delete(key)
+        if (now - entry.at > ATTRIBUTION_TTL_MS) this.relayed.delete(key)
       }
     }
     this.relayed.set(`${sessionID}\u0000${modelID}`, { at: now, exitId })
@@ -928,9 +1006,9 @@ export class RelayState {
   }
 
   /** Which exit served this session and model a moment ago, if one did. */
-  relayedBy(sessionID: string, modelID: string): string | undefined {
+  relayedBy(sessionID: string, modelID: string, now = Date.now()): string | undefined {
     const entry = this.relayed.get(`${sessionID}\u0000${modelID}`)
-    if (entry === undefined || Date.now() - entry.at > 60_000) return undefined
+    if (entry === undefined || now - entry.at > ATTRIBUTION_TTL_MS) return undefined
     return entry.exitId
   }
 

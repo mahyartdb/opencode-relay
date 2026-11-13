@@ -87,6 +87,18 @@ export interface StatusLike {
   readonly paused?: readonly string[]
   /** Exits that are skipped because they did not answer or are cooling down. */
   readonly skipped?: readonly string[]
+  /**
+   * The exit the server's picker would use for the next request, with the live
+   * cooldown state applied. Absent when no exit can serve, and from a server
+   * that predates the field.
+   */
+  readonly servingExitId?: string
+  /**
+   * The exits the server's picker would leave out right now. Unlike `skipped`,
+   * this also holds paused, used-up and untested exits, so it is the picker's
+   * whole answer rather than only the cooldown list.
+   */
+  readonly skippedExitIds?: readonly string[]
   readonly routedCount: number
   readonly modelCount: number
   /** What the last request's routing decision was, when one was recorded. */
@@ -133,31 +145,80 @@ function exitStatusWord(exit: ExitSummaryLike): string {
   return (exit.statusLabel ?? "").length > 0 ? exit.statusLabel : statusLabel(exit.status)
 }
 
-/** The exits that are neither paused nor out of use right now.
+/** Whether one exit is the one routing would use right now.
  *
- * The filter matches the server's: an exit nobody has tested yet is usable,
- * because it might answer; one that failed to answer, is blocked or is
- * answering badly is not.
+ * The live cooldown map lives in the server process and never crosses the RPC,
+ * so the TUI cannot replay the picker's rule. The status carries the picker's
+ * answer instead: the id it would serve and the ids it would skip. When either
+ * is present it is the truth, even where it contradicts a raw status verdict —
+ * a blocked exit whose rest has expired serves again, and an untested one does
+ * not serve at all. A status from an older server carries neither, so the old
+ * status-based predicate is the best available fallback there.
  */
-export function usableExits(status: StatusLike): readonly ExitSummaryLike[] {
-  const exhausted = new Set(status.exhausted)
-  const skipped = new Set(status.skipped ?? [])
-  return status.exits.filter(
-    (exit) =>
-      exit.enabled &&
-      !exhausted.has(exit.id) &&
-      !skipped.has(exit.id) &&
-      exit.status !== "unreachable" &&
-      exit.status !== "blocked" &&
-      exit.status !== "bad",
+export function isUsableExit(exit: ExitSummaryLike, status: StatusLike): boolean {
+  if (!exit.enabled) return false
+  // The picker names the one exit that would serve; every other exit, however
+  // healthy its record looks, would not carry the next request.
+  if (status.servingExitId !== undefined) return status.servingExitId === exit.id
+  // No serving exit but a skip list: this server reports the picker, and it
+  // found nothing it could serve.
+  if (status.skippedExitIds !== undefined) return !status.skippedExitIds.includes(exit.id)
+  // An older server reported neither, so fall back to what the status allows.
+  return (
+    !status.exhausted.includes(exit.id) &&
+    !(status.skipped ?? []).includes(exit.id) &&
+    exit.status !== "unreachable" &&
+    exit.status !== "blocked" &&
+    exit.status !== "bad"
   )
+}
+
+/** The exits that are neither paused nor out of use right now. */
+export function usableExits(status: StatusLike): readonly ExitSummaryLike[] {
+  return status.exits.filter((exit) => isUsableExit(exit, status))
 }
 
 /** The name routing points at, when one exit can be named. */
 function routingName(status: StatusLike): string {
   if (status.strategy === "round-robin") return "round robin"
   if (status.strategy === "fastest") return "fastest"
-  return status.activeExit?.name ?? "next exit"
+  // The picker's answer is the only name that is always true: the chosen exit
+  // may be paused, used up or cooling while a backup takes the request, and
+  // only the server knows which one that is.
+  if (status.servingExitId !== undefined) {
+    const serving = status.exits.find((item) => item.id === status.servingExitId)
+    return serving?.name ?? "next exit"
+  }
+  // A server that reports the picker but no serving exit is saying that
+  // nothing will carry the next request.
+  if (status.skippedExitIds !== undefined) return "next exit"
+  const active = status.activeExit
+  if (active === undefined) return "next exit"
+  // Only an exit routing would actually use may be named. A chosen exit that
+  // is paused, used up, or cooling after a failure leaves the name open: the
+  // next usable exit takes the request.
+  const exit = status.exits.find((item) => item.id === active.id)
+  if (exit === undefined || !isUsableExit(exit, status)) return "next exit"
+  return active.name
+}
+
+/** The exit the status says routing would use, when it can say. */
+function pickerChoice(status: StatusLike): string | undefined {
+  if (status.servingExitId !== undefined) return status.servingExitId
+  // A new server with no serving exit is saying that nothing serves, so a
+  // chosen exit that cannot serve must not be marked as if it would.
+  if (status.skippedExitIds !== undefined) return undefined
+  return status.activeExit?.id
+}
+
+/** Whether the picker leaves the exit out for a reason the line does not already show. */
+function pickerSkippedSilently(exit: ExitSummaryLike, status: StatusLike): boolean {
+  if (!(status.skippedExitIds ?? []).includes(exit.id)) return false
+  if (!exit.enabled) return false
+  if (status.exhausted.includes(exit.id)) return false
+  if ((status.skipped ?? []).includes(exit.id)) return false
+  const word = exitStatusWord(exit).toLowerCase()
+  return !/not tested|not answering|used up|rate limited|blocked|failing/.test(word)
 }
 
 /** How many requests have gone through an exit. */
@@ -173,11 +234,22 @@ function usedUpNote(status: StatusLike): string {
 
 /** What the main menu says about routing right now. */
 export function describeStatusSummary(status: StatusLike): string {
-  if (!status.enabled) {
-    return status.exits.length === 0 ? "Off · no exits" : `Off · ${status.exits.length} exits`
-  }
+  // A test run in progress is the most current fact, so it comes before the
+  // off line and before the counts: it keeps showing while routing is off.
   const scanning = status.scanning
-  if (scanning && scanning.done < scanning.total) return `Testing ${scanning.done}/${scanning.total}`
+  const busy = scanning !== undefined && scanning.done < scanning.total
+  if (busy) {
+    return status.enabled
+      ? `Testing ${scanning.done}/${scanning.total}`
+      : `Off · testing ${scanning.done}/${scanning.total}`
+  }
+  if (!status.enabled) {
+    if (status.exits.length === 0) return "Off · no exits"
+    return `Off · ${status.exits.length} exit${status.exits.length === 1 ? "" : "s"}`
+  }
+  // Routing on, but nothing selected survives the free-model filter: saying
+  // which exit would take a request would promise routing that cannot happen.
+  if (status.selection === "custom" && status.routedCount === 0) return "On · nothing routed"
   const usable = usableExits(status).length
   if (usable === 0) {
     return status.direct === "never"
@@ -192,8 +264,10 @@ export function describeSelection(status: StatusLike): string {
   if (status.selection === "free") {
     return `Every free model · ${status.routedCount} routed of ${status.modelCount}`
   }
-  if (status.customModels.length === 0) return "No model chosen · nothing is routed"
-  const count = status.customModels.length
+  // The routed count, not the raw list: the list still holds models that
+  // were dropped because they are not free.
+  const count = status.routedCount
+  if (count === 0) return "No model chosen · nothing is routed"
   return `${count} chosen free model${count === 1 ? "" : "s"}`
 }
 
@@ -210,87 +284,90 @@ export function describeSettings(status: StatusLike): string {
   return `${strategies[status.strategy]} · ${direct} · ${checks}`
 }
 
-/** What the menu says about the exits. */
-export function describeExits(status: StatusLike): string {
-  if (status.exits.length === 0) return "No exits yet · add a relay or proxies"
-  const parts = [
-    `${status.exits.length} exit${status.exits.length === 1 ? "" : "s"}`,
-    `${usableExits(status).length} ready`,
-  ]
-  const paused = status.paused?.length ?? 0
-  if (paused > 0) parts.push(`${paused} paused`)
-  if (status.exhausted.length > 0) parts.push(`${status.exhausted.length} used up`)
-  return parts.join(" · ")
-}
-
 /** What the Settings entry about the strategy says. */
 export function describeStrategy(status: StatusLike): string {
   return `Now: ${STRATEGY_LABELS[status.strategy].title}`
 }
 
-/** The main menu: a few categorized hubs, and nothing that would do nothing. */
+/** The main menu: a few categorized hubs, and nothing that would do nothing.
+ *
+ * No descriptions: the host draws an option's title and description on one
+ * line and clips the tail, so a description only ever read as a truncated
+ * sentence. The state each hub would have described lives on its own page,
+ * in the exit list, and in the footer pill.
+ */
 export function menuOptions(status: StatusLike): DialogSelectOption<MenuAction>[] {
   return [
-    {
-      title: "Status",
-      value: "status",
-      category: "Routing",
-      description: describeStatusSummary(status),
-    },
-    {
-      title: "Preview the next request",
-      value: "preview",
-      category: "Routing",
-      description: "See where the next request would go, without sending it",
-    },
+    { title: "Status", value: "status", category: "Routing" },
+    { title: "Preview the next request", value: "preview", category: "Routing" },
     {
       title: status.enabled ? "Turn routing off" : "Turn routing on",
       value: "toggle",
       category: "Routing",
-      description: status.enabled
-        ? "Requests go straight to OpenCode."
-        : "Requests use an exit whenever one can serve.",
     },
-    {
-      title: "Models",
-      value: "models",
-      category: "Routing",
-      description: describeSelection(status),
-    },
-    {
-      title: "Exits",
-      value: "exits",
-      category: "Exits",
-      description: describeExits(status),
-    },
-    {
-      title: "Settings",
-      value: "settings",
-      category: "Settings",
-      description: describeSettings(status),
-    },
+    { title: "Models", value: "models", category: "Routing" },
+    { title: "Exits", value: "exits", category: "Exits" },
+    { title: "Settings", value: "settings", category: "Settings" },
     { title: "Close", value: "close" },
   ]
 }
 
-/** One line that describes an exit, wherever it is shown. */
-export function describeExit(exit: ExitSummaryLike, status: StatusLike): string {
-  const parts: string[] = [exit.kind === "relay" ? "relay" : "proxy"]
-  const where = exit.regionLabel ?? exit.region ?? ""
-  if (where.length > 0) parts.push(where)
-  if (!exit.enabled) parts.push("paused")
+/** The most an exit line may take in a dialog, where the host clips the tail. */
+const EXIT_LINE_MAX = 40
+
+/** The pieces of an exit line, and how easily each may be left out. */
+type ExitFact = { readonly text: string; readonly rank: number }
+
+/**
+ * One line that describes an exit, wherever it is shown.
+ *
+ * Only compact facts: state, latency, traffic and the chosen mark. The name
+ * is the entry's own title and a deployed relay's name already carries its
+ * region, so repeating either here is what the dialog clips. The kind, the
+ * region and everything else live on the Details page.
+ *
+ * The line is capped at `max` characters: the host draws it on the same line
+ * as the name and clips the tail, so a long line only ever read as a cut
+ * word. When the facts do not fit, the least useful one steps aside first
+ * (latency, then traffic, then a redundant marker) and the state never does.
+ */
+export function describeExit(
+  exit: ExitSummaryLike,
+  status: StatusLike,
+  max: number = EXIT_LINE_MAX,
+): string {
   const word = exitStatusWord(exit)
   const skipped = (status.skipped ?? []).includes(exit.id)
-  if (skipped && !word.includes("not answering")) parts.push("not answering")
-  if (status.exhausted.includes(exit.id) && !word.includes("used up")) parts.push("used up")
-  parts.push(word)
-  if (exit.latencyMs !== undefined) parts.push(`${exit.latencyMs} ms`)
+  const facts: ExitFact[] = []
+  if (!exit.enabled) facts.push({ text: "paused", rank: 6 })
+  if (skipped && !word.includes("not answering")) facts.push({ text: "not answering", rank: 5 })
+  if (status.exhausted.includes(exit.id) && !word.includes("used up")) {
+    facts.push({ text: "used up", rank: 5 })
+  }
+  facts.push({ text: word, rank: 7 })
+  if (exit.latencyMs !== undefined) facts.push({ text: `${exit.latencyMs} ms`, rank: 2 })
   // The traffic this exit has carried, which is what the user wants to see
   // next to a name. The count of selected models is not traffic and is never
   // shown here.
-  parts.push(`${exit.stats?.requests ?? 0} req`)
-  if (status.activeExit?.id === exit.id) parts.push("chosen")
-  return parts.join(" · ")
+  facts.push({ text: `${exit.stats?.requests ?? 0} req`, rank: 3 })
+  const chosen = pickerChoice(status)
+  if (chosen === exit.id) facts.push({ text: "chosen", rank: 6 })
+
+  const kept = new Set<ExitFact>()
+  let used = 0
+  const byRank = [...facts].sort((a, b) => b.rank - a.rank)
+  for (const [index, fact] of byRank.entries()) {
+    const next = used === 0 ? fact.text.length : used + 3 + fact.text.length
+    // The highest-ranked fact - the status word - is always kept, even over
+    // the budget: a line without a state would say nothing at all.
+    if (index > 0 && next > max) continue
+    kept.add(fact)
+    used = next
+  }
+  return facts
+    .filter((fact) => kept.has(fact))
+    .map((fact) => fact.text)
+    .join(" · ")
 }
 
 /**
@@ -300,6 +377,9 @@ export function describeExit(exit: ExitSummaryLike, status: StatusLike): string 
  * than in the dialog, so the marks are testable and the same wherever a list
  * of exits is shown. Each value also says whether this plugin deployed the
  * relay, because only such a relay has a project to push code to.
+ *
+ * No footer: the host squeezes a footer line until titles read "Rel" or
+ * "127", and the last error is already shown on the Details page.
  */
 export function exitList(status: StatusLike): DialogSelectOption<ExitChoice>[] {
   return status.exits.map((exit) => ({
@@ -311,7 +391,6 @@ export function exitList(status: StatusLike): DialogSelectOption<ExitChoice>[] {
       deployed: exit.kind === "relay" && (exit.project ?? "").length > 0,
     },
     description: describeExit(exit, status),
-    ...(exit.lastError !== undefined ? { footer: exit.lastError } : {}),
   }))
 }
 
@@ -324,21 +403,26 @@ export type ExitListAction =
   | { readonly kind: "update-all" }
   | { readonly kind: "restore" }
 
-/** The Exits submenu: every exit, then the list-level moves, then Back. */
+/** The Exits submenu: every exit, then the list-level moves, then Back.
+ *
+ * Descriptions stay short on purpose: the host renders them on the same line
+ * as the title and clips the tail, so anything long reads as a cut word.
+ */
 export function exitsMenuOptions(status: StatusLike): DialogSelectOption<ExitListAction>[] {
   const options: DialogSelectOption<ExitListAction>[] = [...exitList(status)]
   if (status.exits.length > 0) {
+    const count = status.exits.length
     options.push({
       title: "Test all exits",
       value: { kind: "test-all" },
-      description: `${status.exits.length} exits - checks OpenCode through each`,
+      description: `${count} exit${count === 1 ? "" : "s"} - checks OpenCode through each`,
     })
   }
   if (status.exits.some((exit) => exit.kind === "relay" && (exit.project ?? "").length > 0)) {
     options.push({
       title: "Update all relays",
       value: { kind: "update-all" },
-      description: "Redeploy the current code over each relay",
+      description: "Redeploy the current code to each relay",
     })
   }
   if (status.exhausted.length > 0) {
@@ -351,7 +435,7 @@ export function exitsMenuOptions(status: StatusLike): DialogSelectOption<ExitLis
   options.push({
     title: "Add exits",
     value: { kind: "add" },
-    description: "Deploy a relay, track one, or paste proxies",
+    description: "Deploy a relay, track one, paste proxies",
   })
   options.push({ title: "Back", value: { kind: "back" } })
   return options
@@ -394,6 +478,26 @@ export function describePreview(preview: PreviewLike): string {
   return lines.join("\n")
 }
 
+/** The first sentence of a text, in the form a line comparison can match. */
+function firstSentence(text: string): string {
+  const stop = text.search(/[.!?]/)
+  const sentence = stop === -1 ? text : text.slice(0, stop + 1)
+  return sentence.replace(/\s+/g, " ").trim().toLowerCase()
+}
+
+/**
+ * Whether a note would only say again what a line above it already said.
+ *
+ * The server's routing-off note is this page's own first line, so printing
+ * both said the same thing twice. Only a note whose first sentence matches an
+ * already-printed line is dropped; every other note is kept.
+ */
+function repeatsPrintedLine(note: string, lines: readonly string[]): boolean {
+  const key = firstSentence(note)
+  if (key.length === 0) return false
+  return lines.some((line) => firstSentence(line) === key)
+}
+
 /** The read-only page about everything the plugin knows right now. */
 export function describeStatusPage(status: StatusLike): string {
   const lines: string[] = []
@@ -404,10 +508,10 @@ export function describeStatusPage(status: StatusLike): string {
   )
   if (status.selection === "free") {
     lines.push(`Models: every free model - ${status.routedCount} routed of ${status.modelCount}`)
-  } else if (status.customModels.length === 0) {
+  } else if (status.routedCount === 0) {
     lines.push("Models: no model chosen - nothing is routed")
   } else {
-    const count = status.customModels.length
+    const count = status.routedCount
     lines.push(`Models: ${count} chosen free model${count === 1 ? "" : "s"}`)
   }
   lines.push(`Strategy: ${STRATEGY_LABELS[status.strategy].title}`)
@@ -427,16 +531,19 @@ export function describeStatusPage(status: StatusLike): string {
     lines.push("No request has gone through an exit yet.")
   } else {
     const ok = status.exits.reduce((sum, exit) => sum + (exit.stats?.ok ?? 0), 0)
+    const rotated = status.exits.reduce((sum, exit) => sum + (exit.stats?.rotated ?? 0), 0)
     const limited = status.exits.reduce((sum, exit) => sum + (exit.stats?.limited ?? 0), 0)
     const failed = status.exits.reduce((sum, exit) => sum + (exit.stats?.failed ?? 0), 0)
     lines.push(
-      `${traffic} request${traffic === 1 ? "" : "s"} through exits (${ok} ok, ${limited} limited, ${failed} failed).`,
+      `${traffic} request${traffic === 1 ? "" : "s"} through exits (${ok} ok, ${rotated} rotated, ${limited} limited, ${failed} failed).`,
     )
   }
 
   lines.push("", `Exits: ${status.exits.length}`)
   for (const exit of status.exits) {
-    lines.push(`  ${exit.name}: ${describeExit(exit, status)}`)
+    // The page has room for every fact; the dialog line next to a name does not.
+    const skipped = pickerSkippedSilently(exit, status) ? " · skipped" : ""
+    lines.push(`  ${exit.name}: ${describeExit(exit, status, 160)}${skipped}`)
     if (exit.exhaustedUntil !== undefined && !exitStatusWord(exit).includes("used up until")) {
       lines.push(`    used up until ${resetTime(exit.exhaustedUntil)}`)
     }
@@ -453,7 +560,10 @@ export function describeStatusPage(status: StatusLike): string {
     lines.push("Last request: none yet.")
   }
 
-  if (status.note !== undefined && status.note.length > 0) lines.push("", status.note)
+  const note = status.note
+  if (note !== undefined && note.length > 0 && !repeatsPrintedLine(note, lines)) {
+    lines.push("", note)
+  }
 
   const scanning = status.scanning
   if (scanning && scanning.done < scanning.total) {
@@ -468,8 +578,13 @@ export function describeExitDetails(exit: ExitSummaryLike, status: StatusLike): 
   lines.push(`Name: ${exit.name}`)
   lines.push(`Kind: ${exit.kind}`)
   lines.push(`Address: ${exit.url}`)
+  // The Vercel project this plugin deployed: removing the exit offers to
+  // remove the project with it, and this line is where that name comes from.
+  if ((exit.project ?? "").length > 0) lines.push(`Project: ${exit.project}`)
   lines.push(`Status: ${exitStatusWord(exit)}`)
-  lines.push(status.activeExit?.id === exit.id ? "Chosen exit." : "Not the chosen exit.")
+  // The same answer the list marks "chosen": the picker's serving exit when the
+  // server reports it, and the stored choice on an older server that does not.
+  lines.push(pickerChoice(status) === exit.id ? "Chosen exit." : "Not the chosen exit.")
   lines.push(exit.enabled ? "In use." : "Paused: kept, but not used.")
   if (exit.exhaustedUntil !== undefined) {
     lines.push(`Used up until ${resetTime(exit.exhaustedUntil)}.`)
@@ -506,9 +621,12 @@ export type PillTone = "off" | "ok" | "warn" | "bad" | "busy"
 
 /** How the pill should be colored, so a problem is visible without reading. */
 export function pillTone(status: StatusLike | undefined): PillTone {
-  if (!status || !status.enabled) return "off"
+  if (!status) return "off"
+  // A test run reads as busy even while routing is off: the scan is what is
+  // happening right now, whatever the switch says.
   const scanning = status.scanning
-  if (scanning && scanning.done < scanning.total) return "busy"
+  if (scanning !== undefined && scanning.done < scanning.total) return "busy"
+  if (!status.enabled) return "off"
   if (status.exits.length === 0) return "warn"
   const usable = usableExits(status).length
   if (usable === 0) return status.direct === "never" ? "bad" : "warn"
@@ -519,16 +637,22 @@ export function pillTone(status: StatusLike | undefined): PillTone {
 /** The line the footer shows, or undefined when there is nothing worth saying. */
 export function summarizePill(status: StatusLike | undefined): string | undefined {
   if (!status) return undefined
+  // A background test is the most current fact, so it comes first: it keeps
+  // showing while routing is off and before the first exit exists.
+  const scanning = status.scanning
+  if (scanning !== undefined && scanning.done < scanning.total) {
+    const progress = `testing ${scanning.done}/${scanning.total}`
+    return status.enabled ? `relay on · ${progress}` : `relay off · ${progress} · /relay`
+  }
   if (!status.enabled) {
     // The pill is how someone finds the menu again, so it always shows once
     // the plugin exists - even before the first exit.
     return "relay off · /relay"
   }
   if (status.exits.length === 0) return "relay on · no exits · /relay"
-  const scanning = status.scanning
-  if (scanning && scanning.done < scanning.total) {
-    return `relay on · testing ${scanning.done}/${scanning.total}`
-  }
+  // Routing is on, but a custom selection leaves nothing for the router to
+  // send: naming an exit now would promise routing that cannot happen.
+  if (status.selection === "custom" && status.routedCount === 0) return "relay on · nothing routed"
   const usable = usableExits(status).length
   if (usable === 0) {
     return status.direct === "never"

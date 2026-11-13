@@ -7,20 +7,20 @@
  * routing works does not need to be told how to find the menu.
  */
 import { createMemo, createSignal, Show } from "solid-js"
-import { TextAttributes } from "@opentui/core"
+import { TextAttributes, type ColorInput } from "@opentui/core"
 import { pillTone, summarizePill, type PillTone } from "./present.ts"
 import { currentStatus } from "./state.ts"
 
 /** The colors the pill needs, resolved from the theme by the entry point. */
 export interface PillColors {
-  readonly muted: string
-  readonly warning: string
-  readonly error: string
-  readonly info: string
+  readonly muted: ColorInput
+  readonly warning: ColorInput
+  readonly error: ColorInput
+  readonly info: ColorInput
 }
 
 /** The color a tone reads as. */
-function toneColor(tone: PillTone, colors: PillColors): string {
+function toneColor(tone: PillTone, colors: PillColors): ColorInput {
   switch (tone) {
     case "off":
       return colors.muted

@@ -77,8 +77,8 @@ it, and Esc inside a submenu returns to the main menu.
 
 ### The menu
 
-The main menu is a handful of hubs, each described by what it is doing right
-now:
+The main menu is a handful of hubs; the live state lives on the Status page,
+in the exits list, and in the footer pill rather than under each title:
 
 - **Status** - a read-only page with everything the plugin knows: routing on
   or off, which models are routed, the strategy and direct policy, background
@@ -124,10 +124,10 @@ and the menu and pill say so.
 Relays and proxies are one list because routing treats them the same way: either
 can carry a request, and the strategy picks among both.
 
-- **The exits list** - one entry per exit with its kind, region, state,
-  latency, requests, and whether it is chosen. **Test all exits**, **Update
-  all relays**, and **Bring used-up exits back** sit under the list, and
-  **Add exits** below them.
+- **The exits list** - one entry per exit with its state, latency, requests,
+  and whether it is chosen; a deployed relay's name already carries its
+  region. **Test all exits**, **Update all relays**, and **Bring used-up
+  exits back** sit under the list, and **Add exits** below them.
 - **Add exits** - **Deploy a relay** (pick a Vercel account and one or more
   regions; each relay is its own Vercel project, and a Hobby project runs in
   one region, so a multi-region setup deploys one relay per region), **Track
@@ -135,7 +135,8 @@ can carry a request, and the strategy picks among both.
   pasted list. Deploying with no Vercel account offers to add one instead of
   stopping.
 - **Exit detail** - open an exit for **Details** (a read-only page with the
-  address, health, egress, runtime, request counters, and the last error),
+  address, project when it has one, health, egress, runtime, request
+  counters, and the last error),
   **Use this exit**, both checks, **Pause/Resume**, **Update this relay**
   (relays this plugin deployed), **Edit its name or address** (proxies), and
   **Remove this exit**.
@@ -213,9 +214,11 @@ One clickable line under the prompt; hovering underlines it and a click opens
 the menu. Its text is the honest state, never the number of selected models
 dressed up as traffic:
 
-- routing off: `relay off · /relay`
+- routing off: `relay off · /relay`, or `relay off · testing 3/8 · /relay`
+  while a background check runs
 - routing on with no exits: `relay on · no exits · /relay`
 - while a background check runs: `relay on · testing 3/8`
+- a custom selection with nothing free to route: `relay on · nothing routed`
 - no usable exit: `relay on · no exit can serve · direct` or `· fail`
 - healthy: `relay · Frankfurt · 3 req`, `relay · round robin · 0 req`, with
   `· N used up` appended when exits are used up. Healthy states carry no
@@ -245,8 +248,9 @@ theme's quiet color when everything is fine.
   lose, nothing to recover. Anyone who can read your profile can read them, so
   revoke the Vercel token and redeploy a relay if a machine is lost or shared.
 - The TUI never receives a relay token or proxy password, except in Export,
-  which is explicitly credential-bearing and hands them to the TUI textarea.
-  Otherwise proxy addresses are shown with their credentials replaced by `***`.
+  which is explicitly credential-bearing and opens in a read-only page you can
+  scroll and copy from. Otherwise proxy addresses are shown with their
+  credentials replaced by `***`.
 - The plugin is tested against OpenCode 2.2.7 and declares
   `@opencode/plugin >=2.2.7 <3`.
 

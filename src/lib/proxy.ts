@@ -55,6 +55,24 @@ const SCHEMES: Record<string, ProxyScheme> = {
 /** A hostname that is not an IP: labels of letters, digits and hyphens. */
 const HOSTNAME = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)*[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/i
 
+/**
+ * The identity of a proxy URL for deduplication.
+ *
+ * The scheme, host and port are case-insensitive, but the credentials are
+ * not: `user:PaSs` and `user:pass` authenticate differently, so they are two
+ * proxies and both must be kept. Only the address part is lowercased.
+ */
+export function proxyKey(url: string): string {
+  const scheme = url.indexOf("://")
+  if (scheme < 0) return url
+  const rest = url.slice(scheme + 3)
+  const at = rest.lastIndexOf("@")
+  const auth = at >= 0 ? rest.slice(0, at + 1) : ""
+  const address = at >= 0 ? rest.slice(at + 1) : rest
+  const prefix = url.slice(0, scheme + 3).toLowerCase()
+  return `${prefix}${auth}${address.toLowerCase()}`
+}
+
 /** Remove credentials from an entry before it is shown in an error. */
 export function redactProxyToken(value: string): string {
   const at = value.lastIndexOf("@")
@@ -338,7 +356,7 @@ export function parseProxyList(text: string): ParsedProxyList {
   let duplicates = 0
 
   const add = (proxy: ParsedProxy) => {
-    const key = proxy.url.toLowerCase()
+    const key = proxyKey(proxy.url)
     if (seen.has(key)) {
       duplicates++
       return

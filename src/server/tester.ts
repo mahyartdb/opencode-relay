@@ -159,9 +159,24 @@ interface Verdict {
   readonly note?: string
 }
 
-async function judge(response: Response): Promise<Verdict> {
+/** The body of a chat answer, read from a copy, when it really is a model answer. */
+async function modelAnswer(response: Response): Promise<boolean> {
+  const text = await bodyOf(response)
+  if (text.trim().length === 0) return false
+  try {
+    const data = JSON.parse(text) as { choices?: unknown }
+    return Array.isArray(data.choices) && data.choices.length > 0
+  } catch {
+    return false
+  }
+}
+
+async function judge(response: Response, deep = false): Promise<Verdict> {
   const code = response.status
-  if (code === 409) {
+  // A 409 only says the address is spent when the relay marks it as a rotation.
+  // A bare 409 is the request's own conflict: another instance would answer it
+  // the same way, so the exit is simply failing, not used up.
+  if (code === 409 && response.headers.get("x-relay-rotate") === "1") {
     return {
       status: "exhausted",
       ok: false,
@@ -197,7 +212,7 @@ async function judge(response: Response): Promise<Verdict> {
       note: `OpenCode refused this exit (HTTP ${code}).`,
     }
   }
-  if (code >= 500) {
+  if (code >= 400) {
     return {
       status: "bad",
       ok: false,
@@ -205,12 +220,33 @@ async function judge(response: Response): Promise<Verdict> {
       note: `The exit answered with HTTP ${code}.`,
     }
   }
-  if (code >= 400) {
+  // A redirect or an empty answer is an intercepting proxy or an auth portal,
+  // not OpenCode: nothing can be routed through it, whatever its 2xx says.
+  if (code >= 300) {
     return {
       status: "bad",
       ok: false,
       code,
-      note: `The exit answered with HTTP ${code}.`,
+      note: `The exit redirected the request (HTTP ${code}).`,
+    }
+  }
+  if (code < 200 || code === 204) {
+    return {
+      status: "bad",
+      ok: false,
+      code,
+      note: `The exit answered without a model response (HTTP ${code}).`,
+    }
+  }
+  // A 200 is not proof of a model answer: a captive portal or an HTML error
+  // page answers 200 as well. Only the deep test can tell, so it asks whether
+  // the answer really looks like a chat completion.
+  if (deep && !(await modelAnswer(response))) {
+    return {
+      status: "bad",
+      ok: false,
+      code,
+      note: "The exit answered, but not with a model response.",
     }
   }
   return { status: "ready", ok: true, code }
@@ -241,6 +277,9 @@ export class Tester {
 
   /** Start the background check. Safe to call twice. */
   start(intervalMs = HEALTH_INTERVAL_MS): void {
+    // A tester that was stopped is allowed to run again: without this, every
+    // scan after a restart would silently do nothing.
+    this.stopped = false
     if (this.timer !== undefined) return
     this.timer = setInterval(() => {
       const settings = this.deps.state.settings()
@@ -274,6 +313,10 @@ export class Tester {
 
   /** Is the machinery alive, and which address does it use? */
   private async ping(exit: ExitRecord): Promise<TestResult> {
+    // The moment the probe started: a slower probe that finishes after a newer
+    // verdict must not be taken for the newer one.
+    const checkedAt = Date.now()
+    const healthEpoch = this.deps.state.healthEpoch(exit.id)
     const started = performance.now()
     const elapsed = () => Math.max(0, Math.round(performance.now() - started))
     if (exit.kind === "relay") {
@@ -285,6 +328,8 @@ export class Tester {
         ...(probe.egress !== undefined ? { egress: probe.egress } : {}),
         ...(probe.runtime !== undefined ? { runtime: probe.runtime } : {}),
         ...(probe.reachable ? {} : { lastError: "The relay did not answer." }),
+        checkedAt,
+        healthEpoch,
       })
       return {
         ok: probe.reachable,
@@ -308,6 +353,8 @@ export class Tester {
         latencyMs: elapsed(),
         ...(egress !== undefined ? { egress } : {}),
         ...(ok ? {} : { lastError: `The proxy answered with HTTP ${response.status}.` }),
+        checkedAt,
+        healthEpoch,
       })
       return {
         ok,
@@ -323,6 +370,8 @@ export class Tester {
         status: "unreachable",
         latencyMs: elapsed(),
         lastError: note.slice(0, 240),
+        checkedAt,
+        healthEpoch,
       })
       return { ok: false, status: "unreachable", code: 0, ms: elapsed(), note }
     }
@@ -339,6 +388,12 @@ export class Tester {
   }
 
   private async check(exit: ExitRecord, mode: "api" | "deep"): Promise<TestResult> {
+    // When this check started, not when it ended: two overlapping checks may
+    // finish out of order, and the older verdict must not overwrite the newer.
+    const checkedAt = Date.now()
+    // A live verdict between here and the answer makes this check stale, no
+    // matter how recent its start looks on the record.
+    const healthEpoch = this.deps.state.healthEpoch(exit.id)
     const started = performance.now()
     const elapsed = () => Math.max(0, Math.round(performance.now() - started))
     const sample = this.deps.state.requestSample()
@@ -356,7 +411,13 @@ export class Tester {
           ms: elapsed(),
           note: "No model could be read to test with.",
         }
-        await this.record(exit.id, { status: result.status, latencyMs: result.ms, lastError: result.note })
+        await this.record(exit.id, {
+          status: result.status,
+          latencyMs: result.ms,
+          lastError: result.note,
+          checkedAt,
+          healthEpoch,
+        })
         return result
       }
       target = UPSTREAM_CHAT
@@ -379,6 +440,8 @@ export class Tester {
         status: "unreachable",
         latencyMs: elapsed(),
         lastError: note.slice(0, 240),
+        checkedAt,
+        healthEpoch,
       })
       return {
         ok: false,
@@ -388,7 +451,7 @@ export class Tester {
         note: mode === "api" ? "OpenCode could not be reached through this exit." : note,
       }
     }
-    const verdict = await judge(response)
+    const verdict = await judge(response, mode === "deep")
     const about = exitHeaders(response)
     const ms = elapsed()
     // An answered model list proves OpenCode is reachable, not that a model
@@ -397,20 +460,26 @@ export class Tester {
     // A proxy's address is fixed, so a spent address means a spent proxy. A
     // relay can rotate to another instance, so only the address is remembered.
     const until = verdict.until
-    if (status === "exhausted" && until !== undefined) {
-      if (about.egress !== undefined) this.deps.state.markSpent(about.egress, until)
-      else if (exit.egress !== undefined) this.deps.state.markSpent(exit.egress, until)
-    }
-    await this.record(exit.id, {
+    const recorded = await this.record(exit.id, {
       status,
       latencyMs: ms,
       ...(about.egress !== undefined ? { egress: about.egress } : {}),
       ...(about.runtime !== undefined ? { runtime: about.runtime } : {}),
       ...(verdict.note !== undefined ? { lastError: verdict.note } : {}),
       ...(status === "exhausted" && until !== undefined ? { exhaustedUntil: until } : {}),
+      checkedAt,
+      healthEpoch,
     })
-    if (status === "exhausted" && until !== undefined) {
+    // A stale check still reports what it saw, but it must not retire an exit
+    // a newer check has already cleared, nor arm a cooldown from an old answer.
+    if (recorded && status === "exhausted" && until !== undefined) {
+      if (about.egress !== undefined) this.deps.state.markSpent(about.egress, until)
+      else if (exit.egress !== undefined) this.deps.state.markSpent(exit.egress, until)
       this.deps.state.markExhausted(exit.id, until, verdict.note)
+    } else if (recorded && status === "limited" && until !== undefined) {
+      // A non-free 429 is a rest, not a retirement: the exit works again when
+      // the cooldown passes, but it must not keep serving during it.
+      this.deps.state.markRateLimited(exit.id, until, verdict.note)
     }
     return {
       ok: verdict.ok,
@@ -523,14 +592,21 @@ export class Tester {
         }
         done += 1
         this.deps.state.setScanning({ startedAt, total, done, deep: mode === "deep" })
-        void this.deps.announce("health changed")
+        void this.deps.announce("health changed").catch(() => {})
       }
     }
     const workers = Array.from({ length: Math.min(4, total) }, () => worker())
     await Promise.all(workers)
   }
 
-  /** Write a check's result into the record, without pretending a used-up exit is ready. */
+  /**
+   * Write a check's result into the record, without pretending a used-up exit
+   * is ready.
+   *
+   * Returns false when the state already knows something newer (or the exit is
+   * gone): an overlapping check that started later finished first, and this
+   * result must not bring back a stale verdict or a cooldown.
+   */
   private async record(
     id: string,
     update: {
@@ -540,12 +616,21 @@ export class Tester {
       runtime?: string
       lastError?: string
       exhaustedUntil?: number
+      checkedAt?: number
+      healthEpoch?: number
     },
-  ): Promise<void> {
+  ): Promise<boolean> {
     // A check that fails must not erase the reset time of an exit that is known
     // to be spent, so the reset only travels with an exhausted status.
     if (update.status !== "exhausted") delete update.exhaustedUntil
     await this.deps.state.setHealth(id, update)
+    if (update.checkedAt === undefined) return true
+    const exit = this.deps.state.exit(id)
+    return (
+      exit?.lastCheck === update.checkedAt &&
+      (update.healthEpoch === undefined ||
+        update.healthEpoch === this.deps.state.healthEpoch(id))
+    )
   }
 }
 

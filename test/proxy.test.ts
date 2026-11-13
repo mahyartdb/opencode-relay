@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test"
-import { parseProxyList, parseProxyUrl, redactProxyToken } from "../src/lib/proxy.ts"
+import { parseProxyList, parseProxyUrl, proxyKey, redactProxyToken } from "../src/lib/proxy.ts"
+import { readBody } from "../src/lib/routing.ts"
 
 describe("parseProxyList", () => {
   test("reads one proxy per line in the shapes people actually paste", () => {
@@ -93,6 +94,32 @@ describe("parseProxyList", () => {
     expect(parsed.duplicates).toBe(2)
   })
 
+  test("keeps credentials whose case differs as separate proxies", () => {
+    // The password is case-sensitive: collapsing these would silently drop a
+    // proxy that authenticates differently from the first.
+    const parsed = parseProxyList(`
+      user:PaSs@1.2.3.4:8080
+      user:pass@1.2.3.4:8080
+      USER:PaSs@1.2.3.4:8080
+    `)
+
+    expect(parsed.proxies).toHaveLength(3)
+    expect(parsed.duplicates).toBe(0)
+    expect(parsed.proxies.map((proxy) => proxy.url)).toEqual([
+      "http://user:PaSs@1.2.3.4:8080",
+      "http://user:pass@1.2.3.4:8080",
+      "http://USER:PaSs@1.2.3.4:8080",
+    ])
+
+    // The address, on the other hand, is case-insensitive.
+    const host = parseProxyList(`
+      http://Proxy.Example:8080
+      http://proxy.example:8080
+    `)
+    expect(host.proxies).toHaveLength(1)
+    expect(host.duplicates).toBe(1)
+  })
+
   test("drops comments and blank lines", () => {
     const parsed = parseProxyList(`
       # my list
@@ -152,9 +179,57 @@ describe("parseProxyList", () => {
   })
 })
 
+describe("proxyKey", () => {
+  test("lowercases the address but keeps the credentials verbatim", () => {
+    expect(proxyKey("HTTP://User:PaSs@Proxy.Example:8080")).toBe(
+      "http://User:PaSs@proxy.example:8080",
+    )
+    expect(proxyKey("socks5://u:p@[2001:DB8::1]:1080")).toBe(
+      "socks5://u:p@[2001:db8::1]:1080",
+    )
+    // Without a scheme, the entry is already the identity it was given.
+    expect(proxyKey("User:PaSs@Proxy.Example:8080")).toBe("User:PaSs@Proxy.Example:8080")
+  })
+})
+
 describe("redactProxyToken", () => {
   test("removes the credentials but keeps the address", () => {
     expect(redactProxyToken("alice:secret@1.2.3.4:8080")).toBe("***@1.2.3.4:8080")
     expect(redactProxyToken("1.2.3.4:8080")).toBe("1.2.3.4:8080")
+  })
+})
+
+describe("readBody", () => {
+  test("reads the body from a copy and leaves the answer usable", async () => {
+    const response = new Response("hello")
+
+    const body = await readBody(response)
+
+    expect(body).toBe("hello")
+    expect(await response.text()).toBe("hello")
+  })
+
+  test("cuts a long body", async () => {
+    const response = new Response("x".repeat(9000))
+
+    expect(await readBody(response, 2000, 4000)).toHaveLength(4000)
+  })
+
+  test("cancels a body that takes too long instead of buffering it forever", async () => {
+    let cancelled = false
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode("still going"))
+      },
+      cancel() {
+        cancelled = true
+      },
+    })
+    const response = { clone: () => ({ body: stream }) } as unknown as Response
+
+    const body = await readBody(response, 25, 4000)
+
+    expect(body).toBeUndefined()
+    expect(cancelled).toBe(true)
   })
 })

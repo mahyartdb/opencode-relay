@@ -13,6 +13,7 @@
  */
 import net from "node:net"
 import dns from "node:dns/promises"
+import { UPSTREAM_HOST } from "../lib/types.ts"
 
 export interface SocksUpstream {
   readonly version: 4 | 5
@@ -47,6 +48,21 @@ function sweep(): void {
   for (const bridge of [...meta.values()]) {
     if (bridge.active === 0 && now - bridge.last >= IDLE_MS) dropBridge(bridge)
   }
+}
+
+/**
+ * Whether the local proxy may dial this host.
+ *
+ * The bridge listens on loopback without authentication, so any local process
+ * could otherwise use the user's SOCKS credentials as an open proxy. The plugin
+ * itself only ever asks for the upstream host and its subdomains, so that is
+ * all it may reach -- the same rule bridge.ts and hooks.ts apply. The dot in
+ * the suffix test is what rejects lookalikes such as "notopencode.ai" or
+ * "opencode.ai.evil.com".
+ */
+function isAllowedTarget(host: string): boolean {
+  const name = host.toLowerCase().replace(/\.$/, "")
+  return name === UPSTREAM_HOST || name.endsWith(`.${UPSTREAM_HOST}`)
 }
 
 const keyOf = (up: SocksUpstream): string =>
@@ -171,6 +187,11 @@ export function socks5Connect(
       clearTimeout(timer)
       socket.removeAllListeners("data")
       socket.removeAllListeners("error")
+      // link() attaches the real handlers a moment later. Until it does, the
+      // socket must keep an error listener: an RST in this window would emit
+      // `error` on a listener-less socket, and an unhandled `error` throws
+      // and takes the process down.
+      socket.on("error", () => {})
       const rest = buffer.subarray(length)
       if (rest.length > 0) socket.unshift(rest)
       resolve(socket)
@@ -225,6 +246,9 @@ export async function socks4Connect(
       clearTimeout(timer)
       socket.removeAllListeners("data")
       socket.removeAllListeners("error")
+      // Same window as in socks5Connect: keep the socket from emitting an
+      // unhandled `error` before link() takes over.
+      socket.on("error", () => {})
       const rest = buffer.subarray(8)
       if (rest.length > 0) socket.unshift(rest)
       resolve(socket)
@@ -282,10 +306,18 @@ function handle(client: net.Socket, up: SocksUpstream): void {
     const dial = async () => {
       if (method === "CONNECT") {
         const colon = target.lastIndexOf(":")
+        if (colon <= 0) {
+          refuse("400 Bad Request")
+          return
+        }
         const host = target.slice(0, colon).replace(/^\[|\]$/g, "")
         const port = Number(target.slice(colon + 1))
         if (!host || !(port > 0)) {
           refuse("400 Bad Request")
+          return
+        }
+        if (!isAllowedTarget(host)) {
+          refuse("403 Forbidden")
           return
         }
         const upstream = await connect(up, host, port)
@@ -302,6 +334,10 @@ function handle(client: net.Socket, up: SocksUpstream): void {
       const port = Number(url.port) || (url.protocol === "https:" ? 443 : 80)
       if (url.protocol !== "http:") {
         refuse("400 Bad Request")
+        return
+      }
+      if (!isAllowedTarget(url.hostname)) {
+        refuse("403 Forbidden")
         return
       }
       const upstream = await connect(up, url.hostname.replace(/^\[|\]$/g, ""), port)
@@ -332,6 +368,9 @@ function handle(client: net.Socket, up: SocksUpstream): void {
 
 /** The local HTTP proxy URL for a SOCKS upstream, started on first use. */
 export function socksBridge(up: SocksUpstream): Promise<string> {
+  // Reap idle bridges on use, not only when the map is full, so a long session
+  // does not keep one listening server per proxy it ever used.
+  sweep()
   const key = keyOf(up)
   const existing = bridges.get(key)
   if (existing) return existing

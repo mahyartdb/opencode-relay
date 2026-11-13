@@ -21,6 +21,9 @@ import {
   type RelayTarget,
   type RoutableModel,
 } from "../src/lib/routing.ts"
+import type { ProxyRecord, RelayRecord } from "../src/lib/types.ts"
+import { registerHooks, ROTATE_DELAY_MS } from "../src/server/hooks.ts"
+import { RelayState } from "../src/server/state.ts"
 
 const freeModel: RoutableModel = {
   id: "opencode/grok-code-fast",
@@ -519,5 +522,629 @@ describe("readBody", () => {
     const body = await readBody(response, 2000, 4000)
 
     expect(body?.length).toBe(4000)
+  })
+})
+
+/**
+ * The hooks decide what a real request and a real answer do to an exit. These
+ * tests drive them with the smallest context that can register a session hook:
+ * the network is never touched, and every state transition is observed.
+ */
+
+/** The in-memory stand-in for the plugin's storage. */
+function memoryStorage() {
+  const store = new Map<string, unknown>()
+  return {
+    store,
+    get: async (key: string) => store.get(key),
+    set: async (key: string, value: unknown) => {
+      store.set(key, value)
+    },
+    remove: async (key: string) => {
+      store.delete(key)
+    },
+    scan: async () => ({ entries: [] }),
+  }
+}
+
+/** A relay that only needs its health to be interesting. */
+function relay(id: string): RelayRecord {
+  return {
+    kind: "relay",
+    id,
+    name: id,
+    project: id,
+    region: "fra1",
+    url: `https://${id}.example.com`,
+    access: "test-access",
+    accountId: "",
+    enabled: true,
+    status: "untested",
+    createdAt: Date.now(),
+  }
+}
+
+/** A proxy that only needs its health to be interesting. */
+function proxy(id: string): ProxyRecord {
+  return {
+    kind: "proxy",
+    id,
+    name: id,
+    url: `http://${id}.example.com:8080`,
+    enabled: true,
+    status: "untested",
+    createdAt: Date.now(),
+  }
+}
+
+type HookHandler = (input: any) => Promise<void> | void
+
+/** Register the real hooks against a real state and no outside world. */
+async function makeHooks(canary: () => Promise<string> = async () => "inconclusive") {
+  const state = new RelayState(memoryStorage() as never)
+  await state.load()
+  await state.setEnabled(true)
+  const handlers = new Map<string, HookHandler>()
+  await registerHooks(
+    {
+      session: {
+        hook: async (name: string, callback: HookHandler) => {
+          handlers.set(name, callback)
+          return { dispose: async () => {} }
+        },
+      },
+    } as never,
+    {
+      state,
+      catalog: {
+        list: async () => [freeModel],
+        resolve: (models: readonly RoutableModel[], id: string) =>
+          models.find((model) => model.id === id) ?? { id, name: id },
+      } as never,
+      bridge: { ready: true, origin: "http://127.0.0.1:1", key: "bridge-key" } as never,
+      tester: { canary } as never,
+    },
+  )
+  return { state, hooks: handlers }
+}
+
+/** A state with the named exits ready to serve. */
+async function setup(
+  relays: readonly string[] = ["relay-1"],
+  proxies: readonly string[] = [],
+  canary?: () => Promise<string>,
+) {
+  const made = await makeHooks(canary)
+  for (const id of relays) {
+    await made.state.addRelay(relay(id))
+    await made.state.setHealth(id, { status: "ready" })
+  }
+  for (const id of proxies) {
+    await made.state.addProxy(proxy(id))
+    await made.state.setHealth(id, { status: "ready" })
+  }
+  return made
+}
+
+/** A request as the plugin would send it through one relay. */
+function requestFor(id: string): Request {
+  return relayRequest(new Request("https://opencode.ai/inference/openai/v1/models"), {
+    url: "https://relay.example.com",
+    access: "test-access",
+    id,
+  })
+}
+
+/** A request as the plugin would send it through one proxy. */
+function proxiedFor(id: string): Request {
+  return proxyRequest(new Request("https://opencode.ai/inference/openai/v1/models"), {
+    bridge: "http://127.0.0.1:1",
+    key: "bridge-key",
+    id,
+  })
+}
+
+function answerInput(
+  sessionID: string,
+  request: Request,
+  status: number,
+  headers: Record<string, string> = {},
+  body = "{}",
+) {
+  const nullBody = status === 204 || status === 205
+  return {
+    sessionID,
+    model: { id: freeModel.id, providerID: "opencode" },
+    request,
+    response: new Response(nullBody ? null : body, { status, headers }),
+  }
+}
+
+function responseInput(
+  sessionID: string,
+  exitId: string,
+  status: number,
+  headers: Record<string, string> = {},
+) {
+  return answerInput(sessionID, requestFor(exitId), status, headers)
+}
+
+function retryInput(sessionID: string, status?: number, message?: string) {
+  return {
+    sessionID,
+    model: { id: freeModel.id, providerID: "opencode" },
+    error: {
+      ...(status !== undefined ? { status } : {}),
+      ...(message !== undefined ? { message } : {}),
+    },
+    attempt: 1,
+    decision: { retry: false } as { retry: boolean; delay?: number },
+  }
+}
+
+describe("the request hook on a provider that merely calls itself opencode", () => {
+  test("leaves a request for another host unchanged, credentials included", async () => {
+    const { state, hooks } = await setup()
+    const original = new Request("https://gateway.example.com/inference/openai/v1/chat/completions", {
+      method: "POST",
+      headers: { authorization: "Bearer provider-key", "content-type": "application/json" },
+      body: "{}",
+    })
+    const input = {
+      sessionID: "other-host",
+      model: { id: freeModel.id, providerID: "opencode" },
+      request: original,
+    }
+
+    await hooks.get("http.request")?.(input as never)
+
+    expect(input.request.url).toBe(original.url)
+    expect(input.request.headers.get("authorization")).toBe("Bearer provider-key")
+    expect(input.request.headers.get("x-relay-id")).toBeNull()
+    expect(state.lastDecision()?.routed).toBe(false)
+    expect(state.lastDecision()?.reason).toContain("opencode.ai")
+  })
+
+  test("reports a request whose URL cannot be read instead of guessing", async () => {
+    const { state, hooks } = await setup()
+    const input = {
+      sessionID: "no-url",
+      model: { id: freeModel.id, providerID: "opencode" },
+      request: undefined,
+    }
+
+    await hooks.get("http.request")?.(input as never)
+
+    expect(input.request).toBeUndefined()
+    expect(state.lastDecision()?.routed).toBe(false)
+    expect(state.lastDecision()?.reason).toContain("URL")
+  })
+
+  test("still routes a request addressed to an upstream subdomain", async () => {
+    const { hooks } = await setup()
+    const input = {
+      sessionID: "upstream",
+      model: { id: freeModel.id, providerID: "opencode" },
+      request: new Request("https://api.opencode.ai/inference/openai/v1/models"),
+    }
+
+    await hooks.get("http.request")?.(input as never)
+
+    expect(input.request.headers.get("x-relay-id")).toBe("relay-1")
+  })
+})
+
+describe("the response and retry hooks on another provider", () => {
+  test("leave the exit alone when the provider id is not opencode", async () => {
+    const { state, hooks } = await setup(["relay-1", "relay-2"])
+    state.noteRelayed("other-provider", freeModel.id, "relay-1")
+    const response = responseInput("other-provider", "relay-1", 502)
+    response.model.providerID = "polygate"
+
+    await hooks.get("http.response")?.(response as never)
+
+    expect(state.statsFor("relay-1").failed).toBe(0)
+    expect(state.exit("relay-1")?.status).toBe("ready")
+    expect(state.failureFor("other-provider", freeModel.id)).toBeUndefined()
+
+    const retry = retryInput("other-provider", 502)
+    retry.model.providerID = "polygate"
+    await hooks.get("retry")?.(retry as never)
+
+    expect(retry.decision).toEqual({ retry: false })
+  })
+})
+
+describe("the retry hook on 401 and 403", () => {
+  for (const status of [401, 403]) {
+    test(`${status} retries through a backup exit`, async () => {
+      const { state, hooks } = await setup(["relay-1", "relay-2"])
+      state.noteRelayed("blocked", freeModel.id, "relay-1")
+
+      await hooks.get("http.response")?.(responseInput("blocked", "relay-1", status) as never)
+
+      expect(state.exit("relay-1")?.status).toBe("blocked")
+      expect(state.statsFor("relay-1").failed).toBe(0)
+      // The response hook rests the exit once. The retry hook must not rest it
+      // again, or the cooldown would double.
+      expect(state.failureCount("relay-1")).toBe(1)
+
+      const retry = retryInput("blocked", status)
+      await hooks.get("retry")?.(retry as never)
+
+      expect(retry.decision).toEqual({ retry: true, delay: ROTATE_DELAY_MS })
+      expect(state.statsFor("relay-1").failed).toBe(0)
+      expect(state.failureCount("relay-1")).toBe(1)
+    })
+
+    test(`${status} retries direct when no exit remains and direct is allowed`, async () => {
+      const { state, hooks } = await setup(["relay-1"])
+      state.noteRelayed("blocked-direct", freeModel.id, "relay-1")
+
+      await hooks.get("http.response")?.(
+        responseInput("blocked-direct", "relay-1", status) as never,
+      )
+
+      const retry = retryInput("blocked-direct", status)
+      await hooks.get("retry")?.(retry as never)
+
+      expect(retry.decision).toEqual({ retry: true, delay: ROTATE_DELAY_MS })
+    })
+
+    test(`${status} is not retried when no exit remains and direct is forbidden`, async () => {
+      const { state, hooks } = await setup(["relay-1"])
+      await state.setDirect("never")
+      state.noteRelayed("blocked-never", freeModel.id, "relay-1")
+
+      await hooks.get("http.response")?.(
+        responseInput("blocked-never", "relay-1", status) as never,
+      )
+
+      const retry = retryInput("blocked-never", status)
+      await hooks.get("retry")?.(retry as never)
+
+      expect(retry.decision).toEqual({ retry: false })
+    })
+  }
+})
+
+describe("the response and retry hooks on an unrecognised 4xx", () => {
+  for (const status of [404, 407, 408, 425, 451]) {
+    test(`${status} is an exit fault: retired once and retried`, async () => {
+      const { state, hooks } = await setup(["relay-1", "relay-2"])
+      state.noteRelayed("exit-fault", freeModel.id, "relay-1")
+
+      await hooks.get("http.response")?.(responseInput("exit-fault", "relay-1", status) as never)
+
+      expect(state.exit("relay-1")?.status).toBe("bad")
+      expect(state.statsFor("relay-1").failed).toBe(1)
+      expect(state.failureCount("relay-1")).toBe(1)
+      expect(state.failureFor("exit-fault", freeModel.id)?.kind).toBe("server")
+
+      const retry = retryInput("exit-fault", status)
+      await hooks.get("retry")?.(retry as never)
+
+      expect(retry.decision).toEqual({ retry: true, delay: ROTATE_DELAY_MS })
+      expect(state.statsFor("relay-1").failed).toBe(1)
+      expect(state.failureCount("relay-1")).toBe(1)
+    })
+  }
+
+  test("is not retried when no exit remains and direct is forbidden", async () => {
+    const { state, hooks } = await setup(["relay-1"])
+    await state.setDirect("never")
+    state.noteRelayed("exit-fault-never", freeModel.id, "relay-1")
+
+    await hooks.get("http.response")?.(
+      responseInput("exit-fault-never", "relay-1", 404) as never,
+    )
+
+    const retry = retryInput("exit-fault-never", 404)
+    await hooks.get("retry")?.(retry as never)
+
+    expect(retry.decision).toEqual({ retry: false })
+    expect(state.failureCount("relay-1")).toBe(1)
+  })
+
+  for (const status of [400, 422]) {
+    test(`${status} is request-specific: recorded but neither retired nor retried`, async () => {
+      const { state, hooks } = await setup(["relay-1", "relay-2"])
+      state.noteRelayed("request-fault", freeModel.id, "relay-1")
+
+      await hooks.get("http.response")?.(
+        responseInput("request-fault", "relay-1", status) as never,
+      )
+
+      expect(state.statsFor("relay-1").failed).toBe(1)
+      expect(state.exit("relay-1")?.status).toBe("ready")
+      expect(state.coolingExits()).toEqual([])
+      expect(state.failureFor("request-fault", freeModel.id)?.kind).toBe("refused")
+
+      const retry = retryInput("request-fault", status)
+      await hooks.get("retry")?.(retry as never)
+
+      expect(retry.decision).toEqual({ retry: false })
+      expect(state.statsFor("relay-1").failed).toBe(1)
+    })
+  }
+})
+
+describe("what counts as a successful answer", () => {
+  const rejected: readonly (readonly [string, number, Record<string, string>])[] = [
+    ["a 302 redirect", 302, {}],
+    ["a 204 with no body", 204, {}],
+    [
+      "an HTML page",
+      200,
+      { "content-type": "text/html; charset=utf-8", "x-relay-instance": "i-1" },
+    ],
+    ["an answer that never reached the relay", 200, { "content-type": "application/json" }],
+  ]
+
+  for (const [label, status, headers] of rejected) {
+    test(`${label} is not a success`, async () => {
+      const { state, hooks } = await setup()
+
+      await hooks.get("http.response")?.(
+        answerInput("not-success", requestFor("relay-1"), status, headers) as never,
+      )
+
+      expect(state.statsFor("relay-1").ok).toBe(0)
+      expect(state.statsFor("relay-1").failed).toBe(1)
+      expect(state.exit("relay-1")?.status).toBe("bad")
+      expect(state.failureFor("not-success", freeModel.id)?.kind).toBe("server")
+    })
+  }
+
+  test("a rejected answer is retried through another exit, marked once", async () => {
+    const { state, hooks } = await setup(["relay-1", "relay-2"])
+    state.noteRelayed("rejected", freeModel.id, "relay-1")
+
+    await hooks.get("http.response")?.(responseInput("rejected", "relay-1", 302) as never)
+
+    const retry = retryInput("rejected", 302)
+    await hooks.get("retry")?.(retry as never)
+
+    expect(retry.decision).toEqual({ retry: true, delay: ROTATE_DELAY_MS })
+    expect(state.statsFor("relay-1").failed).toBe(1)
+  })
+
+  test("a JSON 200 through a relay is a success", async () => {
+    const { state, hooks } = await setup()
+
+    await hooks.get("http.response")?.(
+      responseInput("json-relay", "relay-1", 200, {
+        "content-type": "application/json",
+        "x-relay-instance": "i-1",
+      }) as never,
+    )
+
+    expect(state.statsFor("relay-1").ok).toBe(1)
+    expect(state.exit("relay-1")?.status).toBe("ready")
+    expect(state.failureFor("json-relay", freeModel.id)).toBeUndefined()
+  })
+
+  test("an SSE 200 through a relay is a success", async () => {
+    const { state, hooks } = await setup()
+
+    await hooks.get("http.response")?.(
+      responseInput("sse-relay", "relay-1", 200, {
+        "content-type": "text/event-stream",
+        "x-relay-runtime": "bun",
+      }) as never,
+    )
+
+    expect(state.statsFor("relay-1").ok).toBe(1)
+    expect(state.exit("relay-1")?.status).toBe("ready")
+  })
+
+  test("a JSON 200 through a proxy is a success even without relay headers", async () => {
+    const { state, hooks } = await setup([], ["proxy-1"])
+
+    await hooks.get("http.response")?.(
+      answerInput("json-proxy", proxiedFor("proxy-1"), 200, {
+        "content-type": "application/json",
+      }) as never,
+    )
+
+    expect(state.statsFor("proxy-1").ok).toBe(1)
+    expect(state.exit("proxy-1")?.status).toBe("ready")
+  })
+
+  test("an SSE 200 through a proxy is a success even without relay headers", async () => {
+    const { state, hooks } = await setup([], ["proxy-1"])
+
+    await hooks.get("http.response")?.(
+      answerInput("sse-proxy", proxiedFor("proxy-1"), 200, {
+        "content-type": "text/event-stream",
+      }) as never,
+    )
+
+    expect(state.statsFor("proxy-1").ok).toBe(1)
+    expect(state.exit("proxy-1")?.status).toBe("ready")
+  })
+})
+
+describe("the retry hook on 5xx", () => {
+  test("counts one failure, not one per hook", async () => {
+    const { state, hooks } = await setup(["relay-1", "relay-2"])
+    state.noteRelayed("server-error", freeModel.id, "relay-1")
+
+    await hooks.get("http.response")?.(responseInput("server-error", "relay-1", 502) as never)
+
+    expect(state.statsFor("relay-1").failed).toBe(1)
+    expect(state.failureCount("relay-1")).toBe(1)
+
+    const retry = retryInput("server-error", 502, "Upstream request failed")
+    await hooks.get("retry")?.(retry as never)
+
+    expect(retry.decision).toEqual({ retry: true, delay: ROTATE_DELAY_MS })
+    expect(state.statsFor("relay-1").failed).toBe(1)
+    expect(state.failureCount("relay-1")).toBe(1)
+  })
+
+  test("still marks a 5xx the response hook never saw", async () => {
+    const { state, hooks } = await setup(["relay-1", "relay-2"])
+    state.noteRelayed("server-only", freeModel.id, "relay-1")
+
+    const retry = retryInput("server-only", 503, "Service unavailable")
+    await hooks.get("retry")?.(retry as never)
+
+    expect(retry.decision).toEqual({ retry: true, delay: ROTATE_DELAY_MS })
+    expect(state.statsFor("relay-1").failed).toBe(0)
+    expect(state.failureCount("relay-1")).toBe(1)
+    expect(state.exit("relay-1")?.status).toBe("bad")
+  })
+
+  test("is not retried when no exit remains and direct is forbidden", async () => {
+    const { state, hooks } = await setup(["relay-1"])
+    await state.setDirect("never")
+    state.noteRelayed("server-never", freeModel.id, "relay-1")
+
+    await hooks.get("http.response")?.(responseInput("server-never", "relay-1", 500) as never)
+
+    const retry = retryInput("server-never", 500)
+    await hooks.get("retry")?.(retry as never)
+
+    expect(retry.decision).toEqual({ retry: false })
+    expect(state.failureCount("relay-1")).toBe(1)
+  })
+
+  test("is retried direct when no exit remains but direct is allowed", async () => {
+    const { state, hooks } = await setup(["relay-1"])
+    state.noteRelayed("server-direct", freeModel.id, "relay-1")
+
+    await hooks.get("http.response")?.(responseInput("server-direct", "relay-1", 500) as never)
+
+    const retry = retryInput("server-direct", 500)
+    await hooks.get("retry")?.(retry as never)
+
+    expect(retry.decision).toEqual({ retry: true, delay: ROTATE_DELAY_MS })
+  })
+
+  test("a transport error is still marked once and retried", async () => {
+    const { state, hooks } = await setup(["relay-1", "relay-2"])
+    state.noteRelayed("transport", freeModel.id, "relay-1")
+
+    const retry = retryInput("transport", undefined, "fetch failed")
+    await hooks.get("retry")?.(retry as never)
+
+    expect(retry.decision).toEqual({ retry: true, delay: ROTATE_DELAY_MS })
+    expect(state.failureCount("relay-1")).toBe(1)
+    expect(state.exit("relay-1")?.status).toBe("unreachable")
+  })
+
+  test("a transport error with no exit left and direct forbidden is not retried", async () => {
+    const { state, hooks } = await setup(["relay-1"])
+    await state.setDirect("never")
+    state.noteRelayed("transport-never", freeModel.id, "relay-1")
+
+    const retry = retryInput("transport-never", undefined, "fetch failed")
+    await hooks.get("retry")?.(retry as never)
+
+    expect(retry.decision).toEqual({ retry: false })
+    // The transport failure is still on record: leaving the decision alone
+    // must not lose the mark the request hook would otherwise report.
+    expect(state.failureCount("relay-1")).toBe(1)
+    expect(state.exit("relay-1")?.status).toBe("unreachable")
+  })
+})
+
+describe("the retry hook on a 429 free-allowance answer with no exit left", () => {
+  function freeLimitAnswer(sessionID: string) {
+    return answerInput(
+      sessionID,
+      requestFor("relay-1"),
+      429,
+      { "x-relay-egress": "203.0.113.12" },
+      '{"error":{"message":"Free usage limit reached"}}',
+    )
+  }
+
+  test("falls back to direct when direct is allowed", async () => {
+    const { state, hooks } = await setup(["relay-1"], [], async () => "spent")
+    state.noteRelayed("free-direct", freeModel.id, "relay-1")
+
+    await hooks.get("http.response")?.(freeLimitAnswer("free-direct") as never)
+
+    expect(state.exit("relay-1")?.status).toBe("exhausted")
+    expect(state.failureFor("free-direct", freeModel.id)?.kind).toBe("exhausted")
+
+    const retry = retryInput("free-direct", 429)
+    await hooks.get("retry")?.(retry as never)
+
+    expect(retry.decision).toEqual({ retry: true, delay: ROTATE_DELAY_MS })
+  })
+
+  test("is not retried when direct is forbidden", async () => {
+    const { state, hooks } = await setup(["relay-1"], [], async () => "spent")
+    await state.setDirect("never")
+    state.noteRelayed("free-never", freeModel.id, "relay-1")
+
+    await hooks.get("http.response")?.(freeLimitAnswer("free-never") as never)
+
+    expect(state.exit("relay-1")?.status).toBe("exhausted")
+
+    const retry = retryInput("free-never", 429)
+    await hooks.get("retry")?.(retry as never)
+
+    expect(retry.decision).toEqual({ retry: false })
+    expect(state.exit("relay-1")?.status).toBe("exhausted")
+  })
+})
+
+describe("the retry hook on a rotate 409 with one exit", () => {
+  test("falls back to direct when direct is allowed", async () => {
+    const { state, hooks } = await setup(["relay-1"])
+    state.noteRelayed("rotate-direct", freeModel.id, "relay-1")
+
+    await hooks.get("http.response")?.(
+      responseInput("rotate-direct", "relay-1", 409, {
+        "x-relay-rotate": "1",
+        "x-relay-egress": "203.0.113.9",
+      }) as never,
+    )
+
+    expect(state.exit("relay-1")?.status).toBe("exhausted")
+
+    const retry = retryInput("rotate-direct", 409)
+    await hooks.get("retry")?.(retry as never)
+
+    expect(retry.decision).toEqual({ retry: true, delay: ROTATE_DELAY_MS })
+  })
+
+  test("is not retried when direct is forbidden", async () => {
+    const { state, hooks } = await setup(["relay-1"])
+    await state.setDirect("never")
+    state.noteRelayed("rotate-never", freeModel.id, "relay-1")
+
+    await hooks.get("http.response")?.(
+      responseInput("rotate-never", "relay-1", 409, {
+        "x-relay-rotate": "1",
+        "x-relay-egress": "203.0.113.10",
+      }) as never,
+    )
+
+    const retry = retryInput("rotate-never", 409)
+    await hooks.get("retry")?.(retry as never)
+
+    expect(retry.decision).toEqual({ retry: false })
+  })
+
+  test("still moves to the backup exit when one is available", async () => {
+    const { state, hooks } = await setup(["relay-1", "relay-2"])
+    state.noteRelayed("rotate-backup", freeModel.id, "relay-1")
+
+    await hooks.get("http.response")?.(
+      responseInput("rotate-backup", "relay-1", 409, {
+        "x-relay-rotate": "1",
+        "x-relay-egress": "203.0.113.11",
+      }) as never,
+    )
+
+    const retry = retryInput("rotate-backup", 409)
+    await hooks.get("retry")?.(retry as never)
+
+    expect(retry.decision).toEqual({ retry: true, delay: ROTATE_DELAY_MS })
   })
 })
