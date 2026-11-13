@@ -1,21 +1,58 @@
 /**
- * The footer pill: one line that says what is routed right now.
+ * The footer pill: one clickable line that says what is routed right now.
  *
- * It stays silent for someone who never touched the plugin. An empty footer
- * is better than a placeholder nobody can act on.
+ * The tone carries the health (a problem is visible without reading), the
+ * underline appears when the mouse is over it, and a click opens the menu.
+ * Healthy states stay quiet: no `/relay` suffix, because someone whose
+ * routing works does not need to be told how to find the menu.
  */
-import { createMemo, Show } from "solid-js"
-import { summarizePill } from "./present.ts"
+import { createMemo, createSignal, Show } from "solid-js"
+import { TextAttributes } from "@opentui/core"
+import { pillTone, summarizePill, type PillTone } from "./present.ts"
 import { currentStatus } from "./state.ts"
 
+/** The colors the pill needs, resolved from the theme by the entry point. */
+export interface PillColors {
+  readonly muted: string
+  readonly warning: string
+  readonly error: string
+  readonly info: string
+}
+
+/** The color a tone reads as. */
+function toneColor(tone: PillTone, colors: PillColors): string {
+  switch (tone) {
+    case "off":
+      return colors.muted
+    case "warn":
+      return colors.warning
+    case "bad":
+      return colors.error
+    case "busy":
+      return colors.info
+    default:
+      return colors.muted
+  }
+}
+
 /** The pill itself. */
-export function RelayPill(props: { readonly onOpen: () => void }) {
+export function RelayPill(props: { readonly colors: PillColors; readonly onOpen: () => void }) {
   const line = createMemo(() => summarizePill(currentStatus()))
+  const tone = createMemo(() => pillTone(currentStatus()))
+  const [hover, setHover] = createSignal(false)
   return (
     <Show when={line()}>
       {(text) => (
         <box flexDirection="row" flexShrink={1}>
-          <text wrapMode="none" truncate onMouseUp={props.onOpen}>
+          <text
+            wrapMode="none"
+            truncate
+            fg={toneColor(tone(), props.colors)}
+            attributes={hover() ? TextAttributes.UNDERLINE : TextAttributes.NONE}
+            onMouseOver={() => setHover(true)}
+            onMouseOut={() => setHover(false)}
+            onMouseUp={props.onOpen}
+          >
             {text()}
           </text>
         </box>
@@ -25,6 +62,6 @@ export function RelayPill(props: { readonly onOpen: () => void }) {
 }
 
 /** The pill as the slot renders it; the entry point keeps its own file free of markup. */
-export function renderRelayPill(onOpen: () => void) {
-  return <RelayPill onOpen={onOpen} />
+export function renderRelayPill(colors: PillColors, onOpen: () => void) {
+  return <RelayPill colors={colors} onOpen={onOpen} />
 }

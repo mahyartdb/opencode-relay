@@ -70,18 +70,37 @@ Restart OpenCode after changing the config.
 
 ## Use
 
-Type `/relay` in the prompt and press enter, pick `/relay` from the slash list,
-or click the footer pill. The menu stays open after every action, so one visit
-can make several changes. Esc or **Close** leaves it.
+Type `/relay` in the prompt and press enter, press **alt+r**, or click the
+footer pill. The menu stays open after
+every action, so one visit can make several changes. Esc or **Close** leaves
+it, and Esc inside a submenu returns to the main menu.
 
-### Routing
+### The menu
 
+The main menu is a handful of hubs, each described by what it is doing right
+now:
+
+- **Status** - a read-only page with everything the plugin knows: routing on
+  or off, which models are routed, the strategy and direct policy, background
+  checks, the traffic through exits, every exit with its latency and requests,
+  the last routing decision, the server's note, and scan progress while a
+  background check runs.
+- **Preview the next request** - a read-only page that says where the next
+  request would go, why, and which exits are being skipped, without sending
+  anything or advancing the rotation.
 - **Turn routing on / off** - routing starts off. Nothing is changed until you
   turn it on.
-- **Choose models to route** - route every free model, or choose free models one
-  by one. Paid models are filtered out of the picker and dropped from a custom
-  list: the plugin never sends paid traffic through an exit.
-- **Choose how exits are used** - the strategy decides which exit serves a
+- **Models** - route every free model, or choose free models one by one. The
+  picker also offers **Select all** and **Clear selection** above the list.
+  Paid models are filtered out of the picker and dropped from a custom list:
+  the plugin never sends paid traffic through an exit.
+- **Exits** - the exits hub, described below.
+- **Settings** - how exits are used, the direct policy, background checks,
+  export or import, and Vercel accounts.
+
+### Routing rules
+
+- **How exits are used** (Settings) - the strategy decides which exit serves a
   request:
   - **One exit** - prefer the chosen exit; if it cannot serve, use the first
     usable one. When nothing is usable, the direct policy decides.
@@ -91,11 +110,9 @@ can make several changes. Esc or **Close** leaves it.
     preference.
   - **Fastest** - use the exit with the lowest measured average latency.
     Exits without a measurement go last.
-- **When no exit can serve** - **Go direct** keeps the session working;
-  **Never go direct** fails the request instead. There is no silent third
-  option.
-- **Preview the next request** - shows which exit would serve it, why, and which
-  exits are being skipped, without sending anything or advancing the rotation.
+- **When no exit can serve** (Settings) - **Go direct** keeps the session
+  working; **Never go direct** fails the request instead. There is no silent
+  third option.
 
 A relay or proxy that does not answer is rested: two minutes after the first
 failure, doubling with each consecutive failure up to thirty minutes. One
@@ -107,23 +124,21 @@ and the menu and pill say so.
 Relays and proxies are one list because routing treats them the same way: either
 can carry a request, and the strategy picks among both.
 
-- **Relays and proxies** - list every exit with its kind, region, state, latency,
-  and whether it is chosen. Open one to use it, test it, deep-test it, pause or
-  resume it, edit it, or remove it.
-- **Deploy a relay** - pick a Vercel account and one or more regions. Each relay
-  is its own Vercel project. A Hobby project runs in one region, so a
-  multi-region setup deploys one relay per region.
-- **Track an existing relay** - use a relay you deployed yourself, by its URL and
-  access token.
-- **Add proxies** - paste a list; see below.
-- **Update every relay** - redeploy the current relay code over every relay this
-  plugin deployed, keeping URLs and tokens.
-- **Bring used-up exits back** - clear the used-up state before its reset time.
-  The addresses that were marked as spent stay avoided, so a relay can recycle
-  to a fresh instance.
-- **Background checks** - turn the automatic health checks on or off. When on,
-  and while routing is on, every exit is checked every ten minutes, four at a
-  time.
+- **The exits list** - one entry per exit with its kind, region, state,
+  latency, requests, and whether it is chosen. **Test all exits**, **Update
+  all relays**, and **Bring used-up exits back** sit under the list, and
+  **Add exits** below them.
+- **Add exits** - **Deploy a relay** (pick a Vercel account and one or more
+  regions; each relay is its own Vercel project, and a Hobby project runs in
+  one region, so a multi-region setup deploys one relay per region), **Track
+  an existing relay** by its URL and access token, or **Add proxies** from a
+  pasted list. Deploying with no Vercel account offers to add one instead of
+  stopping.
+- **Exit detail** - open an exit for **Details** (a read-only page with the
+  address, health, egress, runtime, request counters, and the last error),
+  **Use this exit**, both checks, **Pause/Resume**, **Update this relay**
+  (relays this plugin deployed), **Edit its name or address** (proxies), and
+  **Remove this exit**.
 
 ### Proxies
 
@@ -153,8 +168,8 @@ through a loopback HTTP-to-SOCKS bridge started by the plugin on first use.
 - **Deep test with a real model** - sends a one-token chat request with the
   headers of a captured real request. This is the only check that can tell
   "OpenCode accepts this address" from "this address is used up".
-- **Test every exit** - starts the same checks for all exits in the background;
-  the menu shows progress.
+- **Test all exits** (Exits) - starts the same checks for all exits in the
+  background; the status page and the pill show progress.
 
 A 429 that looks like the free usage limit is only a suspicion. The plugin sends
 a tiny canary through the same exit; only a canary that is refused too marks the
@@ -167,30 +182,48 @@ forget it.
 
 ### Accounts and transfer
 
+Accounts, export, import, and the background checks live in **Settings**:
+
 - **Add a Vercel account** - needs a Vercel API token that can create projects.
-  The token is stored on your machine and sent only to Vercel.
+  The token is stored on your machine and sent only to Vercel. With exactly one
+  account, removing it skips the picker and only asks for confirmation.
 - **Remove a Vercel account** - relays it deployed keep running; only the token
   and name are forgotten.
 - **Export or import** - writes exits and rules as JSON, credentials included.
   Accounts are never exported or imported.
+- **Background checks** - when on, and while routing is on, every exit is
+  checked every ten minutes, four at a time. When off, exits are only checked
+  when you ask.
 
 ### Keys
 
 | Key | What it does |
 | --- | --- |
+| alt+r | Open the relay menu from anywhere |
 | Up / Down | Move through a list |
 | Enter | Choose |
-| Esc | Leave the current page, or the menu |
-| `t` | Test all exits (main menu) or the open exit (exit list) |
-| `r` | Bring used-up exits back (main menu, when any are used up) |
+| Esc | Leave the current page, return from a submenu, or leave the menu |
+| `t` | Test the exit under the cursor (exits list) |
+| `u` | Update the relay under the cursor (exits list; relays this plugin deployed) |
 | alt+enter | Confirm a pasted list or configuration |
 
-The footer pill shows whether routing is on, the chosen exit or strategy, how
-many requests have gone through exits, and how many exits are used up; it never
-presents the number of selected models as traffic. When no exit can serve, it
-says whether requests go direct or fail. Clicking it opens the same menu, and
-the preview there shows the last decision: which model was asked for, and why
-it went through an exit or straight to OpenCode.
+### The footer pill
+
+One clickable line under the prompt; hovering underlines it and a click opens
+the menu. Its text is the honest state, never the number of selected models
+dressed up as traffic:
+
+- routing off: `relay off · /relay`
+- routing on with no exits: `relay on · no exits · /relay`
+- while a background check runs: `relay on · testing 3/8`
+- no usable exit: `relay on · no exit can serve · direct` or `· fail`
+- healthy: `relay · Frankfurt · 3 req`, `relay · round robin · 0 req`, with
+  `· N used up` appended when exits are used up. Healthy states carry no
+  `/relay` suffix.
+
+The color follows the same state: muted when off, blue while testing, amber
+when there is something to look at, red when requests would fail, and the
+theme's quiet color when everything is fine.
 
 ## Security and privacy
 

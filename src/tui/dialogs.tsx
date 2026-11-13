@@ -11,16 +11,25 @@
  * unhandled rejection inside a plugin takes the whole TUI with it.
  */
 import { createSignal, onCleanup } from "solid-js"
-import type { Context, DialogSelectAction, DialogSelectOption } from "@opencode/plugin/tui/context"
+import type {
+  Context,
+  DialogSelectAction,
+  DialogSelectOption,
+  DialogSize,
+} from "@opencode/plugin/tui/context"
 import type { TextareaRenderable } from "@opentui/core"
 import { Relay } from "../rpc.ts"
 import { REGIONS, STRATEGIES, STRATEGY_LABELS, type Strategy } from "../lib/types.ts"
 import {
-  describeExit,
-  exitList,
+  describeExitDetails,
+  describePreview,
+  describeStatusPage,
+  describeStrategy,
+  exitsMenuOptions,
   menuOptions,
   statusLabel,
   type ExitChoice,
+  type ExitListAction,
   type MenuAction,
 } from "./present.ts"
 import { currentStatus, publishStatus, type RelayModel, type RelayStatus } from "./state.ts"
@@ -181,7 +190,12 @@ function askMultiline(
 }
 
 /** Show text that the user may want to copy, in a dialog they can scroll. */
-function showText(context: Context, title: string, text: string): Promise<void> {
+function showText(
+  context: Context,
+  title: string,
+  text: string,
+  size: DialogSize = "medium",
+): Promise<void> {
   return new Promise((resolve) => {
     let finished = false
     const finish = (): void => {
@@ -199,24 +213,53 @@ function showText(context: Context, title: string, text: string): Promise<void> 
       ),
       finish,
     )
+    // A page of text is wider than a question, so the dialog is asked for the
+    // room after it exists, while it is still the active one.
+    context.ui.dialog.set({ size })
   })
+}
+
+/**
+ * Reports refresh failures in a loop, but only once per sentence.
+ *
+ * A loop that cannot refresh falls back to the last known state, which is
+ * still useful; toasting the same error on every pass would bury the next,
+ * different one. Success clears the memory, so a returning problem is
+ * reported again.
+ */
+function refreshErrorToaster(context: Context): (refresh: Refresh) => void {
+  let reported: string | undefined
+  return (refresh) => {
+    if (refresh.ok) {
+      reported = undefined
+      return
+    }
+    const text = describeError(refresh.error)
+    if (text === reported) return
+    reported = text
+    reportError(context, "Relay", refresh.error)
+  }
 }
 
 /**
  * The menu, and it stays open.
  *
- * Every action ends by asking what to do next, so a change does not throw the
- * user out of the plugin and back to the prompt. `t` tests every exit and `r`
- * brings the used-up exits back, without leaving the menu.
+ * The main menu is only hubs: every action ends by asking what to do next,
+ * and the submenus loop on themselves, so a change never throws the user out
+ * to the prompt. Esc on a submenu returns to the main menu; Esc here leaves.
  */
 let menuOpen = false
 
 export async function openRelayMenu(context: Context, client: RelayClient): Promise<void> {
   // A second click on the pill, or a second /relay while the menu is up, must
   // not stack menus on top of each other.
-  if (menuOpen) return
+  if (menuOpen) {
+    context.ui.toast.show({ title: "Relay", message: "The relay menu is already open.", variant: "info" })
+    return
+  }
   menuOpen = true
   try {
+    const reportRefresh = refreshErrorToaster(context)
     for (;;) {
       const refreshed = await refreshStatus(context, client)
       const status = refreshed.ok ? refreshed.status : currentStatus()
@@ -224,89 +267,133 @@ export async function openRelayMenu(context: Context, client: RelayClient): Prom
         if (!refreshed.ok) reportError(context, "Relay", refreshed.error)
         return
       }
-      if (!refreshed.ok) {
-        // A refresh that failed is worth saying once, but it must not throw the
-        // user out of the menu. The last known state is still useful, and the
-        // next action may well succeed.
-        reportError(context, "Relay", refreshed.error)
-      }
-      const actions: DialogSelectAction<MenuAction>[] = []
-      if (status.exits.length > 0) {
-        actions.push({
-          bind: "t",
-          title: "test all",
-          side: "left",
-          selection: "none",
-          onTrigger: () => {
-            void startTestAll(context, client, false)
-          },
-        })
-      }
-      if (status.exhausted.length > 0) {
-        actions.push({
-          bind: "r",
-          title: "bring back",
-          side: "left",
-          selection: "none",
-          onTrigger: () => {
-            void restoreExhausted(context, client)
-          },
-        })
-      }
+      if (!refreshed.ok) reportRefresh(refreshed)
       const choice = await context.ui.dialog.select<MenuAction>({
         title: "Relay",
         options: menuOptions(status),
-        ...(actions.length > 0 ? { actions } : {}),
       })
       if (choice === undefined || choice === "close") return
-      await runAction(context, client, status, choice)
+      await runAction(context, client, choice)
     }
   } finally {
     menuOpen = false
   }
 }
 
-/** Runs one entry of the menu. */
-async function runAction(
-  context: Context,
-  client: RelayClient,
-  status: RelayStatus,
-  choice: MenuAction,
-): Promise<void> {
+/** Runs one entry of the main menu. */
+async function runAction(context: Context, client: RelayClient, choice: MenuAction): Promise<void> {
   switch (choice) {
-    case "toggle":
-      return toggleRouting(context, client, status)
+    case "status":
+      return showStatus(context, client)
+    case "toggle": {
+      // Toggle needs the state it acts on; the rest is in the submenu.
+      const refreshed = await refreshStatus(context, client)
+      if (refreshed.ok) return toggleRouting(context, client, refreshed.status)
+      const fallback = currentStatus()
+      if (fallback) return toggleRouting(context, client, fallback)
+      return
+    }
     case "models":
-      return chooseModels(context, client, status)
-    case "strategy":
-      return chooseStrategy(context, client, status)
-    case "direct":
-      return chooseDirect(context, client, status)
-    case "preview":
-      return showPreview(context, client, status)
+      return chooseModels(context, client)
     case "exits":
       return manageExits(context, client)
-    case "deploy":
-      return deployRelay(context, client, status)
-    case "track-relay":
-      return trackRelay(context, client)
-    case "add-proxies":
-      return addProxies(context, client)
-    case "test-all":
-      return startTestAll(context, client, false)
-    case "update-all":
-      return updateAllRelays(context, client)
-    case "restore":
-      return restoreExhausted(context, client)
-    case "health":
-      return toggleHealthChecks(context, client, status)
-    case "transfer":
-      return transferConfig(context, client)
-    case "add-account":
-      return addAccount(context, client)
-    case "remove-account":
-      return removeAccount(context, client, status)
+    case "settings":
+      return openSettings(context, client)
+    case "preview":
+      return showPreview(context, client)
   }
+}
+
+/** What one entry of the Settings submenu does. */
+type SettingsAction =
+  | "strategy"
+  | "direct"
+  | "health"
+  | "transfer"
+  | "add-account"
+  | "remove-account"
+  | "back"
+
+/** The Settings hub: the rarely-changed rules, each one step deep. */
+async function openSettings(context: Context, client: RelayClient): Promise<void> {
+  const reportRefresh = refreshErrorToaster(context)
+  for (;;) {
+    const refreshed = await refreshStatus(context, client)
+    const status = refreshed.ok ? refreshed.status : currentStatus()
+    if (!status) return
+    if (!refreshed.ok) reportRefresh(refreshed)
+    const options: DialogSelectOption<SettingsAction>[] = [
+      {
+        title: "How exits are used",
+        value: "strategy",
+        description: describeStrategy(status),
+      },
+      {
+        title: "When no exit can serve",
+        value: "direct",
+        description: status.direct === "allow" ? "Now: go direct" : "Now: fail instead of going direct",
+      },
+      {
+        title: `Background checks: ${status.healthChecks !== false ? "on" : "off"}`,
+        value: "health",
+        description: status.healthChecks !== false ? "Automatic checks every 10 minutes" : "Only when you ask",
+      },
+      { title: "Export or import", value: "transfer", description: "Move exits and rules between machines" },
+      { title: "Add a Vercel account", value: "add-account", description: "Needs a Vercel API token" },
+      ...(status.accounts.length > 0
+        ? [
+            {
+              title: "Remove a Vercel account",
+              value: "remove-account" as const,
+              description: "Relays it deployed keep running",
+            },
+          ]
+        : []),
+      { title: "Back", value: "back" },
+    ]
+    const choice = await context.ui.dialog.select<SettingsAction>({
+      title: "Settings",
+      options,
+    })
+    if (choice === undefined || choice === "back") return
+    switch (choice) {
+      case "strategy":
+        await chooseStrategy(context, client, status)
+        continue
+      case "direct":
+        await chooseDirect(context, client, status)
+        continue
+      case "health":
+        await toggleHealthChecks(context, client, status)
+        continue
+      case "transfer":
+        await transferConfig(context, client)
+        continue
+      case "add-account":
+        await addAccount(context, client)
+        continue
+      case "remove-account":
+        await removeAccount(context, client, status)
+        continue
+    }
+  }
+}
+
+/** The read-only page about everything the plugin knows right now. */
+async function showStatus(context: Context, client: RelayClient): Promise<void> {
+  const refreshed = await refreshStatus(context, client)
+  const status = refreshed.ok ? refreshed.status : currentStatus()
+  if (!status) {
+    if (!refreshed.ok) reportError(context, "Relay", refreshed.error)
+    return
+  }
+  const lines: string[] = []
+  if (!refreshed.ok) {
+    // The page is a snapshot; a reader has to know it may be a stale one.
+    lines.push("This is the last known state: the server did not answer.")
+    lines.push("")
+  }
+  await showText(context, "Relay status", `${lines.length > 0 ? `${lines.join("\n")}\n` : ""}${describeStatusPage(status)}`, "xlarge")
 }
 
 /** Turn routing on or off. */
@@ -383,7 +470,7 @@ async function chooseDirect(context: Context, client: RelayClient, status: Relay
 }
 
 /** Show where the next request would go, without sending anything. */
-async function showPreview(context: Context, client: RelayClient, status: RelayStatus): Promise<void> {
+async function showPreview(context: Context, client: RelayClient): Promise<void> {
   // The model the prompt is pointed at, so the preview is about the request
   // the user is about to make. A model of another provider previews as "only
   // the opencode provider is routed", which is the truth and not a claim that
@@ -395,23 +482,9 @@ async function showPreview(context: Context, client: RelayClient, status: RelayS
     }),
   )
   if (!result) return
-  const lines = [result.reason]
-  if (status.lastDecision) {
-    lines.push("", `Last request: ${status.lastDecision.modelId} - ${status.lastDecision.reason}`)
-  }
-  if (result.skipped.length > 0) {
-    lines.push("", "Left out:")
-    for (const exit of result.skipped) lines.push(`  ${exit.name}: ${exit.reason}`)
-  }
-  if (!result.routed) {
-    lines.push(
-      "",
-      result.direct === "never"
-        ? "Direct routing is off, so this request would fail."
-        : "The request would go straight to OpenCode.",
-    )
-  }
-  await context.ui.dialog.alert({ title: "The next request", message: lines.join("\n") })
+  // The page says what would happen next; what happened last belongs to the
+  // status page, where it is not read as a prediction.
+  await showText(context, "The next request", describePreview(result), "large")
 }
 
 /** Bring the exits whose allowance is gone back into use. */
@@ -449,7 +522,7 @@ async function toggleHealthChecks(
 }
 
 /** Let the user say which models go through the exits. Only free models are ever routed. */
-async function chooseModels(context: Context, client: RelayClient, status: RelayStatus): Promise<void> {
+async function chooseModels(context: Context, client: RelayClient): Promise<void> {
   const result = await callRpc(context, "Relay", () => client.models({}))
   if (!result) return
   const models = result.models
@@ -464,29 +537,49 @@ async function chooseModels(context: Context, client: RelayClient, status: Relay
     })
     return
   }
-  const mode = await context.ui.dialog.select<"free" | "custom">({
-    title: `Route models (${free.length} free)`,
-    options: [
-      {
-        title: "Route every free model",
-        value: "free",
-        description: `Every free model of the opencode provider${models.length > free.length ? `; ${models.length - free.length} paid models are never routed` : ""}`,
-      },
-      {
-        title: "Choose free models one by one",
-        value: "custom",
-        description: "Pick exactly which free models are routed",
-      },
-    ],
-    current: status.selection,
-  })
-  if (mode === undefined) return
-  if (mode === "free") {
-    await setSelection(context, client, { selection: "free" })
-    return
+  for (;;) {
+    // The loop needs the current selection to describe the choices and to
+    // pre-mark the right one; the initial fetch says what that is.
+    const refreshed = await refreshStatus(context, client)
+    const status = refreshed.ok ? refreshed.status : currentStatus()
+    if (!status) return
+    const paid = models.length - free.length
+    const current: "free" | "pick" = status.selection === "free" ? "free" : "pick"
+    const choice = await context.ui.dialog.select<"free" | "pick" | "back">({
+      title: "Models",
+      options: [
+        {
+          title: "Route every free model",
+          value: "free",
+          description: `Every free model of the opencode provider${paid > 0 ? `; ${paid} paid models are never routed` : ""}`,
+        },
+        {
+          title: "Choose free models one by one",
+          value: "pick",
+          description:
+            status.selection === "custom"
+              ? `${status.customModels.length} chosen of ${free.length} free models`
+              : "Pick exactly which free models are routed",
+        },
+        { title: "Back", value: "back" },
+      ],
+      current,
+    })
+    if (choice === undefined || choice === "back") return
+    if (choice === "free") {
+      await setSelection(context, client, { selection: "free" })
+      continue
+    }
+    await pickModels(context, client, free, status.customModels)
   }
-  await pickModels(context, client, free, status.customModels)
 }
+
+/** The extra entries above the model list that set every mark at once. */
+type PickerChoice =
+  | { readonly kind: "all" }
+  | { readonly kind: "none" }
+  | { readonly kind: "model"; readonly id: string }
+  | { readonly kind: "done" }
 
 /** Ask about one free model at a time until the user says they are done. */
 async function pickModels(
@@ -499,17 +592,29 @@ async function pickModels(
   const baseline = [...picked]
   const unchanged = () =>
     picked.size === baseline.length && baseline.every((id) => picked.has(id))
-  let current: { readonly kind: "model"; readonly id: string } | undefined
+  let current: PickerChoice | undefined
   for (;;) {
-    const options: DialogSelectOption<
-      { readonly kind: "model"; readonly id: string } | { readonly kind: "done" }
-    >[] = models.map((model) => ({
-      title: model.name,
-      value: { kind: "model", id: model.id },
-      description: `opencode/${model.id} - free - ${picked.has(model.id) ? "routed" : "not routed"}`,
-    }))
-    options.push({ title: "Done", value: { kind: "done" }, description: "Save this selection" })
-    const choice = await context.ui.dialog.select({
+    const options: DialogSelectOption<PickerChoice>[] = [
+      {
+        title: "Select all",
+        value: { kind: "all" },
+        description: `Mark all ${models.length} free models as routed`,
+      },
+      {
+        title: "Clear selection",
+        value: { kind: "none" },
+        description: "Unmark every model; nothing is routed until you choose again",
+      },
+      ...models.map(
+        (model): DialogSelectOption<PickerChoice> => ({
+          title: model.name,
+          value: { kind: "model", id: model.id },
+          description: `opencode/${model.id} - free - ${picked.has(model.id) ? "routed" : "not routed"}`,
+        }),
+      ),
+      { title: "Done", value: { kind: "done" }, description: "Save this selection" },
+    ]
+    const choice = await context.ui.dialog.select<PickerChoice>({
       title: `Choose free models to route (${picked.size} picked)`,
       options,
       current,
@@ -524,6 +629,16 @@ async function pickModels(
         label: { confirm: "Discard changes", cancel: "Keep editing" },
       })
       if (discard) return
+      continue
+    }
+    if (choice.kind === "all") {
+      // Setting every mark at once is the one change that has to re-render
+      // the whole list, so the loop restarts instead of confirming.
+      for (const model of models) picked.add(model.id)
+      continue
+    }
+    if (choice.kind === "none") {
+      picked.clear()
       continue
     }
     if (choice.kind === "done") break
@@ -608,70 +723,131 @@ async function quickTest(context: Context, client: RelayClient, exit: ExitChoice
 }
 
 /** The key binding that tests the exit the cursor is on. */
-function testAction(context: Context, client: RelayClient): DialogSelectAction<ExitListChoice> {
+function testAction(context: Context, client: RelayClient): DialogSelectAction<ExitListAction> {
   return {
     bind: "t",
     title: "test",
     side: "left",
     selection: "required",
     onTrigger: (value) => {
-      if (value.kind === "add") return
+      if (!("id" in value)) return
       void quickTest(context, client, value)
     },
   }
 }
 
-/** An exit, or the entry that adds more. */
-type ExitListChoice = ExitChoice | { readonly kind: "add" }
+/** The key binding that redeploys the relay the cursor is on. */
+function updateAction(context: Context, client: RelayClient): DialogSelectAction<ExitListAction> {
+  return {
+    bind: "u",
+    title: "update",
+    side: "left",
+    selection: "required",
+    onTrigger: (value) => {
+      // Only a relay this plugin deployed can be redeployed; a proxy or a
+      // tracked relay has no project to push code to.
+      if (!("id" in value) || value.deployed !== true) {
+        context.ui.toast.show({
+          title: "Relay",
+          message: "Only a relay this plugin deployed can be updated.",
+          variant: "warning",
+        })
+        return
+      }
+      void updateRelay(context, client, value.id, value.name)
+    },
+  }
+}
+
+/** What one entry of the Add-exits submenu does. */
+type AddExitAction = "deploy" | "track" | "proxies" | "back"
+
+/** The Add-exits hub: three ways to get another address. */
+async function addExits(context: Context, client: RelayClient): Promise<void> {
+  for (;;) {
+    const choice = await context.ui.dialog.select<AddExitAction>({
+      title: "Add exits",
+      options: [
+        { title: "Deploy a relay", value: "deploy", description: "A new Vercel project in one or more regions" },
+        { title: "Track an existing relay", value: "track", description: "Use a relay you deployed yourself" },
+        { title: "Add proxies", value: "proxies", description: "Paste a list of HTTP, HTTPS or SOCKS proxies" },
+        { title: "Back", value: "back" },
+      ],
+    })
+    if (choice === undefined || choice === "back") return
+    switch (choice) {
+      case "deploy":
+        await deployRelay(context, client)
+        continue
+      case "track":
+        await trackRelay(context, client)
+        continue
+      case "proxies":
+        await addProxies(context, client)
+        continue
+    }
+  }
+}
 
 /** The relays and proxies, and what can be done with each. */
 async function manageExits(context: Context, client: RelayClient): Promise<void> {
+  const reportRefresh = refreshErrorToaster(context)
   for (;;) {
     const refreshed = await refreshStatus(context, client)
     const status = refreshed.ok ? refreshed.status : currentStatus()
     if (!status) return
-    if (!refreshed.ok) reportError(context, "Relay", refreshed.error)
-    if (status.exits.length === 0) {
-      const add = await context.ui.dialog.confirm({
-        title: "No relay or proxy yet",
-        message: "Add a list of proxies now, or deploy a relay from the menu.",
-        label: { confirm: "Add proxies", cancel: "Close" },
-      })
-      if (add) await addProxies(context, client)
-      return
-    }
+    if (!refreshed.ok) reportRefresh(refreshed)
     const active = status.activeExit
-    const current: ExitListChoice | undefined =
+    // The dialog finds the pre-selected row by deep equality with the option
+    // values, so this carries the same deployed flag exitList sets.
+    const current: ExitChoice | undefined =
       active === undefined
         ? undefined
-        : { id: active.id, name: active.name, kind: active.kind }
-    const options: DialogSelectOption<ExitListChoice>[] = [
-      ...exitList(status),
-      { title: "Add proxies", value: { kind: "add" }, description: "Paste a list of HTTP, HTTPS or SOCKS proxies" },
-    ]
-    const choice = await context.ui.dialog.select<ExitListChoice>({
-      title: "Relays and proxies",
-      options,
+        : {
+            id: active.id,
+            name: active.name,
+            kind: active.kind,
+            deployed: active.kind === "relay" && (active.project ?? "").length > 0,
+          }
+    const choice = await context.ui.dialog.select<ExitListAction>({
+      title: "Exits",
+      options: exitsMenuOptions(status),
       ...(current !== undefined ? { current } : {}),
-      actions: [testAction(context, client)],
+      actions: [testAction(context, client), updateAction(context, client)],
     })
     if (choice === undefined) return
-    if (choice.kind === "add") {
-      await addProxies(context, client)
-      continue
+    if (!("id" in choice)) {
+      switch (choice.kind) {
+        case "add":
+          await addExits(context, client)
+          continue
+        case "test-all":
+          await startTestAll(context, client, false)
+          continue
+        case "update-all":
+          await updateAllRelays(context, client)
+          continue
+        case "restore":
+          await restoreExhausted(context, client)
+          continue
+        case "back":
+          return
+      }
     }
     await exitDetail(context, client, choice.id)
   }
 }
 
 /** Everything that can be done with one exit. */
-type DetailAction = "use" | "test" | "deep" | "toggle" | "edit" | "remove" | "back"
+type DetailAction = "details" | "use" | "test" | "deep" | "toggle" | "update" | "edit" | "remove" | "back"
 
 async function exitDetail(context: Context, client: RelayClient, id: string): Promise<void> {
+  const reportRefresh = refreshErrorToaster(context)
   for (;;) {
     const refreshed = await refreshStatus(context, client)
     const status = refreshed.ok ? refreshed.status : currentStatus()
     if (!status) return
+    if (!refreshed.ok) reportRefresh(refreshed)
     const exit = status.exits.find((item) => item.id === id)
     if (!exit) {
       context.ui.toast.show({ title: "Relay", message: "That exit is not there any more.", variant: "warning" })
@@ -679,7 +855,14 @@ async function exitDetail(context: Context, client: RelayClient, id: string): Pr
     }
     const exhausted = status.exhausted.includes(id)
     const chosen = status.activeExit?.id === id
+    const isDeployedRelay = exit.kind === "relay" && (exit.project ?? "").length > 0
     const options: DialogSelectOption<DetailAction>[] = [
+      {
+        title: "Details",
+        value: "details",
+        description: "Address, health, traffic and the last error",
+        ...(exit.lastError !== undefined && exit.lastError.length > 0 ? { footer: exit.lastError } : {}),
+      },
       {
         title: exhausted ? "Use it anyway" : "Use this exit",
         value: "use",
@@ -705,6 +888,15 @@ async function exitDetail(context: Context, client: RelayClient, id: string): Pr
           ? "Keep it, but stop using it"
           : "Use it again in routing and checks",
       },
+      ...(isDeployedRelay
+        ? [
+            {
+              title: "Update this relay",
+              value: "update" as const,
+              description: "Redeploy the current relay code; the address and token stay",
+            },
+          ]
+        : []),
       ...(exit.kind === "proxy"
         ? [{ title: "Edit its name or address", value: "edit" as const, description: "A new address is tested afresh" }]
         : []),
@@ -712,13 +904,18 @@ async function exitDetail(context: Context, client: RelayClient, id: string): Pr
       { title: "Back", value: "back" },
     ]
     const choice = await context.ui.dialog.select<DetailAction>({
-      title: `${exit.name} - ${statusLabel(exit.status)}`,
+      // The server's own label knows about the reset time; the fallback only
+      // fills the gap when the record did not say.
+      title: `${exit.name} - ${(exit.statusLabel ?? "").length > 0 ? exit.statusLabel : statusLabel(exit.status)}`,
       options,
-      ...(exit.lastError !== undefined ? { placeholder: exit.lastError } : {}),
     })
     if (choice === undefined || choice === "back") return
 
     switch (choice) {
+      case "details": {
+        await showText(context, exit.name, describeExitDetails(exit, status), "large")
+        break
+      }
       case "use": {
         const result = await callRpc(context, "Relay", () => client.useExit({ id }))
         if (!result) break
@@ -769,6 +966,10 @@ async function exitDetail(context: Context, client: RelayClient, id: string): Pr
         })
         break
       }
+      case "update": {
+        await updateRelay(context, client, id, exit.name)
+        break
+      }
       case "edit": {
         await editProxy(context, client, id, exit.name, exit.url)
         break
@@ -779,6 +980,27 @@ async function exitDetail(context: Context, client: RelayClient, id: string): Pr
       }
     }
   }
+}
+
+/** Redeploy one relay with the current code, and say whether it answered. */
+async function updateRelay(
+  context: Context,
+  client: RelayClient,
+  id: string,
+  name: string,
+): Promise<void> {
+  const result = await withWorking(context, `Updating ${name}`, () =>
+    callRpc(context, "Relay", () => client.updateRelay({ id })),
+  )
+  if (!result) return
+  context.ui.toast.show({
+    title: "Relay",
+    message: result.reachable
+      ? `${name} is redeployed and answered.`
+      : `${name} is redeployed, but did not answer yet.`,
+    variant: result.reachable ? "success" : "warning",
+  })
+  await refreshStatus(context, client)
 }
 
 /** Change a proxy's name or address. */
@@ -796,12 +1018,15 @@ async function editProxy(
     value: name,
   })
   if (nextName === undefined) return
+  let changed = false
   if (nextName.trim().length > 0 && nextName.trim() !== name) {
-    const changed = await callRpc(context, "Relay", () =>
+    const updated = await callRpc(context, "Relay", () =>
       client.updateProxy({ id, name: nextName.trim() }),
     )
-    if (!changed?.updated) {
+    if (!updated?.updated) {
       context.ui.toast.show({ title: "Relay", message: "The name was not changed.", variant: "warning" })
+    } else {
+      changed = true
     }
   }
   const nextUrl = await context.ui.dialog.prompt({
@@ -810,24 +1035,37 @@ async function editProxy(
     placeholder: url,
     value: url,
   })
-  if (nextUrl === undefined) return
-  if (nextUrl.trim().length === 0 || nextUrl.trim() === url) return
-  const changed = await withWorking(context, "Testing the new address", () =>
-    callRpc(context, "Relay", () => client.updateProxy({ id, url: nextUrl.trim() })),
-  )
-  if (!changed?.updated) {
-    context.ui.toast.show({
-      title: "Relay",
-      message: "That address could not be read as a proxy. It was left as it was.",
-      variant: "error",
-    })
+  if (nextUrl === undefined) {
+    if (changed) await refreshStatus(context, client)
     return
   }
-  context.ui.toast.show({
-    title: "Relay",
-    message: "The address was changed and is being checked.",
-    variant: "success",
-  })
+  if (nextUrl.trim().length > 0 && nextUrl.trim() !== url) {
+    const updated = await withWorking(context, "Testing the new address", () =>
+      callRpc(context, "Relay", () => client.updateProxy({ id, url: nextUrl.trim() })),
+    )
+    if (!updated?.updated) {
+      context.ui.toast.show({
+        title: "Relay",
+        message: "That address could not be read as a proxy. It was left as it was.",
+        variant: "error",
+      })
+      return
+    }
+    context.ui.toast.show({
+      title: "Relay",
+      message: "The address was changed and is being checked.",
+      variant: "success",
+    })
+    await refreshStatus(context, client)
+    return
+  }
+  // Neither question changed anything: saying so beats a silent return, which
+  // reads as a lost answer.
+  if (!changed) {
+    context.ui.toast.show({ title: "Relay", message: "Nothing changed.", variant: "info" })
+    return
+  }
+  await refreshStatus(context, client)
 }
 
 /** Remove an exit, asking about a Vercel project when there is one. */
@@ -1023,9 +1261,19 @@ async function transferConfig(context: Context, client: RelayClient): Promise<vo
 }
 
 /** Deploy a new relay to one region, or several at once. */
-async function deployRelay(context: Context, client: RelayClient, status: RelayStatus): Promise<void> {
-  if (status.accounts.length === 0) {
-    context.ui.toast.show({ title: "Relay", message: "Add a Vercel account first.", variant: "warning" })
+async function deployRelay(context: Context, client: RelayClient): Promise<void> {
+  // Fresh state: the account list may have changed since the menu opened.
+  const refreshed = await refreshStatus(context, client)
+  const status = refreshed.ok ? refreshed.status : currentStatus()
+  if (!status || status.accounts.length === 0) {
+    // A deploy without an account was a dead end that threw the user out; the
+    // way out of the dead end is the thing the deploy needs.
+    const add = await context.ui.dialog.confirm({
+      title: "No Vercel account yet",
+      message: "Deploying a relay needs a Vercel account. Add one now?",
+      label: { confirm: "Add an account", cancel: "Not now" },
+    })
+    if (add) await addAccount(context, client)
     return
   }
   // One account is no choice at all, so the only account is used without a
@@ -1226,14 +1474,16 @@ async function addAccount(context: Context, client: RelayClient): Promise<void> 
 
 /** Forget an account. The relays deployed with it stay: they run on their own. */
 async function removeAccount(context: Context, client: RelayClient, status: RelayStatus): Promise<void> {
-  const choice = await context.ui.dialog.select<{ readonly id: string; readonly name: string }>({
+  // One account is no choice at all; the confirmation is the only question.
+  const only = status.accounts.length === 1 ? status.accounts[0] : undefined
+  const choice = only ?? (await context.ui.dialog.select<{ readonly id: string; readonly name: string }>({
     title: "Remove which account?",
     options: status.accounts.map((item) => ({
       title: item.name,
       value: { id: item.id, name: item.name },
       description: item.plan ? `Plan: ${item.plan}` : undefined,
     })),
-  })
+  }))
   if (choice === undefined) return
   const sure = await context.ui.dialog.confirm({
     title: `Remove ${choice.name}?`,

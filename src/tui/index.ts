@@ -21,22 +21,44 @@ export default Plugin.define({
       })
     }
 
+    // The theme speaks in color roles; the pill needs four of them. Not every
+    // build of the theme has every key, so each one falls back to a color
+    // that keeps the pill legible rather than crashing the footer.
+    const theme = context.theme as unknown as Record<string, string | undefined>
+    const colors = {
+      textMuted: theme.textMuted ?? "#6c6c6c",
+      warning: theme.warning ?? "#e5c07b",
+      error: theme.error ?? "#e06c75",
+      info: theme.info ?? "#61afef",
+    }
+
     // The pill and the menu share one snapshot, so the footer can never claim
     // something different from the dialog the user just used.
     const releaseSlot = context.ui.slot({
       append: "prompt.footer.status",
-      render: () => renderRelayPill(openMenu),
+      render: () =>
+        renderRelayPill(
+          {
+            muted: colors.textMuted,
+            warning: colors.warning,
+            error: colors.error,
+            info: colors.info,
+          },
+          openMenu,
+        ),
     })
 
-    // The command palette entry opens the menu directly.
+    // The command palette entry opens the menu directly. alt+r is the global
+    // shortcut: ctrl+r is the host's session rename and cannot be taken.
     context.keymap.layer(() => ({
       commands: [
         {
           id: "relay",
           title: "Relay",
-          description: "Route OpenCode's free models through a relay of your own",
+          description: "Route OpenCode's free models through relays and proxies you control.",
           group: "Relay",
           palette: true,
+          bind: "alt+r",
           run: openMenu,
         },
       ],
