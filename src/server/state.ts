@@ -208,6 +208,16 @@ export class RelayState {
     this.relayList = relays.map((relay) => this.fresh(relay))
     this.proxyList = proxies.map((proxy) => this.fresh(proxy))
     this.rules = settings ?? { ...DEFAULT_SETTINGS, customModels: [] }
+    // A live failure's rest was written with its status, so a restart picks it
+    // back up: `usable()` needs the entry to see both that the exit failed
+    // live and when the rest is over. An entry whose rest has already passed
+    // is restored too — without it a recorded failure would look like a test
+    // verdict, and only another test could clear it. A record without the
+    // fields holds a test verdict only, and leaves the map alone.
+    for (const exit of [...this.relayList, ...this.proxyList]) {
+      if (exit.coolingUntil === undefined) continue
+      this.cooling.set(exit.id, { until: exit.coolingUntil, failures: exit.failures ?? 0 })
+    }
     const expired = [...this.relayList, ...this.proxyList].some(
       (exit) => exit.status === "exhausted" && (exit.exhaustedUntil ?? 0) <= Date.now(),
     )
@@ -364,14 +374,30 @@ export class RelayState {
     const current = this.proxy(id)
     if (!current) return undefined
     const urlChanged = input.url !== undefined && input.url !== current.url
-    // A new address is a new exit: the old reset time belongs to a machine that
-    // is no longer behind this entry.
-    const { exhaustedUntil: _until, ...reset } = current
-    const next: ProxyRecord = {
-      ...(urlChanged ? reset : current),
-      ...(input.name !== undefined ? { name: input.name } : {}),
-      ...(input.url !== undefined ? { url: input.url } : {}),
-      ...(urlChanged ? { status: "untested" as Status, enabled: true } : {}),
+    let next: ProxyRecord
+    if (urlChanged && input.url !== undefined) {
+      // A new address is a new exit: the verdicts, measurements and resting
+      // state the old record gathered belong to a machine that is no longer
+      // behind this entry, so the record starts over untested.
+      next = {
+        kind: "proxy",
+        id,
+        name: input.name ?? current.name,
+        url: input.url,
+        enabled: current.enabled,
+        status: "untested" as Status,
+        createdAt: current.createdAt,
+      }
+    } else {
+      // The rest goes with the memory entry this write deletes: a record that
+      // kept `coolingUntil` beside a cleared map would put the rest back on
+      // the next restart. Every other field stays as it is.
+      const { coolingUntil: _cooling, failures: _failures, ...kept } = current
+      next = {
+        ...kept,
+        ...(input.name !== undefined ? { name: input.name } : {}),
+        ...(input.url !== undefined ? { url: input.url } : {}),
+      }
     }
     this.proxyList = this.proxyList.map((proxy) => (proxy.id === id ? next : proxy))
     this.cooling.delete(id)
@@ -404,8 +430,16 @@ export class RelayState {
     }
     const checkedAt = update.checkedAt ?? Date.now()
     // A stale reset time would keep a record looking used up after a test
-    // proved it works again, so it only travels with an exhausted status.
-    const { exhaustedUntil: previousUntil, ...rest } = current
+    // proved it works again, so it only travels with an exhausted status. The
+    // live rest is dropped with it for every verdict: a test verdict governs
+    // alone, so a `bad` one still stays retired until another test, and a
+    // restart must not resurrect a rest the test has just superseded.
+    const {
+      exhaustedUntil: previousUntil,
+      coolingUntil: _cooling,
+      failures: _failures,
+      ...rest
+    } = current
     const until = update.exhaustedUntil ?? previousUntil
     const next: ExitRecord = {
       ...rest,
@@ -417,9 +451,12 @@ export class RelayState {
       ...(update.lastError !== undefined ? { lastError: update.lastError } : {}),
       ...(update.status === "exhausted" && until !== undefined ? { exhaustedUntil: until } : {}),
     }
-    if (update.status === "ready" || update.status === "reachable") {
-      this.cooling.delete(id)
-    }
+    // A verdict from a test or a probe supersedes whatever live rest was
+    // armed: the record it writes carries no rest fields, and the in-memory
+    // entry goes with it, for every status. A `bad` verdict then governs
+    // alone — retired until another test — instead of reviving when an older
+    // live rest happens to run out.
+    this.cooling.delete(id)
     await this.replaceExit(next)
     return (
       current.status !== next.status ||
@@ -447,8 +484,9 @@ export class RelayState {
   async setExitEnabled(id: string, enabled: boolean): Promise<boolean> {
     const current = this.exit(id)
     if (!current) return false
+    // Pausing is not a health verdict, so the rest is left alone: resuming,
+    // here or after a restart, finds the exit still resting out its failure.
     const next: ExitRecord = { ...current, enabled }
-    if (!enabled) this.cooling.delete(id)
     await this.replaceExit(next)
     return true
   }
@@ -463,10 +501,15 @@ export class RelayState {
     const exit = this.exit(id)
     if (!exit) return
     this.bumpHealthEpoch(id)
-    this.cooling.set(id, { until, failures: this.cooling.get(id)?.failures ?? 0 })
+    const failures = this.cooling.get(id)?.failures ?? 0
+    this.cooling.set(id, { until, failures })
+    // The rest is written with the status, so a restart keeps waiting it out
+    // instead of serving before the cooldown has ended.
     const next: ExitRecord = {
       ...exit,
       status: "limited",
+      coolingUntil: until,
+      failures,
       ...(note !== undefined ? { lastError: note.slice(0, 240) } : {}),
     }
     void this.replaceExit(next).catch(() => {})
@@ -479,10 +522,12 @@ export class RelayState {
     this.bumpHealthEpoch(id)
     // A refusal is a live failure like any other: rest the exit briefly instead
     // of retiring it, so the next request can prove the refusal has passed.
-    this.rest(id)
+    const rested = this.rest(id)
     const next: ExitRecord = {
       ...exit,
       status: "blocked",
+      coolingUntil: rested.until,
+      failures: rested.failures,
       ...(note !== undefined ? { lastError: note.slice(0, 240) } : {}),
     }
     void this.replaceExit(next).catch(() => {})
@@ -728,13 +773,18 @@ export class RelayState {
    * keeps failing should not be tried on every request.
    */
   markFailure(id: string, note?: string, status: ExitStatus = "unreachable"): void {
-    this.rest(id)
+    const rested = this.rest(id)
     const exit = this.exit(id)
     if (exit) {
       this.bumpHealthEpoch(id)
+      // The rest is written with the status in one replaceExit, so a crash
+      // cannot persist a live failure whose rest is lost: a restart would
+      // otherwise read the failure as a test verdict and skip the exit forever.
       const next: ExitRecord = {
         ...exit,
         status,
+        coolingUntil: rested.until,
+        failures: rested.failures,
         ...(note !== undefined ? { lastError: note.slice(0, 240) } : {}),
       }
       void this.replaceExit(next).catch(() => {})
@@ -742,11 +792,13 @@ export class RelayState {
   }
 
   /** Arm the next rest for this exit, twice as long as the one before. */
-  private rest(id: string): void {
+  private rest(id: string): { until: number; failures: number } {
     const previous = this.cooling.get(id)?.failures ?? 0
     const failures = previous + 1
     const wait = Math.min(COOLDOWN_BASE_MS * 2 ** (failures - 1), COOLDOWN_MAX_MS)
-    this.cooling.set(id, { until: Date.now() + wait, failures })
+    const entry = { until: Date.now() + wait, failures }
+    this.cooling.set(id, entry)
+    return entry
   }
 
   /** How long this exit has been failing, for a note. */
@@ -812,15 +864,39 @@ export class RelayState {
     // of date. The tester stamps an epoch when its check starts, so its own
     // answer was never in flight against this verdict; only an older check is.
     this.bumpHealthEpoch(id)
-    // The in-memory record is what the menu and the fastest strategy read. A
-    // write per successful request would be a lot of disk traffic for a field
-    // that a restart can afford to find slightly stale.
+    // A success after a failure has to be remembered: the record on disk still
+    // carries the failure verdict and its rest, and a restart would read it
+    // back and sideline an exit that just served a request. When the record is
+    // already clean, later successes only update memory, so a healthy stretch
+    // is not a disk write per request.
+    if (
+      exit.status !== "ready" ||
+      exit.coolingUntil !== undefined ||
+      exit.failures !== undefined ||
+      exit.exhaustedUntil !== undefined
+    ) {
+      // The keys are removed rather than set to null-ish, so the stored JSON
+      // keeps its optional fields optional.
+      const {
+        exhaustedUntil: _until,
+        coolingUntil: _cooling,
+        failures: _failures,
+        ...cleared
+      } = exit
+      const next: ExitRecord = {
+        ...cleared,
+        status: "ready",
+        lastCheck: Date.now(),
+        ...(measured !== undefined ? { latencyMs: measured } : {}),
+      }
+      void this.replaceExit(next).catch(() => {})
+      return
+    }
+    // The in-memory record is what the menu and the fastest strategy read.
     const next: ExitRecord = {
       ...exit,
-      status: "ready",
       lastCheck: Date.now(),
       ...(measured !== undefined ? { latencyMs: measured } : {}),
-      ...(exit.exhaustedUntil !== undefined ? { exhaustedUntil: undefined } : {}),
     }
     if (next.kind === "relay") {
       this.relayList = this.relayList.map((relay) => (relay.id === id ? next : relay))
@@ -908,7 +984,7 @@ export class RelayState {
       // The reset has passed: the exit is worth trying again. It is not called
       // ready until something answers through it.
       for (const exit of expired) {
-        const { exhaustedUntil: _until, ...rest } = exit
+        const { exhaustedUntil: _until, coolingUntil: _cooling, failures: _failures, ...rest } = exit
         const next: ExitRecord = { ...rest, status: "reachable" }
         if (next.kind === "relay") {
           this.relayList = this.relayList.map((relay) => (relay.id === exit.id ? next : relay))
@@ -937,14 +1013,14 @@ export class RelayState {
       if (relay.status !== "exhausted") return relay
       restored.push(relay.id)
       this.cooling.delete(relay.id)
-      const { exhaustedUntil: _until, ...rest } = relay
+      const { exhaustedUntil: _until, coolingUntil: _cooling, failures: _failures, ...rest } = relay
       return { ...rest, status: "reachable" as Status }
     })
     this.proxyList = this.proxyList.map((proxy) => {
       if (proxy.status !== "exhausted") return proxy
       restored.push(proxy.id)
       this.cooling.delete(proxy.id)
-      const { exhaustedUntil: _until, ...rest } = proxy
+      const { exhaustedUntil: _until, coolingUntil: _cooling, failures: _failures, ...rest } = proxy
       return { ...rest, status: "reachable" as Status }
     })
     this.cursor = 0

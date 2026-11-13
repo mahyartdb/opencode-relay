@@ -42,6 +42,25 @@ describe("parseProxyList", () => {
     expect(proxy?.password).toBeUndefined()
   })
 
+  test("never alters a password that ends in a dot", () => {
+    const proxy = parseProxyUrl("1.2.3.4:8080:user:pass.")
+
+    expect(proxy?.password).toBe("pass.")
+    expect(proxy?.url).toBe("http://user:pass.@1.2.3.4:8080")
+
+    // Prose around an address can no longer be silently repaired either: the
+    // dot may belong to the password, so the entry is refused with a reason
+    // instead of being edited into a different credential.
+    const prose = parseProxyList("use 1.2.3.4:8080.")
+    expect(prose.proxies).toEqual([])
+    expect(prose.invalid.map((entry) => entry.reason)).toEqual(["expected host:port", "expected host:port"])
+  })
+
+  test("still strips list punctuation around a bare address", () => {
+    expect(parseProxyUrl("1.2.3.4:8080,")?.port).toBe(8080)
+    expect(parseProxyUrl("<1.2.3.4:8080>")?.port).toBe(8080)
+  })
+
   test("reads host:port@user:pass in either order", () => {
     expect(parseProxyUrl("1.2.3.4:8080@bob:secret")?.url).toBe(
       "http://bob:secret@1.2.3.4:8080",
@@ -49,6 +68,64 @@ describe("parseProxyList", () => {
     expect(parseProxyUrl("bob:secret@1.2.3.4:8080")?.url).toBe(
       "http://bob:secret@1.2.3.4:8080",
     )
+  })
+
+  test("keeps a separator inside a password instead of splitting the token", () => {
+    const parsed = parseProxyList(`
+      socks5://user:p;ss@host:1080
+    `)
+
+    expect(parsed.invalid).toEqual([])
+    expect(parsed.proxies).toHaveLength(1)
+    expect(parsed.proxies[0]?.username).toBe("user")
+    expect(parsed.proxies[0]?.password).toBe("p;ss")
+    expect(parsed.proxies[0]?.url).toBe("socks5://user:p%3Bss@host:1080")
+  })
+
+  test("keeps a comma inside a password", () => {
+    const proxy = parseProxyUrl("http://user:p,ss@host:8080")
+
+    expect(proxy?.url).toBe("http://user:p%2Css@host:8080")
+    expect(proxy?.password).toBe("p,ss")
+  })
+
+  test("splits scheme'd addresses without credentials at separators", () => {
+    const comma = parseProxyList("http://1.2.3.4:8080,http://5.6.7.8:8080")
+
+    expect(comma.invalid).toEqual([])
+    expect(comma.proxies.map((proxy) => proxy.url)).toEqual([
+      "http://1.2.3.4:8080",
+      "http://5.6.7.8:8080",
+    ])
+  })
+
+  test("splits semicolon and space separated scheme'd addresses without credentials", () => {
+    const semicolon = parseProxyList("socks5://1.2.3.4:1080; socks5://5.6.7.8:1080")
+
+    expect(semicolon.invalid).toEqual([])
+    expect(semicolon.proxies.map((proxy) => proxy.url)).toEqual([
+      "socks5://1.2.3.4:1080",
+      "socks5://5.6.7.8:1080",
+    ])
+
+    const space = parseProxyList("socks5://1.2.3.4:1080 socks5://5.6.7.8:1080")
+
+    expect(space.invalid).toEqual([])
+    expect(space.proxies.map((proxy) => proxy.url)).toEqual([
+      "socks5://1.2.3.4:1080",
+      "socks5://5.6.7.8:1080",
+    ])
+  })
+
+  test("keeps passwords whole next to a credential-less address on the same line", () => {
+    const parsed = parseProxyList("socks5://user:p;ss@host:1080, http://5.6.7.8:8080")
+
+    expect(parsed.invalid).toEqual([])
+    expect(parsed.proxies).toHaveLength(2)
+    expect(parsed.proxies[0]?.username).toBe("user")
+    expect(parsed.proxies[0]?.password).toBe("p;ss")
+    expect(parsed.proxies[0]?.url).toBe("socks5://user:p%3Bss@host:1080")
+    expect(parsed.proxies[1]?.url).toBe("http://5.6.7.8:8080")
   })
 
   test("keeps IPv6 addresses in brackets", () => {
@@ -81,6 +158,50 @@ describe("parseProxyList", () => {
       "http://5.6.7.8:8002",
       "http://9.9.9.9:8003",
     ])
+  })
+
+  test("reports each JSON entry it cannot convert, in order", () => {
+    const parsed = parseProxyList(
+      JSON.stringify([{ host: "1.2.3.4" }, { host: "5.6.7.8", port: 8080 }]),
+    )
+
+    expect(parsed.proxies.map((proxy) => proxy.url)).toEqual(["http://5.6.7.8:8080"])
+    expect(parsed.invalid).toEqual([
+      { value: '{"host":"1.2.3.4"}', reason: "the JSON entry has no port" },
+    ])
+  })
+
+  test("an all-bad JSON list reports every entry instead of re-reading the text", () => {
+    const parsed = parseProxyList(
+      JSON.stringify([{ host: "1.2.3.4" }, { port: 8080 }]),
+    )
+
+    expect(parsed.proxies).toEqual([])
+    expect(parsed.invalid).toEqual([
+      { value: '{"host":"1.2.3.4"}', reason: "the JSON entry has no port" },
+      { value: '{"port":8080}', reason: "the JSON entry has no host" },
+    ])
+  })
+
+  test("a failed JSON entry with credentials reports them replaced", () => {
+    const parsed = parseProxyList(
+      JSON.stringify([{ host: "1.2.3.4", username: "alice", password: "s3cret" }]),
+    )
+
+    expect(parsed.proxies).toEqual([])
+    expect(parsed.invalid).toHaveLength(1)
+    expect(parsed.invalid[0]?.reason).toBe("the JSON entry has no port")
+    expect(parsed.invalid[0]?.value).not.toContain("alice")
+    expect(parsed.invalid[0]?.value).not.toContain("s3cret")
+    expect(parsed.invalid[0]?.value).toContain('"username":"***"')
+    expect(parsed.invalid[0]?.value).toContain('"password":"***"')
+  })
+
+  test("JSON that is neither a list nor an object is still read as text", () => {
+    const parsed = parseProxyList(JSON.stringify("hello"))
+
+    expect(parsed.proxies).toEqual([])
+    expect(parsed.invalid[0]?.reason).toContain("host:port")
   })
 
   test("counts duplicates once, whatever their spelling", () => {

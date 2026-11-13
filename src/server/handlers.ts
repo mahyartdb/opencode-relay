@@ -130,14 +130,37 @@ function describeState(options: {
   }
   const otherSkipped = skipped.filter((id) => id !== active?.id)
   if (otherSkipped.length > 0) {
-    const names = otherSkipped
-      .map((id) => exits.find((exit) => exit.id === id)?.name)
-      .filter((name): name is string => name !== undefined)
-    if (names.length > 0) {
+    // Why each skipped exit sits out, in words. The exhausted ones are already
+    // counted in their own sentence above, so they are left out here rather
+    // than reported twice. The active exit was handled further up: it is the
+    // one another exit takes over from.
+    const counted = new Set(exhausted)
+    const paused: string[] = []
+    const limited: string[] = []
+    const untested: string[] = []
+    const silent: string[] = []
+    for (const id of otherSkipped) {
+      if (counted.has(id)) continue
+      const exit = exits.find((entry) => entry.id === id)
+      if (exit === undefined) continue
+      if (!exit.enabled) paused.push(exit.name)
+      else if (exit.status === "limited") limited.push(exit.name)
+      else if (exit.status === "exhausted") continue
+      else if (exit.status === "untested" || exit.status === "unknown") untested.push(exit.name)
+      else silent.push(exit.name)
+    }
+    const groups: Array<{ readonly verdict: readonly [string, string]; readonly names: readonly string[] }> = [
+      { verdict: ["is paused", "are paused"], names: paused },
+      { verdict: ["is rate-limited", "are rate-limited"], names: limited },
+      { verdict: ["has not been tested yet", "have not been tested yet"], names: untested },
+      { verdict: ["did not answer", "did not answer"], names: silent },
+    ]
+    for (const { verdict, names } of groups) {
+      if (names.length === 0) continue
       problems.push(
         names.length === 1
-          ? `${names[0]} did not answer, so it is skipped.`
-          : `${names.join(", ")} did not answer, so they are skipped.`,
+          ? `${names[0]} ${verdict[0]}, so it is skipped.`
+          : `${names.join(", ")} ${verdict[1]}, so they are skipped.`,
       )
     }
   }
@@ -584,6 +607,8 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
           await state.setHealth(relay.id, {
             status: probe.reachable ? "reachable" : "unreachable",
             latencyMs: probe.ms,
+            ...(probe.egress !== undefined ? { egress: probe.egress } : {}),
+            ...(probe.runtime !== undefined ? { runtime: probe.runtime } : {}),
             checkedAt,
             healthEpoch,
           })
@@ -595,8 +620,10 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
             message: redact(describe(err), [account.token, relay.access]),
           })
         }
-        await announce("relays updated")
       }
+      // One announce for the whole batch, like deployRelays: per-relay
+      // announcements would flood the conversation with refreshes.
+      if (updated > 0) await announce("relays updated")
       return { updated, failed }
     },
 
@@ -840,7 +867,6 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
               ? `${pick.reason} The plugin is set to never go direct, so the request fails.`
               : `${pick.reason} The request goes direct.`,
           direct: settings.direct,
-          ...(exit !== undefined ? { exit } : {}),
           skipped,
         }
       }

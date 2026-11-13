@@ -1,4 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test"
+import net from "node:net"
+import tls from "node:tls"
+import { readFileSync } from "node:fs"
 import type { RelayRecord } from "../src/lib/types.ts"
 import { RelayState } from "../src/server/state.ts"
 import { Tester } from "../src/server/tester.ts"
@@ -36,6 +39,91 @@ function memoryStorage() {
     },
     scan: async () => ({ entries: [] }),
   }
+}
+
+/**
+ * The certificate a tunnel stub presents for the upstream host, and the raw
+ * net-server helpers the SOCKS stubs need. The pair is generated once per run
+ * into this file's directory, so no fixture file is needed.
+ */
+let tlsStubPartsPromise:
+  | {
+      KEY: string
+      CERT: string
+      stubServer: (onData: (socket: net.Socket) => void) => Promise<{
+        server: net.Server
+        port: number
+      }>
+      closeServer: (server: net.Server) => Promise<void>
+    }
+  | undefined
+
+async function tlsStubParts() {
+  if (tlsStubPartsPromise) return tlsStubPartsPromise
+  // Bun can mint a key pair itself, but not an X.509 certificate, so the pair
+  // is signed with whatever openssl the machine has. Git for Windows bundles
+  // one even when PATH does not.
+  const candidates = [
+    "openssl",
+    "C:\\Program Files\\Git\\usr\\bin\\openssl.exe",
+    "C:\\Program Files (x86)\\Git\\usr\\bin\\openssl.exe",
+  ]
+  let pem = ""
+  for (const candidate of candidates) {
+    let out = ""
+    try {
+      const proc = Bun.spawnSync([
+        candidate,
+        "req",
+        "-x509",
+        "-newkey",
+        "rsa:2048",
+        "-keyout",
+        "-",
+        "-out",
+        "-",
+        "-days",
+        "30",
+        "-nodes",
+        "-subj",
+        "/CN=opencode.ai",
+        "-addext",
+        "subjectAltName=DNS:opencode.ai",
+      ])
+      out = new TextDecoder().decode(proc.stdout)
+    } catch {
+      continue
+    }
+    if (out.includes("-----BEGIN CERTIFICATE-----")) {
+      pem = out
+      break
+    }
+  }
+  if (!pem) throw new Error("no openssl could mint the stub certificate")
+  const split = pem.indexOf("-----BEGIN CERTIFICATE-----")
+  const parts = {
+    KEY: pem.slice(0, split),
+    CERT: pem.slice(split),
+    stubServer: netStubServer,
+    closeServer: netCloseServer,
+  }
+  tlsStubPartsPromise = parts
+  return parts
+}
+
+function netStubServer(onData: (socket: net.Socket) => void) {
+  return new Promise<{ server: net.Server; port: number }>((resolve) => {
+    const server = net.createServer(onData)
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address()
+      if (address === null || typeof address === "string") throw new Error("the stub has no port")
+      resolve({ server, port: address.port })
+    })
+  })
+}
+
+async function netCloseServer(server: net.Server): Promise<void> {
+  await new Promise<void>((resolve) => server.close(() => resolve()))
 }
 
 /** A tester pointed at a local server that stands in for the relay. */
@@ -428,5 +516,108 @@ describe("a ping", () => {
     // released, which would let it overwrite a verdict that arrived while it
     // was waiting.
     expect(lastCheck as number).toBeLessThan(releasedAt)
+  })
+})
+
+describe("a proxy ping", () => {
+  /** A proxy exit record pointing at a loopback SOCKS bridge that was made earlier. */
+  function proxyExit(url: string) {
+    return {
+      kind: "proxy" as const,
+      id: "proxy-1",
+      name: "local proxy",
+      url,
+      enabled: true,
+      status: "untested" as const,
+      createdAt: Date.now(),
+    }
+  }
+
+  /**
+   * A SOCKS5 upstream whose tunnel ends in a TLS endpoint answering like the
+   * trace service. The tunnel's TLS is ended by the stub itself with a
+   * self-signed certificate, so verification must be off while the test runs;
+   * the stub is closed afterwards.
+   */
+  async function traceStub(answer: () => { status: number; body: string }) {
+    const { closeServer, stubServer, KEY, CERT } = await tlsStubParts()
+    const server = await stubServer((socket) => {
+      let greeted = false
+      let replied = false
+      socket.on("data", (chunk: Buffer) => {
+        if (!greeted) {
+          greeted = true
+          socket.write(Buffer.from([0x05, 0x00]))
+          return
+        }
+        if (replied) return
+        replied = true
+        socket.write(Buffer.from([0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0x1f, 0x90]))
+        const tlsSocket = new tls.TLSSocket(socket, {
+          isServer: true,
+          key: KEY,
+          cert: CERT,
+        })
+        tlsSocket.on("data", (data: Buffer) => {
+          const text = data.toString("latin1")
+          if (text.startsWith("GET") || text.startsWith("POST")) {
+            const { status, body } = answer()
+            tlsSocket.write(
+              `HTTP/1.1 ${status} x\r\ncontent-type: text/plain\r\n\r\n${body}`,
+            )
+            tlsSocket.end()
+          }
+        })
+        tlsSocket.on("error", () => {})
+      })
+    })
+    return {
+      port: server.port,
+      stop: async () => {
+        await closeServer(server.server)
+      },
+    }
+  }
+
+  test("a trace answer makes the proxy reachable", async () => {
+    const stub = await traceStub(() => ({ status: 200, body: "ip=203.0.113.7\n" }))
+    const made = await setup(() => new Response("{}", { status: 200 }))
+    await made.state.addProxy(proxyExit(`socks5://127.0.0.1:${stub.port}`))
+    const previousTls = process.env.NODE_TLS_REJECT_UNAUTHORIZED
+    process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0"
+    try {
+      const result = await made.tester.test("proxy-1", "ping")
+      expect(result.ok).toBe(true)
+      expect(result.status).toBe("reachable")
+      expect(result.code).toBe(200)
+      expect(result.egress).toBe("203.0.113.7")
+    } finally {
+      if (previousTls === undefined) delete process.env.NODE_TLS_REJECT_UNAUTHORIZED
+      else process.env.NODE_TLS_REJECT_UNAUTHORIZED = previousTls
+      await stub.stop()
+    }
+  })
+
+  test("a 200 without the trace body is not a reachable proxy", async () => {
+    const stub = await traceStub(() => ({
+      status: 200,
+      body: "<html>Welcome to the captive portal</html>",
+    }))
+    const made = await setup(() => new Response("{}", { status: 200 }))
+    await made.state.addProxy(proxyExit(`socks5://127.0.0.1:${stub.port}`))
+    const previousTls = process.env.NODE_TLS_REJECT_UNAUTHORIZED
+    process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0"
+    try {
+      const result = await made.tester.test("proxy-1", "ping")
+      expect(result.ok).toBe(false)
+      expect(result.status).toBe("unreachable")
+      expect(result.code).toBe(200)
+      expect(result.note).toBe("The proxy answered with HTTP 200 but not with the expected trace.")
+      expect(made.state.exit("proxy-1")?.status).toBe("unreachable")
+    } finally {
+      if (previousTls === undefined) delete process.env.NODE_TLS_REJECT_UNAUTHORIZED
+      else process.env.NODE_TLS_REJECT_UNAUTHORIZED = previousTls
+      await stub.stop()
+    }
   })
 })

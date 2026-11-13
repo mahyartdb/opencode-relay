@@ -58,6 +58,10 @@ const HealthFields = {
   runtime: Schema.optionalKey(Schema.String),
   lastError: Schema.optionalKey(Schema.String),
   exhaustedUntil: Schema.optionalKey(Schema.Number),
+  // A live failure's rest, written with the status so a restart does not
+  // retire the exit all over again. Absent when only a test is on record.
+  coolingUntil: Schema.optionalKey(Schema.Number),
+  failures: Schema.optionalKey(Schema.Number),
   createdAt: Schema.Number,
 }
 
@@ -85,13 +89,16 @@ const StoredProxy = Schema.Struct({
 
 /** The stored shape of the routing rules. */
 const StoredSettings = Schema.Struct({
-  enabled: Schema.Boolean,
-  selection: Schema.Literals(["all", "free", "custom"]),
+  // A file written by hand or by an older version may be missing any of the
+  // first three; readSettings fills in what a fresh installation starts with
+  // instead of dropping every saved choice.
+  enabled: Schema.optionalKey(Schema.Boolean),
+  selection: Schema.optionalKey(Schema.Literals(["all", "free", "custom"])),
   // Written before the strategies existed, so a stored value may not have it.
   strategy: Schema.optionalKey(
     Schema.Literals(["fixed", "round-robin", "exhausted", "fastest"]),
   ),
-  customModels: Schema.Array(Schema.String),
+  customModels: Schema.optionalKey(Schema.Array(Schema.String)),
   // The field was called activeRelayId before proxies existed.
   activeExitId: Schema.optionalKey(Schema.String),
   activeRelayId: Schema.optionalKey(Schema.String),
@@ -108,6 +115,8 @@ type StoredHealth = {
   readonly runtime?: string
   readonly lastError?: string
   readonly exhaustedUntil?: number
+  readonly coolingUntil?: number
+  readonly failures?: number
   readonly createdAt: number
 }
 
@@ -128,6 +137,8 @@ function healthJson(exit: StoredHealth): Record<string, Schema.Json> {
   if (exit.runtime !== undefined) json.runtime = exit.runtime
   if (exit.lastError !== undefined) json.lastError = exit.lastError
   if (exit.exhaustedUntil !== undefined) json.exhaustedUntil = exit.exhaustedUntil
+  if (exit.coolingUntil !== undefined) json.coolingUntil = exit.coolingUntil
+  if (exit.failures !== undefined) json.failures = exit.failures
   return json
 }
 
@@ -141,6 +152,8 @@ function healthOf(stored: StoredHealth): {
   runtime?: string
   lastError?: string
   exhaustedUntil?: number
+  coolingUntil?: number
+  failures?: number
 } {
   return {
     enabled: stored.enabled ?? true,
@@ -152,6 +165,8 @@ function healthOf(stored: StoredHealth): {
     ...(stored.runtime !== undefined ? { runtime: stored.runtime } : {}),
     ...(stored.lastError !== undefined ? { lastError: stored.lastError } : {}),
     ...(stored.exhaustedUntil !== undefined ? { exhaustedUntil: stored.exhaustedUntil } : {}),
+    ...(stored.coolingUntil !== undefined ? { coolingUntil: stored.coolingUntil } : {}),
+    ...(stored.failures !== undefined ? { failures: stored.failures } : {}),
   }
 }
 
@@ -299,12 +314,12 @@ export async function readSettings(storage: StorageDomain): Promise<Settings | u
   const settings = decoded.value
   const activeExitId = settings.activeExitId ?? settings.activeRelayId
   return {
-    enabled: settings.enabled,
+    enabled: settings.enabled ?? false,
     // "all" predates the free-only rule. It is read as "free", which is what
     // the plugin would have routed anyway once paid models were filtered out.
-    selection: (settings.selection === "all" ? "free" : settings.selection) as Selection,
+    selection: (settings.selection === "all" ? "free" : (settings.selection ?? "free")) as Selection,
     strategy: (settings.strategy ?? "fixed") as Strategy,
-    customModels: [...settings.customModels],
+    customModels: [...(settings.customModels ?? [])],
     direct: (settings.direct ?? "allow") as DirectPolicy,
     healthChecks: settings.healthChecks ?? true,
     ...(activeExitId !== undefined ? { activeExitId } : {}),

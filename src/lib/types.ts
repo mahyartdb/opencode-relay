@@ -194,6 +194,10 @@ export interface ExitHealth {
   readonly lastError?: string
   /** When a used-up exit is worth trying again. */
   readonly exhaustedUntil?: number
+  /** When a live failure's rest ends. Persisted with the status, so a restart keeps the rest. */
+  readonly coolingUntil?: number
+  /** How many consecutive live failures armed the current rest. */
+  readonly failures?: number
   readonly createdAt: number
 }
 

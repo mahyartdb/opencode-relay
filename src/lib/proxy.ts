@@ -166,8 +166,10 @@ function readToken(
   invalid: (value: string, reason: string) => void,
 ): void {
   let value = token.trim()
-  // Surrounding punctuation from a list, a CSV cell or a chat message.
-  value = value.replace(/^[<("'`]+/, "").replace(/[>)"'`,.;]+$/, "")
+  // Surrounding punctuation from a list, a CSV cell or a chat message. A dot
+  // or a semicolon is not punctuation here: it may be the last character of a
+  // password, and eating it would store a credential that was never typed.
+  value = value.replace(/^[<("'`]+/, "").replace(/[>)"'`,]+$/, "")
   if (value.length === 0) return
   if (value.startsWith("//")) return
 
@@ -291,18 +293,20 @@ function finish(
   add(proxy)
 }
 
-/** Turn one JSON entry into a token the text parser understands. */
-function jsonEntry(item: unknown): string | undefined {
+/** Turn one JSON entry into a token, or say why it cannot be one. */
+function jsonEntry(item: unknown): string | { readonly reason: string } {
   if (typeof item === "string") return item
-  if (!item || typeof item !== "object") return undefined
+  if (!item || typeof item !== "object") {
+    return { reason: "the JSON entry is not a proxy object or an address string" }
+  }
   const record = item as Record<string, unknown>
   const url = record["url"] ?? record["proxy"] ?? record["address"]
   if (typeof url === "string" && url.length > 0) return url
   const host = record["host"] ?? record["ip"] ?? record["server"] ?? record["hostname"]
-  if (typeof host !== "string" || host.length === 0) return undefined
+  if (typeof host !== "string" || host.length === 0) return { reason: "the JSON entry has no host" }
   const port = record["port"] ?? record["proxy_port"] ?? record["portNumber"]
   const portText = typeof port === "number" ? String(port) : typeof port === "string" ? port : ""
-  if (portText.length === 0) return undefined
+  if (portText.length === 0) return { reason: "the JSON entry has no port" }
   const protocol = record["protocol"] ?? record["type"] ?? record["scheme"] ?? record["protocols"]
   const scheme = typeof protocol === "string" ? protocol.split(",")[0]?.trim().toLowerCase() : ""
   const prefix = scheme && SCHEMES[scheme] ? `${SCHEMES[scheme]}://` : ""
@@ -315,17 +319,100 @@ function jsonEntry(item: unknown): string | undefined {
   return `${prefix}${auth}${host}:${portText}`
 }
 
-/** Tokens from a paste: JSON, lines, commas, semicolons and plain spaces. */
-function tokens(text: string): string[] {
+/** Show a failed JSON entry with its credential fields replaced. */
+function redactJsonEntry(item: unknown): string {
+  if (item !== null && typeof item === "object" && !Array.isArray(item)) {
+    const record = { ...(item as Record<string, unknown>) }
+    for (const key of ["username", "user", "password", "pass"]) {
+      if (typeof record[key] === "string") record[key] = "***"
+    }
+    return JSON.stringify(record)
+  }
+  return JSON.stringify(item)
+}
+
+/** An entry refused before it could become a token, with its reason. */
+interface RefusedToken {
+  readonly value: string
+  readonly reason: string
+}
+
+/**
+ * Whether an `@` still closes credentials ahead of a separator position.
+ *
+ * It must do so before the next separator and before the `://` that would
+ * start the next scheme'd address: otherwise the `@` belongs to a later
+ * token, and the separator here ends this one. A scheme'd address without
+ * credentials has no `@` at all, so its separators split the line.
+ */
+function credentialsAhead(line: string, from: number): boolean {
+  const rest = line.slice(from + 1)
+  const at = rest.indexOf("@")
+  if (at < 0) return false
+  const separator = rest.search(/[\s,;]/)
+  if (separator >= 0 && at > separator) return false
+  const scheme = rest.indexOf("://")
+  return scheme < 0 || at < scheme
+}
+
+/**
+ * Split a line at whitespace, commas and semicolons, but not inside
+ * credentials.
+ *
+ * A separator after `scheme://` but before the `@` that closes the
+ * credentials belongs to the password, so it stays in the token — but only
+ * when an `@` really does close credentials ahead of the separator; once the
+ * `@` has been seen, separators split the line again. A bare `host:port`
+ * token splits as before.
+ */
+function splitLine(line: string): string[] {
+  const parts: string[] = []
+  let current = ""
+  let scheme = false
+  let credentials = false
+  for (let index = 0; index < line.length; index += 1) {
+    const char = line[index] ?? ""
+    if (char === ":" && !scheme && line.slice(index, index + 3) === "://") {
+      scheme = true
+    } else if (char === "@" && scheme) {
+      credentials = true
+    }
+    if (/[\s,;]/.test(char) && !(scheme && !credentials && credentialsAhead(line, index))) {
+      if (current.length > 0) parts.push(current)
+      current = ""
+      scheme = false
+      credentials = false
+      continue
+    }
+    current += char
+  }
+  if (current.length > 0) parts.push(current)
+  return parts
+}
+
+/**
+ * Tokens from a paste: JSON, lines, commas, semicolons and plain spaces.
+ *
+ * Once the text parses as JSON, every entry is accounted for — the ones that
+ * convert come back as tokens, the others as refusals with a reason — and the
+ * text is never read as a list again.
+ */
+function tokens(text: string): (string | RefusedToken)[] {
   const trimmed = text.trim()
   if (trimmed.startsWith("[") || trimmed.startsWith("{")) {
     try {
       const parsed = JSON.parse(trimmed) as unknown
-      const items = Array.isArray(parsed) ? parsed : [parsed]
-      const converted = items
-        .map((item) => jsonEntry(item))
-        .filter((item): item is string => item !== undefined)
-      if (converted.length > 0) return converted
+      if (Array.isArray(parsed) || (parsed !== null && typeof parsed === "object")) {
+        const items = Array.isArray(parsed) ? parsed : [parsed]
+        const entries: (string | RefusedToken)[] = []
+        for (const item of items) {
+          const entry = jsonEntry(item)
+          if (typeof entry === "string") entries.push(entry)
+          else entries.push({ value: redactJsonEntry(item), reason: entry.reason })
+        }
+        return entries
+      }
+      // Not a list or an object, so it is read as a list of lines.
     } catch {
       // Not JSON, so it is read as a list.
     }
@@ -337,7 +424,7 @@ function tokens(text: string): string[] {
     // inside a URL stays part of the URL and is stripped later.
     const withoutComment = line.replace(/(^|\s)#.*$/, "$1").trim()
     if (withoutComment.length === 0 || withoutComment.startsWith("//")) continue
-    tokens.push(...withoutComment.split(/[\s,;]+/).filter(Boolean))
+    tokens.push(...splitLine(withoutComment))
   }
   return tokens
 }
@@ -368,7 +455,10 @@ export function parseProxyList(text: string): ParsedProxyList {
     invalid.push({ value: value.slice(0, 120), reason })
   }
 
-  for (const token of tokens(text)) readToken(token, add, refuse)
+  for (const entry of tokens(text)) {
+    if (typeof entry === "string") readToken(entry, add, refuse)
+    else refuse(entry.value, entry.reason)
+  }
   return { proxies, invalid, duplicates }
 }
 

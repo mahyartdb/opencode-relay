@@ -81,6 +81,9 @@ const RELAY_HEADERS = new Set([
  */
 export function isFree(model: RoutableModel): boolean {
   if (!model.cost) return false
+  // An empty list would make `every` vacuously true; a model with no tiers at
+  // all is an unknown price, not a free one.
+  if (model.cost.length === 0) return false
   return model.cost.every((tier) => tier.input === 0 && tier.output === 0)
 }
 

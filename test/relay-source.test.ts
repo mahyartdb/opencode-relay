@@ -102,4 +102,26 @@ describe("projectName", () => {
   test("is deterministic", () => {
     expect(projectName({ region: "fra1", suffix: "team" })).toBe(projectName({ region: "fra1", suffix: "team" }))
   })
+
+  test("keeps the random tail of two long names in one region apart", () => {
+    // Two relays whose names are long enough to push the suffix against the
+    // 63-character limit: projectSuffix's random hex sits at the suffix's end,
+    // so it must survive truncation, or both relays track one project and
+    // deleting one relay deletes the project the other still runs on.
+    const first = projectName({ region: "fra1", suffix: `${"r".repeat(44)}a1b2c3` })
+    const second = projectName({ region: "fra1", suffix: `${"r".repeat(44)}d4e5f6` })
+    expect(first).not.toBe(second)
+    expect(first.length).toBeLessThanOrEqual(63)
+    expect(second.length).toBeLessThanOrEqual(63)
+    expect(first.endsWith("a1b2c3")).toBe(true)
+    expect(second.endsWith("d4e5f6")).toBe(true)
+  })
+
+  test("keeps the last six characters of a suffix longer than the room left", () => {
+    // The region alone nearly fills the whole name, so only six characters of
+    // the suffix fit: it is cut back to its end, where the random tail lives.
+    const name = projectName({ region: "e".repeat(47), suffix: `${"f".repeat(20)}1a2b3c` })
+    expect(name.length).toBeLessThanOrEqual(63)
+    expect(name.endsWith("1a2b3c")).toBe(true)
+  })
 })

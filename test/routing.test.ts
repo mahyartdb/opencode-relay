@@ -77,6 +77,16 @@ describe("isFree", () => {
     expect(isFree(unknownModel)).toBe(false)
   })
 
+  test("is false when the pricing list is empty", () => {
+    expect(
+      isFree({
+        id: "opencode/untiered",
+        name: "Untiered",
+        cost: [],
+      }),
+    ).toBe(false)
+  })
+
   test("is false when any tier costs something", () => {
     expect(isFree(paidModel)).toBe(false)
     expect(

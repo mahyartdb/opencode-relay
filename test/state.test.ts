@@ -34,6 +34,27 @@ async function makeState(): Promise<RelayState> {
   return state
 }
 
+/**
+ * One storage, many states: every new instance only knows what the last one
+ * wrote, so loading it is a real restart.
+ */
+async function makeRestartable() {
+  const memory = memoryStorage()
+  const spawn = async (): Promise<RelayState> => {
+    const state = new RelayState(memory as never)
+    await state.load()
+    return state
+  }
+  const state = await spawn()
+  const restart = async (): Promise<RelayState> => {
+    // Failure verdicts are written without being awaited, so give the pending
+    // writes a tick to land before the next process reads them.
+    await Bun.sleep(0)
+    return spawn()
+  }
+  return { state, restart, store: memory.store }
+}
+
 /** A relay record that only needs its health to be interesting. */
 function relay(id: string, name = id): RelayRecord {
   return {
@@ -202,6 +223,196 @@ describe("a live failure", () => {
 
     expect(state.pickExit({ advance: false, now: now + 59_000 }).exit).toBeUndefined()
     expect(state.pickExit({ advance: false, now: now + 61_000 }).exit?.id).toBe("relay-1")
+  })
+})
+
+describe("across a restart", () => {
+  test("a live failure keeps its rest, and the exit serves once it is over", async () => {
+    const { state, restart } = await makeRestartable()
+    await state.addRelay(relay("relay-1"))
+    await state.setHealth("relay-1", { status: "ready" })
+
+    const now = Date.now()
+    state.markFailure("relay-1", "The exit did not answer.", "unreachable")
+
+    const next = await restart()
+    // The failure was live, so the exit rests rather than retires — but the
+    // rest is only known to the new process if it was written with the status.
+    expect(next.pickExit({ advance: false }).exit).toBeUndefined()
+    expect(next.coolingExits()).toContain("relay-1")
+
+    // When the rest ends, the same exit serves again without another test.
+    const later = await next.pickExit({ advance: false, now: now + COOLDOWN_BASE_MS + 5_000 })
+    expect(later.exit?.id).toBe("relay-1")
+  })
+
+  test("a success after a live failure survives the restart", async () => {
+    const { state, restart } = await makeRestartable()
+    await state.addRelay(relay("relay-1"))
+    await state.setHealth("relay-1", { status: "ready" })
+
+    state.markFailure("relay-1", "The exit did not answer.", "unreachable")
+    state.markSuccess("relay-1", 120)
+
+    const next = await restart()
+    expect(next.exit("relay-1")?.status).toBe("ready")
+    expect(next.pickExit({ advance: false }).exit?.id).toBe("relay-1")
+  })
+
+  test("pausing an exit does not clear its rest", async () => {
+    const { state, restart } = await makeRestartable()
+    await state.addRelay(relay("relay-1"))
+    await state.setHealth("relay-1", { status: "ready" })
+
+    const now = Date.now()
+    state.markFailure("relay-1", "The exit did not answer.", "unreachable")
+    await state.setExitEnabled("relay-1", false)
+    await state.setExitEnabled("relay-1", true)
+
+    const next = await restart()
+    expect(next.pickExit({ advance: false }).exit).toBeUndefined()
+
+    const later = await next.pickExit({ advance: false, now: now + COOLDOWN_BASE_MS + 5_000 })
+    expect(later.exit?.id).toBe("relay-1")
+  })
+
+  test("a rate limit keeps its cooldown across a restart", async () => {
+    const { state, restart } = await makeRestartable()
+    await state.addRelay(relay("relay-1"))
+    await state.setHealth("relay-1", { status: "ready" })
+
+    const now = Date.now()
+    state.markRateLimited("relay-1", now + 60_000, "OpenCode rate-limited this exit.")
+
+    const next = await restart()
+    // The restart lands inside the cooldown, so the exit stays skipped.
+    expect(next.pickExit({ advance: false }).exit).toBeUndefined()
+
+    // At the cooldown's end the exit serves again, on the strength of its
+    // persisted rest.
+    expect(next.pickExit({ advance: false, now: now + 61_000 }).exit?.id).toBe("relay-1")
+  })
+
+  test("a test verdict still waits for another test", async () => {
+    const { state, restart } = await makeRestartable()
+    await state.addRelay(relay("relay-1"))
+    await state.setHealth("relay-1", { status: "ready" })
+
+    const now = Date.now()
+    await state.setHealth("relay-1", { status: "bad", lastError: "HTTP 500", checkedAt: now })
+
+    const next = await restart()
+    expect(next.pickExit({ advance: false }).exit).toBeUndefined()
+    expect(
+      next.pickExit({ advance: false, now: now + 24 * 60 * 60_000 }).exit,
+    ).toBeUndefined()
+  })
+
+  test("changing a proxy's URL starts its record over", async () => {
+    const { state, store } = await makeRestartable()
+    await state.addRelay(relay("relay-1"))
+    await state.setHealth("relay-1", { status: "ready" })
+
+    const proxy = await state.addProxy({
+      kind: "proxy",
+      id: "proxy-1",
+      name: "proxy",
+      url: "http://1.2.3.4:8080",
+      enabled: true,
+      status: "ready",
+      latencyMs: 42,
+      lastCheck: Date.now(),
+      egress: "1.2.3.4",
+      runtime: "bun",
+      createdAt: Date.now(),
+    })
+    // The record carries a live failure's rest, seeded the way one is armed:
+    // with a real failure, so the test proves the very fields markFailure
+    // stamps are the ones a URL change drops.
+    state.markFailure(proxy.id, "The exit did not answer.", "unreachable")
+    expect(state.proxy(proxy.id)?.coolingUntil).toBeDefined()
+    expect(state.proxy(proxy.id)?.failures).toBe(1)
+    await state.setExitEnabled(proxy.id, false)
+
+    const updated = await state.updateProxy(proxy.id, {
+      name: "moved",
+      url: "socks5://9.9.9.9:1080",
+    })
+    expect(updated).toMatchObject({
+      kind: "proxy",
+      id: "proxy-1",
+      name: "moved",
+      url: "socks5://9.9.9.9:1080",
+      enabled: false,
+      status: "untested",
+      createdAt: proxy.createdAt,
+    })
+    expect(updated?.lastError).toBeUndefined()
+    expect(updated?.lastCheck).toBeUndefined()
+    expect(updated?.latencyMs).toBeUndefined()
+    expect(updated?.egress).toBeUndefined()
+    expect(updated?.runtime).toBeUndefined()
+    expect(updated?.coolingUntil).toBeUndefined()
+    expect(updated?.failures).toBeUndefined()
+    expect(updated?.exhaustedUntil).toBeUndefined()
+
+    // Nothing stale is left on disk either: the next restart reads the new
+    // record exactly as the running process wrote it.
+    const persisted = (store.get("proxies") as (Record<string, unknown> | undefined)[])?.find(
+      (entry) => entry?.id === "proxy-1",
+    )
+    expect(persisted).toMatchObject({ status: "untested" })
+    expect(persisted?.lastError).toBeUndefined()
+    expect(persisted?.latencyMs).toBeUndefined()
+    expect(persisted?.egress).toBeUndefined()
+    expect(persisted?.runtime).toBeUndefined()
+    expect(persisted?.coolingUntil).toBeUndefined()
+    expect(persisted?.failures).toBeUndefined()
+    expect(persisted?.exhaustedUntil).toBeUndefined()
+
+    // A name-only edit is not a new exit: the record keeps what it knows.
+    const renamed = await state.updateProxy(proxy.id, { name: "renamed" })
+    expect(renamed).toMatchObject({
+      name: "renamed",
+      url: "socks5://9.9.9.9:1080",
+      status: "untested",
+      enabled: false,
+      createdAt: proxy.createdAt,
+    })
+  })
+
+  test("a partial settings object keeps what it says and defaults the rest", async () => {
+    const { state, restart, store } = await makeRestartable()
+    await state.addRelay(relay("relay-1"))
+    await state.addRelay(relay("relay-2"))
+    await state.setEnabled(true)
+    await state.setStrategy("round-robin")
+
+    // A hand-edited file that names only the plugin switch and the chosen
+    // exit: what it says must survive the load, and the rest must default
+    // instead of the whole object being dropped for the defaults.
+    store.set("settings", { enabled: true, activeExitId: "relay-2" })
+    const next = await restart()
+    const rules = next.settings()
+    expect(rules.enabled).toBe(true)
+    expect(rules.selection).toBe("free")
+    expect(rules.strategy).toBe("fixed")
+    expect(rules.customModels).toEqual([])
+    expect(rules.activeExitId).toBe("relay-2")
+
+    // The same file with everything in it still reads back whole.
+    store.set("settings", {
+      enabled: true,
+      selection: "custom",
+      customModels: ["iceman-free"],
+      activeExitId: "relay-2",
+    })
+    const full = await restart()
+    const kept = full.settings()
+    expect(kept.enabled).toBe(true)
+    expect(kept.selection).toBe("custom")
+    expect(kept.customModels).toEqual(["iceman-free"])
+    expect(kept.activeExitId).toBe("relay-2")
   })
 })
 

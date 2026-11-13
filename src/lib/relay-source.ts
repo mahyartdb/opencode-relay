@@ -59,8 +59,19 @@ function sanitise(value: string): string {
 export function projectName(input: { readonly region: string; readonly suffix?: string }): string {
   // The prefix keeps every relay of this plugin identifiable in the Vercel dashboard; the region keeps
   // relays of different regions apart, since a project can only run in one region.
-  const parts = ["oc-relay", sanitise(input.region), sanitise(input.suffix ?? "")].filter((part) => part.length > 0)
+  const base = ["oc-relay", sanitise(input.region)]
+    .filter((part) => part.length > 0)
+    .join("-")
+    .slice(0, MAX_NAME_LENGTH)
+  // The suffix tells two relays of one region apart, and its random tail sits
+  // at its end, so truncation must keep the suffix's end: cutting the front
+  // would leave two long names the same project, and deleting one relay would
+  // delete the project the other still runs on. When no room is left the
+  // suffix goes entirely, so the region's own name stays intact.
+  const suffix = sanitise(input.suffix ?? "")
+  const keep = Math.max(0, MAX_NAME_LENGTH - base.length - 1)
+  const tail = keep === 0 ? "" : suffix.slice(-keep)
   // Truncating can leave a trailing hyphen, which Vercel rejects, so drop it afterwards.
-  const name = parts.join("-").slice(0, MAX_NAME_LENGTH).replace(/-+$/, "")
+  const name = (tail.length > 0 ? `${base}-${tail}` : base).replace(/-+$/, "")
   return name.length > 0 ? name : FALLBACK_NAME
 }

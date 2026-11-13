@@ -236,7 +236,9 @@ export async function deployRelay(input: DeployRelayInput): Promise<DeployRelayR
 
   const deadline = Date.now() + DEPLOY_TIMEOUT_MS
   let last = created
-  while (Date.now() < deadline) {
+  // Inspect first, then wait: `created` already carries a readyState, so a
+  // finished deployment must not be made to wait one poll interval.
+  for (;;) {
     const state = last.readyState
     if (state === "READY") {
       const url = pickDeploymentUrl(last.alias, last.url)
@@ -246,6 +248,7 @@ export async function deployRelay(input: DeployRelayInput): Promise<DeployRelayR
       const msg = last.errorMessage ? redact(`: ${last.errorMessage}`, secrets) : ""
       throw new Error(redact(`Vercel deployment ${state.toLowerCase()}${msg}`, secrets))
     }
+    if (Date.now() >= deadline) break
     await sleep(DEPLOY_POLL_MS)
     if (Date.now() >= deadline) break
     const statusPath = withTeam(`/v13/deployments/${encodeURIComponent(id)}`, account.teamId)
@@ -256,15 +259,6 @@ export async function deployRelay(input: DeployRelayInput): Promise<DeployRelayR
     })
     await expectOk(statusRes, "Failed to read Vercel deployment status", account.token, secrets)
     last = (await statusRes.json()) as typeof created
-  }
-  // final check after loop
-  if (last.readyState === "READY") {
-    const url = pickDeploymentUrl(last.alias, last.url)
-    return { id, project, url, region }
-  }
-  if (last.readyState === "ERROR" || last.readyState === "CANCELED") {
-    const msg = last.errorMessage ? redact(`: ${last.errorMessage}`, secrets) : ""
-    throw new Error(redact(`Vercel deployment ${last.readyState.toLowerCase()}${msg}`, secrets))
   }
   throw new Error("Vercel deployment timed out after 120 seconds.")
 }
@@ -308,7 +302,12 @@ export async function probeRelay(url: string, access: string): Promise<RelayProb
     } catch {
       data = undefined
     }
-    const obj = data && typeof data === "object" ? (data as Record<string, unknown>) : undefined
+    // A 2xx alone is not a relay: a captive portal or an HTML error page
+    // answers 200 as well. The ping must be a JSON object to count.
+    if (!(data && typeof data === "object") || Array.isArray(data)) {
+      return { reachable: false, status, ms: elapsed() }
+    }
+    const obj = data as Record<string, unknown>
     const egress = typeof obj?.["egress"] === "string" ? (obj["egress"] as string) : undefined
     const runtime = typeof obj?.["runtime"] === "string" ? (obj["runtime"] as string) : undefined
     const instance = typeof obj?.["instance"] === "string" ? (obj["instance"] as string) : undefined

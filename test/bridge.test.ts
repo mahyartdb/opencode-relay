@@ -198,6 +198,62 @@ describe("the SOCKS handshake hands the socket over safely", () => {
       await closeServer(stub.server)
     }
   })
+
+  test("a SOCKS5 auth reply with a wrong version byte fails the handshake", async () => {
+    const stub = await badAuthStub()
+    try {
+      await expect(
+        socks5Connect(
+          { version: 5, host: "127.0.0.1", port: stub.port, username: "user", password: "pass" },
+          "example.com",
+          443,
+        ),
+      ).rejects.toThrow("Not a SOCKS5 server")
+    } finally {
+      await closeServer(stub.server)
+    }
+  })
+
+  test("a SOCKS5 connect reply with a wrong version byte fails the handshake", async () => {
+    const stub = await stubServer((socket) => {
+      let greeted = false
+      let replied = false
+      socket.on("data", () => {
+        if (!greeted) {
+          greeted = true
+          socket.write(Buffer.from([0x05, 0x00]))
+          return
+        }
+        if (replied) return
+        replied = true
+        // A granted reply whose version byte is not 0x05 is not SOCKS5.
+        socket.write(Buffer.from([0x04, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0x1f, 0x90]))
+      })
+    })
+    try {
+      await expect(
+        socks5Connect({ version: 5, host: "127.0.0.1", port: stub.port }, "example.com", 443),
+      ).rejects.toThrow("Not a SOCKS5 server")
+    } finally {
+      await closeServer(stub.server)
+    }
+  })
+
+  test("a SOCKS4 reply with a nonzero version byte fails the handshake", async () => {
+    const stub = await stubServer((socket) => {
+      socket.once("data", () => {
+        // A granted reply whose version byte is not the null byte SOCKS4 uses.
+        socket.write(Buffer.concat([Buffer.from([0x04, 0x5a]), Buffer.alloc(6)]))
+      })
+    })
+    try {
+      await expect(
+        socks4Connect({ version: 4, host: "127.0.0.1", port: stub.port }, "127.0.0.1", 443),
+      ).rejects.toThrow("Not a SOCKS4 server")
+    } finally {
+      await closeServer(stub.server)
+    }
+  })
 })
 
 /** Send one raw HTTP-proxy request and return the first response head. */
@@ -252,6 +308,26 @@ function grantingStub(): Promise<{ server: net.Server; port: number }> {
       if (replied) return
       replied = true
       socket.write(Buffer.from([0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0x1f, 0x90]))
+    })
+  })
+}
+
+/** A SOCKS5 stub that answers the username/password step with a wrong version. */
+function badAuthStub(): Promise<{ server: net.Server; port: number }> {
+  return stubServer((socket) => {
+    let greeted = false
+    let answered = false
+    socket.on("data", () => {
+      if (!greeted) {
+        greeted = true
+        // The server picks the username/password method.
+        socket.write(Buffer.from([0x05, 0x02]))
+        return
+      }
+      if (answered) return
+      answered = true
+      // An auth reply whose version byte is not 0x01 is not RFC 1929.
+      socket.write(Buffer.from([0x02, 0x00]))
     })
   })
 }

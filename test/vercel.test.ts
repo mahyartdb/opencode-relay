@@ -142,6 +142,36 @@ describe("deployRelay", () => {
       }),
     ).rejects.toThrow(/deployment error/i)
   })
+
+  test("a deploy that is not ready at creation is polled to READY", async () => {
+    const urls: string[] = []
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes("/v13/deployments?skipAutoDetectionConfirmation=1")) {
+        return jsonResponse({ id: "dep_slow", readyState: "BUILDING" })
+      }
+      if (url.includes("/v13/deployments/dep_slow")) {
+        urls.push(url)
+        return jsonResponse({
+          id: "dep_slow",
+          readyState: "READY",
+          alias: ["my-relay.vercel.app"],
+          url: "my-relay-hash.vercel.app",
+        })
+      }
+      throw new Error(`unexpected url: ${url}`)
+    }) as unknown as typeof fetch
+
+    const result = await deployRelay({
+      account: { token: "tok-secret" },
+      project: "my-relay",
+      region: "fra1",
+      access: "access-secret",
+      relaySource: "export default {}",
+    })
+    expect(result.url).toBe("https://my-relay.vercel.app")
+    expect(urls.length).toBe(1)
+  })
 })
 
 describe("deleteVercelProject", () => {
@@ -179,6 +209,29 @@ describe("probeRelay", () => {
 
     const probe = await probeRelay("https://relay.example.com", "access-secret")
     expect(probe).toMatchObject({ reachable: false, status: 0 })
+    expect(probe.ms).toBeGreaterThanOrEqual(0)
+  })
+
+  test("a 200 that is not JSON is not a reachable relay", async () => {
+    globalThis.fetch = (async () => {
+      return new Response("<html><body>Sign in</body></html>", {
+        status: 200,
+        headers: { "content-type": "text/html" },
+      })
+    }) as unknown as typeof fetch
+
+    const probe = await probeRelay("https://relay.example.com", "access-secret")
+    expect(probe).toMatchObject({ reachable: false, status: 200 })
+    expect(probe.ms).toBeGreaterThanOrEqual(0)
+  })
+
+  test("a 200 with a JSON array body is not a reachable relay", async () => {
+    globalThis.fetch = (async () => {
+      return jsonResponse([1, 2, 3], 200)
+    }) as unknown as typeof fetch
+
+    const probe = await probeRelay("https://relay.example.com", "access-secret")
+    expect(probe).toMatchObject({ reachable: false, status: 200 })
     expect(probe.ms).toBeGreaterThanOrEqual(0)
   })
 })

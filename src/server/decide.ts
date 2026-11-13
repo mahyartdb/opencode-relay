@@ -67,6 +67,9 @@ export interface DecideInput {
  *   left through it, and the next real request would skip an exit for nothing.
  * - Only then is an exit picked. "No exit can serve" is therefore never the
  *   reason a model that was never going to be routed went direct.
+ * - The pick is made without moving the rotation, and the rotation advances
+ *   only when the decision is "routed": a request that ends direct or failed
+ *   must not spend a turn it never used.
  */
 export async function decideModel(
   deps: DecideDeps,
@@ -136,9 +139,11 @@ export async function decideModel(
     }
   }
 
-  // The model qualifies, so the rotation may move: this is the only place
-  // that advances it, and only for a model the hook is about to route.
-  const pick = state.pickExit({ advance: input.advance })
+  // The model qualifies, so the pick may be made -- but the rotation moves
+  // only for a decision that actually routes. Picking with `advance: false`
+  // first keeps a request that ends at the bridge check or direct from
+  // consuming a round-robin turn it never used.
+  const pick = state.pickExit({ advance: false })
   const skipped = [...pick.skipped]
   const withModel = { ...base, model, skipped }
 
@@ -160,6 +165,23 @@ export async function decideModel(
       kind: "bridge",
       routed: false,
       reason: `The local proxy bridge is not running, so ${pick.exit.name} cannot carry the request.`,
+    }
+  }
+
+  // The exit will actually carry the request, so this is the only place the
+  // rotation advances. The state is unchanged since the first pick, so the
+  // second call is deterministic; its answer is the committed truth.
+  if (input.advance) {
+    const moved = state.pickExit({ advance: true })
+    if (moved.exit !== undefined) {
+      return {
+        ...withModel,
+        skipped: [...moved.skipped],
+        kind: "routed",
+        routed: true,
+        exit: moved.exit,
+        reason: `The request goes through ${moved.exit.name}.`,
+      }
     }
   }
 

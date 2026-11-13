@@ -167,10 +167,12 @@ export function socks5Connect(
       }
       if (state === "auth") {
         if (buffer.length < 2) return
+        if (buffer[0] !== 0x01) return fail(new Error("Not a SOCKS5 server"))
         if (buffer[1] !== 0x00) return fail(new Error("SOCKS5 username/password rejected"))
         buffer = buffer.subarray(2)
         return sendConnect()
       }
+      if (buffer[0] !== 0x05) return fail(new Error("Not a SOCKS5 server"))
       if (buffer.length < 4) return
       if (buffer[1] !== 0x00) {
         return fail(
@@ -239,6 +241,9 @@ export async function socks4Connect(
       if (done) return
       buffer = Buffer.concat([buffer, chunk])
       if (buffer.length < 8) return
+      if (buffer[0] !== 0x00) {
+        return fail(new Error("Not a SOCKS4 server"))
+      }
       if (buffer[1] !== 0x5a) {
         return fail(new Error(`SOCKS4 connect to ${host}:${port} was refused (code ${buffer[1]})`))
       }
@@ -380,6 +385,12 @@ export function socksBridge(up: SocksUpstream): Promise<string> {
         .filter((bridge) => bridge.active === 0)
         .sort((a, b) => a.last - b.last)[0]
       if (idle) dropBridge(idle)
+      // Sweeping one idle bridge was the last chance: a cap that can still be
+      // exceeded is not a cap, so a still-full map refuses instead.
+      if (meta.size >= MAX_BRIDGES) {
+        reject(new Error("Too many SOCKS bridges"))
+        return
+      }
     }
     const entry = { key, server: undefined as unknown as net.Server, active: 0, last: Date.now() }
     const server = net.createServer((client) => {
@@ -392,7 +403,12 @@ export function socksBridge(up: SocksUpstream): Promise<string> {
     })
     entry.server = server
     meta.set(key, entry)
-    server.once("error", reject)
+    server.once("error", (error) => {
+      // A bind error must not leave a dead entry behind: it would count
+      // against the cap forever, with nothing listening at all.
+      meta.delete(key)
+      reject(error)
+    })
     server.listen(0, "127.0.0.1", () =>
       resolve(`http://127.0.0.1:${(server.address() as net.AddressInfo).port}`),
     )

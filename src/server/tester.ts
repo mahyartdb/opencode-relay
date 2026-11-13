@@ -344,15 +344,22 @@ export class Tester {
     const signal = timeout(PING_TIMEOUT_MS)
     try {
       const response = await fetchThroughProxy(exit.url, UPSTREAM_TRACE, { signal })
-      const text = response.ok ? await response.text() : ""
+      const text = await response.text()
       const match = /^ip=(.+)$/m.exec(text)
       const egress = match?.[1]?.trim()
-      const ok = response.ok
+      // A 2xx alone is not proof: the trace endpoint answers in `ip=` lines,
+      // so a proxy that returns anything else is not answering the ping.
+      const ok = response.ok && /^ip=.+/m.test(text)
+      const note = ok
+        ? undefined
+        : response.ok
+          ? "The proxy answered with HTTP 200 but not with the expected trace."
+          : `The proxy answered with HTTP ${response.status}.`
       await this.record(exit.id, {
         status: ok ? "reachable" : "unreachable",
         latencyMs: elapsed(),
         ...(egress !== undefined ? { egress } : {}),
-        ...(ok ? {} : { lastError: `The proxy answered with HTTP ${response.status}.` }),
+        ...(note !== undefined ? { lastError: note } : {}),
         checkedAt,
         healthEpoch,
       })
@@ -362,7 +369,7 @@ export class Tester {
         code: response.status,
         ms: elapsed(),
         ...(egress !== undefined ? { egress } : {}),
-        ...(ok ? {} : { note: `The proxy answered with HTTP ${response.status}.` }),
+        ...(note !== undefined ? { note } : {}),
       }
     } catch (error) {
       const note = error instanceof Error ? error.message : String(error)
