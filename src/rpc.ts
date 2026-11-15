@@ -7,8 +7,13 @@
  *
  * Every schema is a Standard Schema, so the same definition types both ends:
  * the TUI knows what a method returns, and the server validates what it is
- * given before the handler ever sees it. Credentials never cross it: a relay's
- * access token and a proxy's password stay on the server.
+ * given before the handler ever sees it.
+ *
+ * Only `exportConfig` carries credentials: it is the one method whose whole
+ * job is to write them out, and the terminal says so before it shows it.
+ * Every other answer stays credential-free - a relay's access token and a
+ * proxy's password never cross this contract. A handler that would break that
+ * has to say so here, in the schema, where a reader looks for it.
  */
 import { Schema } from "effect"
 import { Rpc } from "@opencode/plugin/rpc"
@@ -53,6 +58,8 @@ const ExitSummary = Schema.Struct({
   latencyMs: Schema.optional(Schema.Number),
   lastCheck: Schema.optional(Schema.Number),
   exhaustedUntil: Schema.optional(Schema.Number),
+  /** Why OpenCode said the address is used up, when it said. */
+  spendReason: Schema.optional(Schema.String),
   lastError: Schema.optional(Schema.String),
   stats: ExitStats,
 })
@@ -98,9 +105,16 @@ const ScanProgress = Schema.Struct({
   startedAt: Schema.Number,
   total: Schema.Number,
   done: Schema.Number,
-  kind: Schema.optional(Schema.Literals(["relay", "proxy"])),
   deep: Schema.Boolean,
 })
+
+/**
+ * A change that could not be written.
+ *
+ * The change is in memory but not on disk, so the caller is told instead of
+ * being answered as if the change had been saved.
+ */
+const StorageFailed = Schema.toStandardSchemaV1(Schema.Struct({ message: Schema.String }))
 
 /** What the plugin is doing right now. */
 const Status = Schema.Struct({
@@ -116,7 +130,13 @@ const Status = Schema.Struct({
   accounts: Schema.Array(AccountSummary),
   exhausted: Schema.Array(Schema.String),
   paused: Schema.Array(Schema.String),
-  /** Exits that are not used right now because they did not answer. */
+  /**
+   * Exits that are resting right now.
+   *
+   * A rest is armed by a failure, a rate limit or a refusal: the exit did
+   * answer, and it is out of use until the rest is over. The exits that are
+   * out of use for another reason are in `exhausted` and `paused`.
+   */
   skipped: Schema.Array(Schema.String),
   /**
    * The exit the picker would use for the next request, with the live cooldown
@@ -213,7 +233,12 @@ export const Relay = Rpc.define({
         }),
       ),
       errors: {
+        storage_failed: StorageFailed,
         invalid_token: Schema.toStandardSchemaV1(
+          Schema.Struct({ message: Schema.String }),
+        ),
+        /** Vercel could not be reached; the token may well be fine. */
+        vercel_unreachable: Schema.toStandardSchemaV1(
           Schema.Struct({ message: Schema.String }),
         ),
       },
@@ -225,6 +250,9 @@ export const Relay = Rpc.define({
       output: Schema.toStandardSchemaV1(
         Schema.Struct({ removed: Schema.Boolean }),
       ),
+      errors: {
+        storage_failed: StorageFailed,
+      },
     },
 
     /** Deploy a relay to one region with a stored account. */
@@ -239,6 +267,7 @@ export const Relay = Rpc.define({
       ),
       output: Schema.toStandardSchemaV1(DeployedRelay),
       errors: {
+        storage_failed: StorageFailed,
         deploy_failed: Schema.toStandardSchemaV1(
           Schema.Struct({ message: Schema.String }),
         ),
@@ -276,6 +305,10 @@ export const Relay = Rpc.define({
         }),
       ),
       output: Schema.toStandardSchemaV1(DeployedRelay),
+      errors: {
+        storage_failed: StorageFailed,
+        insecure_relay: Schema.toStandardSchemaV1(Schema.Struct({ message: Schema.String })),
+      },
     },
 
     /** Remove a relay, and optionally delete its Vercel project. */
@@ -293,6 +326,9 @@ export const Relay = Rpc.define({
           projectDeleted: Schema.Boolean,
         }),
       ),
+      errors: {
+        storage_failed: StorageFailed,
+      },
     },
 
     /** Remove any exit, whichever kind it is. The Vercel project is kept. */
@@ -301,6 +337,9 @@ export const Relay = Rpc.define({
       output: Schema.toStandardSchemaV1(
         Schema.Struct({ removed: Schema.Boolean }),
       ),
+      errors: {
+        storage_failed: StorageFailed,
+      },
     },
 
     /** Redeploy the current relay code, keeping the URL and access token. */
@@ -325,11 +364,15 @@ export const Relay = Rpc.define({
           failed: Schema.Array(
             Schema.Struct({ id: Schema.String, name: Schema.String, message: Schema.String }),
           ),
+          /** Relays that were not redeployed, and why. */
+          skipped: Schema.Array(
+            Schema.Struct({ id: Schema.String, name: Schema.String, message: Schema.String }),
+          ),
         }),
       ),
     },
 
-    /** Test one exit: a ping, an OpenCode request, or a tiny real model request. */
+    /** Test one exit: an OpenCode request, or a tiny real model request. */
     testExit: {
       input: Schema.toStandardSchemaV1(
         Schema.Struct({
@@ -349,6 +392,9 @@ export const Relay = Rpc.define({
           note: Schema.optional(Schema.String),
         }),
       ),
+      errors: {
+        storage_failed: StorageFailed,
+      },
     },
 
     /** Start checking every exit in the background. */
@@ -365,6 +411,10 @@ export const Relay = Rpc.define({
     useExit: {
       input: Schema.toStandardSchemaV1(Schema.Struct({ id: Schema.String })),
       output: Schema.toStandardSchemaV1(Schema.Struct({ active: Schema.String })),
+      errors: {
+        storage_failed: StorageFailed,
+        unknown_exit: Schema.toStandardSchemaV1(Schema.Struct({ message: Schema.String })),
+      },
     },
 
     /** Pause an exit, or bring it back. */
@@ -375,6 +425,21 @@ export const Relay = Rpc.define({
       output: Schema.toStandardSchemaV1(
         Schema.Struct({ id: Schema.String, enabled: Schema.Boolean }),
       ),
+      errors: {
+        storage_failed: StorageFailed,
+        unknown_exit: Schema.toStandardSchemaV1(Schema.Struct({ message: Schema.String })),
+      },
+    },
+
+    /** Bring every paused exit back into use. */
+    resumeAllExits: {
+      input: Schema.toStandardSchemaV1(Schema.Struct({})),
+      output: Schema.toStandardSchemaV1(
+        Schema.Struct({ resumed: Schema.Array(Schema.String) }),
+      ),
+      errors: {
+        storage_failed: StorageFailed,
+      },
     },
 
     /** Add every proxy that can be read from a pasted list. */
@@ -394,8 +459,13 @@ export const Relay = Rpc.define({
             Schema.Struct({ value: Schema.String, reason: Schema.String }),
           ),
           duplicates: Schema.Number,
+          /** Valid entries that were left out because there were too many. */
+          leftOut: Schema.optional(Schema.String),
         }),
       ),
+      errors: {
+        storage_failed: StorageFailed,
+      },
     },
 
     /** Change a proxy's name or address. A new address is tested afresh. */
@@ -408,14 +478,24 @@ export const Relay = Rpc.define({
         }),
       ),
       output: Schema.toStandardSchemaV1(
-        Schema.Struct({ updated: Schema.Boolean }),
+        Schema.Struct({
+          updated: Schema.Boolean,
+          /** Why nothing was changed, when nothing was. */
+          reason: Schema.optional(Schema.String),
+        }),
       ),
+      errors: {
+        storage_failed: StorageFailed,
+      },
     },
 
     /** Turn routing on or off. */
     setEnabled: {
       input: Schema.toStandardSchemaV1(Schema.Struct({ enabled: Schema.Boolean })),
       output: Schema.toStandardSchemaV1(Schema.Struct({ enabled: Schema.Boolean })),
+      errors: {
+        storage_failed: StorageFailed,
+      },
     },
 
     /** Choose which models are routed. Only free models are accepted. */
@@ -434,18 +514,27 @@ export const Relay = Rpc.define({
           dropped: Schema.Array(Schema.String),
         }),
       ),
+      errors: {
+        storage_failed: StorageFailed,
+      },
     },
 
     /** Choose how the exits are used. */
     setStrategy: {
       input: Schema.toStandardSchemaV1(Schema.Struct({ strategy: Strategy })),
       output: Schema.toStandardSchemaV1(Schema.Struct({ strategy: Strategy })),
+      errors: {
+        storage_failed: StorageFailed,
+      },
     },
 
     /** Choose what happens when no exit can serve a request. */
     setDirect: {
       input: Schema.toStandardSchemaV1(Schema.Struct({ direct: Direct })),
       output: Schema.toStandardSchemaV1(Schema.Struct({ direct: Direct })),
+      errors: {
+        storage_failed: StorageFailed,
+      },
     },
 
     /** Whether the exits are checked in the background. */
@@ -456,6 +545,9 @@ export const Relay = Rpc.define({
       output: Schema.toStandardSchemaV1(
         Schema.Struct({ enabled: Schema.Boolean }),
       ),
+      errors: {
+        storage_failed: StorageFailed,
+      },
     },
 
     /** Bring the exits whose allowance is gone back into use. */
@@ -464,6 +556,9 @@ export const Relay = Rpc.define({
       output: Schema.toStandardSchemaV1(
         Schema.Struct({ restored: Schema.Array(Schema.String) }),
       ),
+      errors: {
+        storage_failed: StorageFailed,
+      },
     },
 
     /** Show where the next request would go, without sending or advancing anything. */
@@ -492,6 +587,12 @@ export const Relay = Rpc.define({
           relays: Schema.Number,
           proxies: Schema.Number,
           invalid: Schema.Number,
+          /** Entries that were already there, counted so "nothing new" is visible. */
+          duplicates: Schema.optional(Schema.Number),
+          /** Why the file could not be read, or why the import stopped partway. */
+          error: Schema.optional(Schema.String),
+          /** Valid entries that were left out because there were too many. */
+          leftOut: Schema.optional(Schema.String),
         }),
       ),
     },
