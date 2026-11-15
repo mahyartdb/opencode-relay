@@ -68,6 +68,18 @@ function projectSuffix(name: string | undefined): string {
   return `${name ?? ""}-${randomBytes(3).toString("hex")}`
 }
 
+/**
+ * Say that something changed, without risking the answer.
+ *
+ * Every announcement happens after the change has landed: a failed event
+ * dispatch must not reject an RPC whose change is already in force, or the
+ * user would be told it failed and repeat it — a second deployment in the
+ * same region, for instance.
+ */
+function announceChanged(announce: (reason: string) => Promise<void>, reason: string): void {
+  void announce(reason).catch(() => {})
+}
+
 /** The access token a relay requires. It is a secret, so it is not guessable. */
 function newAccessToken(): string {
   return randomBytes(24).toString("hex")
@@ -186,6 +198,7 @@ function describeState(options: {
     const paused: string[] = []
     const limited: string[] = []
     const untested: string[] = []
+    const failing: string[] = []
     const silent: string[] = []
     for (const id of otherSkipped) {
       if (counted.has(id)) continue
@@ -199,12 +212,17 @@ function describeState(options: {
         // A refusal is its own sentence: "did not answer" would be false, and
         // the user needs to know OpenCode itself turned the exit away.
         problems.push(`${exit.name} is blocked by OpenCode, so it is skipped.`)
+      } else if (exit.status === "bad") {
+        // The exit answered with an error, which is not the same as not
+        // answering: its own lastError says what came back.
+        failing.push(exit.name)
       } else silent.push(exit.name)
     }
     const groups: Array<{ readonly verdict: readonly [string, string]; readonly names: readonly string[] }> = [
       { verdict: ["is paused", "are paused"], names: paused },
       { verdict: ["is rate-limited", "are rate-limited"], names: limited },
       { verdict: ["has not been tested yet", "have not been tested yet"], names: untested },
+      { verdict: ["is failing", "are failing"], names: failing },
       { verdict: ["did not answer", "did not answer"], names: silent },
     ]
     for (const { verdict, names } of groups) {
@@ -400,11 +418,13 @@ async function recordProbe(
   if (!probe.reachable) {
     // A relay that answered with a status has a problem of its own (a wrong
     // access token, a 500), which is not the same as one that did not answer.
+    // The status word has to say which: "not answering" beside an error that
+    // names an HTTP status would contradict itself.
     const note =
       probe.status > 0
         ? `The relay answered with HTTP ${probe.status}.`
         : "The relay did not answer its first check."
-    state.markFailure(id, note, "unreachable")
+    state.markFailure(id, note, probe.status > 0 ? "bad" : "unreachable")
     return
   }
   try {
@@ -531,6 +551,13 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
 
     /** Add a Vercel account after checking the token and reading its plan. */
     addAccount: async (input, { error }) => {
+      // A name that cleans to nothing is not a name: control characters alone
+      // would leave an entry the menus cannot show.
+      if (safeName(input.name).length === 0) {
+        return error("invalid_input_name", "That account name is not usable.", {
+          message: "The name has to be text that can be shown in the menu.",
+        })
+      }
       let plan: AccountPlan
       try {
         plan = await inspectVercel({
@@ -558,7 +585,7 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
         ...(input.teamId !== undefined ? { teamId: input.teamId } : {}),
         plan: plan.plan,
       })
-      await announce("account added")
+      announceChanged(announce, "account added")
       return {
         id: account.id,
         name: account.name,
@@ -574,7 +601,7 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
     /** Remove a stored account. Relays deployed with it are kept: they run on their own. */
     removeAccount: async (input) => {
       const removed = await state.removeAccount(input.id)
-      if (removed) await announce("account removed")
+      if (removed) announceChanged(announce, "account removed")
       return { removed }
     },
 
@@ -596,7 +623,7 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
         })
         // The announcement is outside the failure mapping: a failed event
         // dispatch must not be read as a refusal by Vercel.
-        void announce("relay deployed").catch(() => {})
+        announceChanged(announce, "relay deployed")
         return deployed
       } catch (err) {
         // A write that did not land is not a refusal by Vercel: the relay may
@@ -648,7 +675,7 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
           })
         }
       }
-      if (deployed.length > 0) await announce("relays deployed")
+      if (deployed.length > 0) announceChanged(announce, "relays deployed")
       return { deployed, failed }
     },
 
@@ -682,6 +709,13 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
             "The relay's access token is asked for separately; a password in the address would be stored in the clear.",
         })
       }
+      // A name that cleans to nothing is not a name: control characters alone
+      // would leave an entry the menus cannot show.
+      if (safeName(input.name).length === 0) {
+        return error("invalid_input_name", "That relay name is not usable.", {
+          message: "The name has to be text that can be shown in the menu.",
+        })
+      }
       const relay: RelayRecord = {
         kind: "relay",
         id: randomUUID(),
@@ -704,7 +738,7 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
       const healthEpoch = state.healthEpoch(relay.id)
       const probe = await probeRelay(relay.url, relay.access)
       await recordProbe(state, relay.id, probe, checkedAt, healthEpoch)
-      await announce("relay added")
+      announceChanged(announce, "relay added")
       return {
         id: relay.id,
         name: relay.name,
@@ -755,7 +789,7 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
           )
         }
       }
-      await announce("relay removed")
+      announceChanged(announce, "relay removed")
       return { removed: true, projectDeleted }
     },
 
@@ -763,7 +797,7 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
     removeExit: async (input) => {
       const exit = await state.removeExit(input.id)
       if (!exit) return { removed: false }
-      await announce("exit removed")
+      announceChanged(announce, "exit removed")
       return { removed: true }
     },
 
@@ -814,7 +848,7 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
       const healthEpoch = state.healthEpoch(relay.id)
       const probe = await probeRelay(relay.url, relay.access)
       await recordProbe(state, relay.id, probe, checkedAt, healthEpoch)
-      await announce("relay updated")
+      announceChanged(announce, "relay updated")
       return { id: relay.id, reachable: probe.reachable }
     },
 
@@ -876,14 +910,14 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
       }
       // One announce for the whole batch, like deployRelays: per-relay
       // announcements would flood the conversation with refreshes.
-      if (updated > 0) await announce("relays updated")
+      if (updated > 0) announceChanged(announce, "relays updated")
       return { updated, failed, skipped }
     },
 
     /** Test one exit: an OpenCode request, or a tiny real model request. */
     testExit: async (input) => {
       const result = await tester.test(input.id, input.deep ? "deep" : "api")
-      await announce("exit tested")
+      announceChanged(announce, "exit tested")
       return {
         ok: result.ok,
         status: result.status,
@@ -923,7 +957,7 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
         })
       }
       await state.setActiveExit(input.id)
-      await announce("active exit changed")
+      announceChanged(announce, "active exit changed")
       return { active: input.id }
     },
 
@@ -946,7 +980,7 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
     /** Bring every paused exit back into use. */
     resumeAllExits: async () => {
       const resumed = await state.resumeAll()
-      if (resumed.length > 0) await announce("exits resumed")
+      if (resumed.length > 0) announceChanged(announce, "exits resumed")
       return { resumed }
     },
 
@@ -996,7 +1030,7 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
       }
       await state.addProxyList(records)
       if (records.length > 0) {
-        await announce("proxies added")
+        announceChanged(announce, "proxies added")
         // The list can be long, so the check runs behind the conversation. The
         // exits are usable as their checks finish.
         checkUntested()
@@ -1060,7 +1094,7 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
         ...(url !== undefined ? { url } : {}),
       })
       if (!next) return { updated: false, reason: "This proxy is not there any more." }
-      await announce("proxy updated")
+      announceChanged(announce, "proxy updated")
       if (url !== undefined) {
         void tester
           .test(next.id, "api")
@@ -1093,7 +1127,7 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
         dropped = models.filter((id) => !free.has(id))
       }
       const settings = await state.setSelection(input.selection, accepted)
-      await announce("selection changed")
+      announceChanged(announce, "selection changed")
       return {
         selection: settings.selection,
         customModels: [...settings.customModels],
@@ -1104,28 +1138,28 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
     /** Choose how the exits are used. */
     setStrategy: async (input) => {
       await state.setStrategy(input.strategy as Strategy)
-      await announce("strategy changed")
+      announceChanged(announce, "strategy changed")
       return { strategy: input.strategy }
     },
 
     /** Choose what happens when no exit can serve a request. */
     setDirect: async (input) => {
       await state.setDirect(input.direct as DirectPolicy)
-      await announce("direct policy changed")
+      announceChanged(announce, "direct policy changed")
       return { direct: input.direct }
     },
 
     /** Whether the exits are checked in the background. */
     setHealthChecks: async (input) => {
       await state.setHealthChecks(input.enabled)
-      await announce("health checks changed")
+      announceChanged(announce, "health checks changed")
       return { enabled: input.enabled }
     },
 
     /** Bring the exits whose allowance is gone back into use. */
     resetExhausted: async () => {
       const restored = await state.restoreExhausted()
-      await announce("exhausted exits restored")
+      announceChanged(announce, "exhausted exits restored")
       return { restored }
     },
 
@@ -1343,10 +1377,6 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
         state.relays().map((relay) => JSON.stringify([relay.url, relay.access])),
       )
       for (const entry of relayEntries) {
-        if (importedRelays.length >= IMPORT_RELAY_LIMIT) {
-          overflow += 1
-          continue
-        }
         if (!entry || typeof entry !== "object") {
           invalid += 1
           continue
@@ -1371,6 +1401,12 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
         const parsedAddress = parseRelayAddress(normalized)
         if (parsedAddress === undefined || parsedAddress.username.length > 0 || parsedAddress.password.length > 0) {
           invalid += 1
+          continue
+        }
+        // The cap is applied to entries that have passed every check: only a
+        // valid entry is counted as left out, so "invalid" stays what it says.
+        if (importedRelays.length >= IMPORT_RELAY_LIMIT) {
+          overflow += 1
           continue
         }
         const stored = normalized.endsWith("/") ? normalized.slice(0, -1) : normalized
@@ -1403,10 +1439,6 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
       const seenProxies = new Set(state.proxies().map((proxy) => proxyKey(proxy.url)))
       const imported: ProxyRecord[] = []
       for (const entry of proxyEntries) {
-        if (imported.length >= IMPORT_PROXY_LIMIT) {
-          overflow += 1
-          continue
-        }
         const url = typeof entry === "string"
           ? entry
           : entry && typeof entry === "object"
@@ -1421,9 +1453,16 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
           invalid += 1
           continue
         }
+        // The cap is applied to entries that have passed every check, and
+        // after the duplicate check: only a valid entry is counted as left
+        // out, so "invalid" stays what it says.
         const key = proxyKey(proxy.url)
         if (seenProxies.has(key)) {
           duplicates += 1
+          continue
+        }
+        if (imported.length >= IMPORT_PROXY_LIMIT) {
+          overflow += 1
           continue
         }
         seenProxies.add(key)
@@ -1490,7 +1529,7 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
           error: reason,
         }
       }
-      await announce("configuration imported")
+      announceChanged(announce, "configuration imported")
       // Imported exits stay untested on purpose: a deep test sends the
       // user's own OpenCode session token through the exit, and a shared or
       // tampered config must not be able to aim that at a URL of its choosing.

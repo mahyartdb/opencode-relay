@@ -450,9 +450,12 @@ export class Tester {
     if (mode === "deep") {
       const model = sample?.modelID ?? (await this.pickModel(exit, signal))
       if (model === undefined) {
+        // Nothing was learned about the exit: the test could not be built.
+        // Recording a verdict would retire it without a rest, on something
+        // the check never earned.
         const result: TestResult = {
           ok: false,
-          status: "bad",
+          status: "unknown",
           code: 0,
           ms: elapsed(),
           note: "No model could be read to test with.",

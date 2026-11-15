@@ -218,7 +218,13 @@ export async function inspectVercel(account: VercelAccount): Promise<AccountPlan
 
   const projectsRes = await vercelFetch(withTeam("/v9/projects?limit=100", teamId), { token })
   if (projectsRes.status === 401 || projectsRes.status === 403) {
-    throw new Error("Vercel refused the request (HTTP 401/403). Check the token and its permissions.")
+    // The status has to travel: the add-account path maps a refusal to a
+    // token problem, and a plain error here would send the user to check
+    // their network for a token that is simply bad.
+    throw new VercelError(
+      "Vercel refused the request (HTTP 401/403). Check the token and its permissions.",
+      projectsRes.status,
+    )
   }
   await expectOk(projectsRes, "Failed to read Vercel projects", token)
   const projectsData = (await projectsRes.json()) as {

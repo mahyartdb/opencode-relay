@@ -241,6 +241,10 @@ export const Relay = Rpc.define({
         vercel_unreachable: Schema.toStandardSchemaV1(
           Schema.Struct({ message: Schema.String }),
         ),
+        /** A name that is only control characters cannot be shown. */
+        invalid_input_name: Schema.toStandardSchemaV1(
+          Schema.Struct({ message: Schema.String }),
+        ),
       },
     },
 
@@ -308,6 +312,7 @@ export const Relay = Rpc.define({
       errors: {
         storage_failed: StorageFailed,
         insecure_relay: Schema.toStandardSchemaV1(Schema.Struct({ message: Schema.String })),
+        invalid_input_name: Schema.toStandardSchemaV1(Schema.Struct({ message: Schema.String })),
       },
     },
 

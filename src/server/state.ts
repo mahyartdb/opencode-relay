@@ -1645,10 +1645,11 @@ export class RelayState {
    */
   async restoreExhausted(): Promise<string[]> {
     const restored: string[] = []
-    const beforeRelays = this.relayList
-    const beforeProxies = this.proxyList
+    const restoredRelays = new Set<string>()
+    const restoredProxies = new Set<string>()
     this.relayList = this.relayList.map((relay) => {      if (relay.status !== "exhausted") return relay
       restored.push(relay.id)
+      restoredRelays.add(relay.id)
       this.cooling.delete(relay.id)
       // A restore is live evidence too: a check that began before it must
       // not re-mark the exit used up with an answer of its own.
@@ -1659,6 +1660,7 @@ export class RelayState {
     this.proxyList = this.proxyList.map((proxy) => {
       if (proxy.status !== "exhausted") return proxy
       restored.push(proxy.id)
+      restoredProxies.add(proxy.id)
       this.cooling.delete(proxy.id)
       this.bumpHealthEpoch(proxy.id)
       const { exhaustedUntil: _until, coolingUntil: _cooling, failures: _failures, ...rest } = proxy
@@ -1669,9 +1671,12 @@ export class RelayState {
     try {
       await this.enqueueWrite(RELAYS_KEY, () => writeRelays(this.storage, this.relayList))
     } catch (error) {
-      // The relays were not written, so they go back to being used up. The
-      // proxies have not been touched yet.
-      this.relayList = beforeRelays
+      // The relays were not written, so they go back to being used up. Only
+      // the ones this call restored go back: a verdict written meanwhile must
+      // not be discarded with them. The proxies have not been touched yet.
+      this.relayList = this.relayList.map((relay) =>
+        restoredRelays.has(relay.id) ? { ...relay, status: "exhausted" as Status } : relay,
+      )
       throw error
     }
     try {
@@ -1679,7 +1684,9 @@ export class RelayState {
     } catch (error) {
       // The proxies were not written, so they go back to being used up. The
       // relays were written, so they stay as they are.
-      this.proxyList = beforeProxies
+      this.proxyList = this.proxyList.map((proxy) =>
+        restoredProxies.has(proxy.id) ? { ...proxy, status: "exhausted" as Status } : proxy,
+      )
       throw new StorageError(
         "proxies",
         `${error instanceof Error ? error.message : String(error)} The relays were brought back.`,
