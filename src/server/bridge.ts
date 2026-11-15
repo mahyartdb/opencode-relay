@@ -60,14 +60,23 @@ export async function fetchThroughProxy(
 ): Promise<Response> {
   const parsed = new URL(proxyUrl)
   let endpoint = proxyUrl
+  let proxy: ProxiedInit["proxy"] = proxyUrl
   if (parsed.protocol === "socks4:" || parsed.protocol === "socks4a:" || parsed.protocol === "socks5:" || parsed.protocol === "socks5h:") {
     const upstream = parseSocksUrl(proxyUrl)
     if (!upstream) throw new Error("The SOCKS proxy address could not be read.")
-    endpoint = await socksBridge(upstream)
+    const bridge = await socksBridge(upstream)
+    endpoint = bridge.url
+    // The local bridge spends the user's SOCKS credentials, so it asks for a
+    // secret of its own. The secret is sent as a proxy header rather than in
+    // the address, so it does not end up in an error message.
+    proxy = {
+      url: bridge.url,
+      headers: { "Proxy-Authorization": `Basic ${Buffer.from(`${bridge.secret}:`).toString("base64")}` },
+    }
   }
   return fetch(target, {
     ...init,
-    proxy: endpoint,
+    proxy,
     respectNoProxy: false,
     redirect: "manual",
   } as ProxiedInit)
@@ -119,26 +128,26 @@ export class ProxyBridge {
 
   private async handle(request: Request): Promise<Response> {
     if (!this.ready || !sameSecret(request.headers.get("x-bridge-key"), this.secret)) {
-      return json(401, { error: "Unauthorized bridge request" })
+      return bridgeError(401, { error: "Unauthorized bridge request" })
     }
     const id = request.headers.get("x-bridge-exit") ?? ""
     const target = request.headers.get("x-bridge-target") ?? ""
     if (id.length === 0 || target.length === 0) {
-      return json(400, { error: "Missing bridge headers" })
+      return bridgeError(400, { error: "Missing bridge headers" })
     }
     let url: URL
     try {
       url = new URL(target)
     } catch {
-      return json(400, { error: "Bad target" })
+      return bridgeError(400, { error: "Bad target" })
     }
     const host = url.hostname.toLowerCase()
     if (url.protocol !== "https:" || !(host === UPSTREAM_HOST || host.endsWith(`.${UPSTREAM_HOST}`))) {
-      return json(403, { error: "Target host not allowed" })
+      return bridgeError(403, { error: "Target host not allowed" })
     }
     const proxy = this.deps.proxyUrl(id)
     if (proxy === undefined) {
-      return json(409, { error: "The proxy is not available" })
+      return bridgeError(409, { error: "The proxy is not available" })
     }
     const headers = new Headers()
     request.headers.forEach((value, name) => {
@@ -168,7 +177,7 @@ export class ProxyBridge {
       // The detail belongs in the plugin's note, not in a response that could
       // be read by anything else on loopback.
       console.error("[relay] proxy request failed", error)
-      return json(502, { error: "The proxy could not carry the request" })
+      return bridgeError(502, { error: "The proxy could not carry the request" })
     }
   }
 }
@@ -187,4 +196,18 @@ function json(status: number, body: unknown): Response {
     status,
     headers: { "content-type": "application/json" },
   })
+}
+
+/**
+ * An answer the bridge itself made.
+ *
+ * The bridge answers a few requests itself: a wrong secret, a target it does
+ * not allow, a proxy that is gone. Those answers say nothing about the exit
+ * behind them, so they are marked: the hook does not book them as the exit's
+ * health, and does not blame the exit for them.
+ */
+function bridgeError(status: number, body: unknown): Response {
+  const response = json(status, body)
+  response.headers.set("x-bridge-error", "1")
+  return response
 }

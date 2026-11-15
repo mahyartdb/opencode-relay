@@ -23,18 +23,44 @@ export interface SocksUpstream {
   readonly password?: string
 }
 
+/** A started local bridge: the proxy address and the secret it demands. */
+export interface SocksBridge {
+  /** The local HTTP proxy address. The secret is not in it. */
+  readonly url: string
+  /** The secret a client has to present to use the bridge. */
+  readonly secret: string
+}
+
 const HEADER_LIMIT = 16 * 1024
 const IDLE_MS = 10 * 60_000
 const MAX_BRIDGES = 64
 
+/**
+ * How long a client may take to send its request head.
+ *
+ * The secret is only checked once the head is complete, so a client that
+ * opens a connection and says nothing would hold a socket open for free.
+ */
+const HEAD_TIMEOUT_MS = 10_000
+/**
+ * The length a SOCKS credential may have.
+ *
+ * The protocol carries the username and the password in a single byte, so a
+ * longer one cannot be written: the length would wrap and the handshake
+ * would break in a way that looks like a broken server.
+ */
+const CREDENTIAL_LIMIT = 255
+
 interface Bridge {
   readonly key: string
   readonly server: net.Server
+  /** The `Proxy-Authorization` value a client has to send. */
+  readonly auth: string
   active: number
   last: number
 }
 
-const bridges = new Map<string, Promise<string>>()
+const bridges = new Map<string, Promise<SocksBridge>>()
 const meta = new Map<string, Bridge>()
 
 function dropBridge(bridge: Bridge): void {
@@ -93,6 +119,20 @@ function ipv6Bytes(address: string): Buffer {
   return out
 }
 
+/**
+ * Whether the credentials can be written into the SOCKS handshake.
+ *
+ * The username and the password travel in a single byte each, so a longer
+ * one cannot be sent at all: the length would wrap and the server would
+ * read a different credential. Refusing here says so plainly, instead of
+ * failing later as an unexplained refusal from the proxy.
+ */
+function credentialsFit(up: SocksUpstream): boolean {
+  const user = Buffer.byteLength(up.username ?? "", "utf8")
+  const password = Buffer.byteLength(up.password ?? "", "utf8")
+  return user <= CREDENTIAL_LIMIT && password <= CREDENTIAL_LIMIT
+}
+
 /** Open a SOCKS5 tunnel. The host is sent as a name, so the proxy resolves it. */
 export function socks5Connect(
   up: SocksUpstream,
@@ -100,6 +140,11 @@ export function socks5Connect(
   port: number,
   timeoutMs = 15_000,
 ): Promise<net.Socket> {
+  if (!credentialsFit(up)) {
+    return Promise.reject(
+      new Error(`The SOCKS credentials for ${up.host}:${up.port} are longer than ${CREDENTIAL_LIMIT} bytes.`),
+    )
+  }
   return new Promise((resolve, reject) => {
     const socket = net.connect({ host: up.host, port: up.port })
     socket.setNoDelay(true)
@@ -210,6 +255,9 @@ export async function socks4Connect(
   port: number,
   timeoutMs = 15_000,
 ): Promise<net.Socket> {
+  if (!credentialsFit(up)) {
+    throw new Error(`The SOCKS credentials for ${up.host}:${up.port} are longer than ${CREDENTIAL_LIMIT} bytes.`)
+  }
   const ip = net.isIPv4(host) ? host : (await dns.lookup(host, { family: 4 })).address
   return new Promise((resolve, reject) => {
     const socket = net.connect({ host: up.host, port: up.port })
@@ -277,8 +325,24 @@ function link(a: net.Socket, b: net.Socket): void {
   a.resume()
 }
 
+/**
+ * The `Proxy-Authorization` value in a request head, if it carries one.
+ *
+ * The header is read from the head the client sent, before anything is
+ * forwarded: the bridge checks it before it opens a tunnel.
+ */
+function proxyAuthorization(lines: readonly string[]): string | undefined {
+  for (const line of lines.slice(1)) {
+    const colon = line.indexOf(":")
+    if (colon <= 0) continue
+    if (line.slice(0, colon).trim().toLowerCase() !== "proxy-authorization") continue
+    return line.slice(colon + 1).trim()
+  }
+  return undefined
+}
+
 /** Handle one HTTP-proxy connection: CONNECT or an absolute-form request. */
-function handle(client: net.Socket, up: SocksUpstream): void {
+function handle(client: net.Socket, up: SocksUpstream, auth: string): void {
   client.setNoDelay(true)
   let head = Buffer.alloc(0)
   const refuse = (status: string) => {
@@ -288,17 +352,28 @@ function handle(client: net.Socket, up: SocksUpstream): void {
       client.destroy()
     }
   }
+  // A client that opens a connection and never finishes its request would
+  // hold the socket, and the bridge with it, for as long as it likes: the
+  // secret is only checked once the head is complete. The head has a
+  // deadline of its own.
+  const headTimer = setTimeout(() => {
+    client.off("data", onData)
+    client.destroy()
+  }, HEAD_TIMEOUT_MS)
+  headTimer.unref?.()
   const onData = (chunk: Buffer) => {
     head = Buffer.concat([head, chunk])
     const end = head.indexOf("\r\n\r\n")
     if (end < 0) {
       if (head.length > HEADER_LIMIT) {
         client.off("data", onData)
+        clearTimeout(headTimer)
         refuse("431 Request Header Fields Too Large")
       }
       return
     }
     client.off("data", onData)
+    clearTimeout(headTimer)
     client.pause()
     const text = head.subarray(0, end).toString("latin1")
     const rest = head.subarray(end + 4)
@@ -306,6 +381,13 @@ function handle(client: net.Socket, up: SocksUpstream): void {
     const [method, target, version] = (lines[0] ?? "").split(" ")
     if (!method || !target || !version) {
       refuse("400 Bad Request")
+      return
+    }
+    // The bridge is a local proxy that carries the user's SOCKS credentials,
+    // so only a client that knows the bridge's own secret may use it. Without
+    // this, any process on this machine could spend the user's proxy.
+    if (proxyAuthorization(lines) !== auth) {
+      refuse("407 Proxy Authentication Required")
       return
     }
     const dial = async () => {
@@ -350,14 +432,20 @@ function handle(client: net.Socket, up: SocksUpstream): void {
         upstream.destroy()
         return
       }
-      const headers = [
-        ...lines.slice(1).filter((line) => !/^(proxy-|connection:|keep-alive:)/i.test(line)),
-        "Connection: close",
-      ]
+      // A header line is forwarded as it was read, so a value with a bare
+      // line feed in it would smuggle a header of its own into the upstream
+      // request. A line with a control character in it is refused.
+      const headers = lines
+        .slice(1)
+        .filter((line) => !/^(proxy-|connection:|keep-alive:)/i.test(line))
+      if (headers.some((line) => /[\r\n\0]/.test(line))) {
+        refuse("400 Bad Request")
+        return
+      }
       upstream.write(
         Buffer.concat([
           Buffer.from(
-            `${method} ${url.pathname}${url.search} ${version}\r\n${headers.join("\r\n")}\r\n\r\n`,
+            `${method} ${url.pathname}${url.search} ${version}\r\n${[...headers, "Connection: close"].join("\r\n")}\r\n\r\n`,
             "latin1",
           ),
           rest,
@@ -371,15 +459,19 @@ function handle(client: net.Socket, up: SocksUpstream): void {
   client.on("error", () => client.destroy())
 }
 
-/** The local HTTP proxy URL for a SOCKS upstream, started on first use. */
-export function socksBridge(up: SocksUpstream): Promise<string> {
+/** The local HTTP proxy for a SOCKS upstream, started on first use. */
+export function socksBridge(up: SocksUpstream): Promise<SocksBridge> {
   // Reap idle bridges on use, not only when the map is full, so a long session
   // does not keep one listening server per proxy it ever used.
   sweep()
   const key = keyOf(up)
   const existing = bridges.get(key)
   if (existing) return existing
-  const started = new Promise<string>((resolve, reject) => {
+  // Every bridge gets its own secret: the bridge is a local proxy that
+  // spends the user's SOCKS credentials, so a client has to prove it may.
+  const secret = crypto.randomUUID().replace(/-/g, "")
+  const auth = `Basic ${Buffer.from(`${secret}:`).toString("base64")}`
+  const started = new Promise<SocksBridge>((resolve, reject) => {
     if (meta.size >= MAX_BRIDGES) {
       const idle = [...meta.values()]
         .filter((bridge) => bridge.active === 0)
@@ -392,14 +484,14 @@ export function socksBridge(up: SocksUpstream): Promise<string> {
         return
       }
     }
-    const entry = { key, server: undefined as unknown as net.Server, active: 0, last: Date.now() }
+    const entry = { key, server: undefined as unknown as net.Server, auth, active: 0, last: Date.now() }
     const server = net.createServer((client) => {
       entry.active++
       client.once("close", () => {
         entry.active--
         entry.last = Date.now()
       })
-      handle(client, up)
+      handle(client, up, auth)
     })
     entry.server = server
     meta.set(key, entry)
@@ -410,7 +502,7 @@ export function socksBridge(up: SocksUpstream): Promise<string> {
       reject(error)
     })
     server.listen(0, "127.0.0.1", () =>
-      resolve(`http://127.0.0.1:${(server.address() as net.AddressInfo).port}`),
+      resolve({ url: `http://127.0.0.1:${(server.address() as net.AddressInfo).port}`, secret }),
     )
   })
   bridges.set(key, started)
@@ -430,13 +522,18 @@ export function parseSocksUrl(raw: string): SocksUpstream | undefined {
   try {
     const url = new URL(raw)
     if (!/^socks(4a?|5h?):$/.test(url.protocol)) return undefined
-    return {
+    const upstream: SocksUpstream = {
       version: url.protocol.startsWith("socks4") ? 4 : 5,
       host: url.hostname.replace(/^\[|\]$/g, ""),
       port: Number(url.port) || 1080,
       ...(url.username.length > 0 ? { username: decodeURIComponent(url.username) } : {}),
       ...(url.password.length > 0 ? { password: decodeURIComponent(url.password) } : {}),
     }
+    // A credential the protocol cannot carry is refused here, where the user
+    // is told why, rather than in the handshake, where it would look like a
+    // proxy that refuses every authentication method.
+    if (!credentialsFit(upstream)) return undefined
+    return upstream
   } catch {
     return undefined
   }

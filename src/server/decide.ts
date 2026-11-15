@@ -160,6 +160,27 @@ export async function decideModel(
   }
 
   if (pick.exit.kind === "proxy" && !bridgeReady) {
+    // The bridge stops the proxies, not the relays: another exit may still
+    // carry the request, and going direct would spend the user's own
+    // allowance on a request that had a way out.
+    const exclude = state
+      .exits()
+      .filter((exit) => exit.kind === "proxy")
+      .map((exit) => ({ id: exit.id, reason: "the local proxy bridge is not running" }))
+    const withoutProxies = state.pickExit({ advance: false, exclude })
+    if (withoutProxies.exit !== undefined) {
+      const moved = input.advance ? state.pickExit({ advance: true, exclude }) : withoutProxies
+      if (moved.exit !== undefined) {
+        return {
+          ...withModel,
+          skipped: [...moved.skipped],
+          kind: "routed",
+          routed: true,
+          exit: moved.exit,
+          reason: `The request goes through ${moved.exit.name}.`,
+        }
+      }
+    }
     return {
       ...withModel,
       kind: "bridge",
@@ -169,8 +190,11 @@ export async function decideModel(
   }
 
   // The exit will actually carry the request, so this is the only place the
-  // rotation advances. The state is unchanged since the first pick, so the
-  // second call is deterministic; its answer is the committed truth.
+  // rotation advances. The state is usually unchanged since the first pick,
+  // so the second call is deterministic and its answer is the committed
+  // truth -- but "usually" is not "always": an answer from an earlier request
+  // can retire the exit between the two picks. When the committed pick finds
+  // nothing, the stale first pick must not be sent anyway.
   if (input.advance) {
     const moved = state.pickExit({ advance: true })
     if (moved.exit !== undefined) {
@@ -182,6 +206,16 @@ export async function decideModel(
         exit: moved.exit,
         reason: `The request goes through ${moved.exit.name}.`,
       }
+    }
+    return {
+      ...withModel,
+      skipped: [...moved.skipped],
+      kind: "no-exit",
+      routed: false,
+      reason:
+        settings.direct === "never"
+          ? `${moved.reason} Direct routing is not allowed.`
+          : moved.reason,
     }
   }
 

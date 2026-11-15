@@ -47,6 +47,14 @@ export interface HookDeps {
   readonly catalog: ModelCatalog
   readonly bridge: ProxyBridge
   readonly tester: Tester
+  /**
+   * Says that the traffic counters moved.
+   *
+   * The footer counts the requests that went through an exit, and only the
+   * server knows when one did. Without this the number on the pill would
+   * freeze at zero while traffic flowed.
+   */
+  readonly announceTraffic: () => void
 }
 
 /** The registrations of the three hooks, so they can be disposed of. */
@@ -92,6 +100,34 @@ export async function registerHooks(
   deps: HookDeps,
 ): Promise<HookRegistrations> {
   const { state, catalog, bridge, tester } = deps
+
+  /**
+   * Says that traffic moved, at most once a second.
+   *
+   * Every routed request is an event, and every event is a status refresh on
+   * the other side. Announcing each one would make the plugin talk to
+   * itself in a storm, so the announcements are throttled and the last one
+   * is always delivered: a request that arrived during the quiet window
+   * still gets its count onto the pill.
+   */
+  const TRAFFIC_INTERVAL_MS = 1_000
+  let lastAnnounced = 0
+  let pending: ReturnType<typeof setTimeout> | undefined
+  const announceTraffic = (): void => {
+    const now = Date.now()
+    const wait = Math.max(0, TRAFFIC_INTERVAL_MS - (now - lastAnnounced))
+    if (wait === 0) {
+      lastAnnounced = now
+      deps.announceTraffic()
+      return
+    }
+    if (pending !== undefined) return
+    pending = setTimeout(() => {
+      pending = undefined
+      lastAnnounced = Date.now()
+      deps.announceTraffic()
+    }, wait)
+  }
 
   // The request hook is the only one that changes what OpenCode sends, and it
   // is scoped to the OpenCode provider so no other provider is ever touched.
@@ -146,9 +182,14 @@ export async function registerHooks(
         // failure. Switching off, another provider, an unlisted model and a
         // model outside the chosen list are direct by policy, which is the
         // documented behavior, not an error worth failing the request over.
+        // A model list that could not be read is different: the plugin
+        // cannot tell whether this model is free, so going direct would spend
+        // the user's own allowance on a model that may well have been routed.
         if (
           settings.direct === "never" &&
-          (decision.kind === "no-exit" || decision.kind === "bridge")
+          (decision.kind === "no-exit" ||
+            decision.kind === "bridge" ||
+            decision.kind === "catalog")
         ) {
           throw new Error(
             `${decision.reason} The plugin is set to never go direct, so the request was not sent.`,
@@ -171,6 +212,11 @@ export async function registerHooks(
         path: `${url.pathname}${url.search}`,
         headers: headerRecord(input.request),
       })
+
+      // The traffic counter moved, and the footer counts requests that went
+      // through an exit. Saying so is what keeps the number on the pill true
+      // while traffic happens.
+      announceTraffic()
 
       // The exit is chosen here; the in-memory timing starts now. A request that
       // never reaches the exit still has a started mark, which the response
@@ -237,22 +283,63 @@ export async function registerHooks(
       const modelId = input.model.id
       const timing = state.finishTiming(sessionID, modelId)
       const answer = readResponseState(input.response)
+      // The bridge answers a few requests itself: a wrong secret, a target it
+      // does not allow, a proxy that is gone. Those answers say nothing about
+      // the exit behind them, so they are not booked as its health. A bridge
+      // that could not carry the request is the exception: that is the proxy
+      // failing, and it has to be rested and counted.
+      if (input.response.headers.get("x-bridge-error") === "1") {
+        const code = input.response.status
+        if (code >= 500) {
+          state.markFailed(exitId)
+          state.markFailure(exitId, "The proxy could not carry the request.", "unreachable")
+        }
+        state.noteFailureContext(sessionID, modelId, {
+          at: Date.now(),
+          exitId,
+          kind: "server",
+          reached: false,
+          note:
+            code >= 500
+              ? "The proxy could not carry the request."
+              : "The local proxy bridge refused the request.",
+        })
+        return
+      }
       // A proxy has no relay headers to say where the answer came from: reaching
       // the proxy is reaching the upstream. A relay has to say so itself.
       const reached = exit.kind === "proxy" ? true : answer.reachedExit
       state.noteEgress(exitId, answer.egress, answer.runtime)
 
       if (answer.rotate) {
-        const until = nextResetAt()
-        if (answer.egress !== undefined) state.markSpent(answer.egress, until)
+        // The rotate signal is the relay's own echo of the avoid list: the
+        // plugin already told it the address is used up, and the relay
+        // answers instead of calling OpenCode. It is not evidence from the
+        // provider, so it must not retire the exit for longer than the
+        // provider said, and it must not push the address's window further
+        // out.
+        const known = answer.egress !== undefined ? state.spentUntil(answer.egress) : undefined
+        if (known !== undefined) {
+          // The address is known to be spent, for a window the provider gave:
+          // the exit rests until then, and the window is not pushed out.
+          state.markExhausted(exitId, known, "The address behind this relay is used up.")
+        } else {
+          // The window has passed, so the echo is stale: the address is free
+          // again and must not be marked spent for longer. The relay still
+          // refused the request, so the exit rests for a while.
+          state.markRateLimited(
+            exitId,
+            Date.now() + REFUSED_COOLDOWN_MS,
+            "The relay asked for another instance.",
+          )
+        }
         state.markRotated(exitId)
-        state.markExhausted(exitId, until, "The address behind this relay is used up.")
         state.noteFailureContext(sessionID, modelId, {
           at: Date.now(),
           exitId,
           kind: "rotate",
           reached: true,
-          until,
+          until: known,
           note: "The relay asked for another instance.",
         })
         return
@@ -317,8 +404,13 @@ export async function registerHooks(
         if (canary === "spent") {
           const wait = parseRetryAfter(input.response.headers.get("retry-after"))
           const until = wait > 0 ? Date.now() + Math.min(wait, 24 * 60 * 60_000) : nextResetAt()
-          if (answer.egress !== undefined) state.markSpent(answer.egress, until)
-          else if (exit.egress !== undefined) state.markSpent(exit.egress, until)
+          if (answer.egress !== undefined) {
+            state.markSpent(answer.egress, until)
+            state.noteSpendReason(answer.egress, body)
+          } else if (exit.egress !== undefined) {
+            state.markSpent(exit.egress, until)
+            state.noteSpendReason(exit.egress, body)
+          }
           state.markExhausted(exitId, until, "OpenCode confirmed the free allowance of this address is used up.")
           state.noteFailureContext(sessionID, modelId, {
             at: Date.now(),
@@ -333,11 +425,16 @@ export async function registerHooks(
         // Either the request itself was refused, or the canary could not tell.
         // Neither is a reason to keep the exit out of use for long, and neither
         // is a reason to retry the same request through another address.
-        const until = Date.now() + REFUSED_COOLDOWN_MS
-        const note =
-          canary === "clean"
-            ? "OpenCode refused this request; the exit itself still works."
-            : "OpenCode refused this request; the exit could not be confirmed either way."
+        //
+        // A canary that answered proves the exit works: the refusal was about
+        // the request, so the exit is rested for a moment rather than for a
+        // quarter of an hour. A canary that could not tell leaves the doubt
+        // where it was.
+        const clean = canary === "clean"
+        const until = Date.now() + (clean ? RATE_LIMIT_COOLDOWN_MS : REFUSED_COOLDOWN_MS)
+        const note = clean
+          ? "OpenCode refused this request; the exit itself still works."
+          : "OpenCode refused this request; the exit could not be confirmed either way."
         state.markRateLimited(exitId, until, note)
         state.noteFailureContext(sessionID, modelId, {
           at: Date.now(),
@@ -368,6 +465,22 @@ export async function registerHooks(
       }
 
       if (code === 401 || code === 403) {
+        // A relay that never reached the upstream refused the plugin itself:
+        // the access token is wrong, or the target is not allowed. That is a
+        // configuration mistake, not OpenCode turning the exit away, and
+        // saying otherwise would blame the wrong party.
+        if (!reached) {
+          const note = `The relay refused the plugin's access token (HTTP ${code}).`
+          state.markFailure(exitId, note, "bad")
+          state.noteFailureContext(sessionID, modelId, {
+            at: Date.now(),
+            exitId,
+            kind: "server",
+            reached: false,
+            note,
+          })
+          return
+        }
         state.markBlocked(exitId, `OpenCode refused this exit (HTTP ${code}).`)
         state.noteFailureContext(sessionID, modelId, {
           at: Date.now(),
@@ -437,9 +550,11 @@ export async function registerHooks(
 
       const settings = state.settings()
       // Another attempt is worth asking for when another exit can serve, or
-      // when the request may fall back to OpenCode itself.
+      // when the request may fall back to OpenCode itself. The bridge counts:
+      // a proxy behind a bridge that is not running is not a way out, and a
+      // retry would fail for a different reason than the one it was given.
       const canRetry = (): boolean =>
-        state.canRetryAfterAllowance() || settings.direct === "allow"
+        state.canRetryAfterAllowance(bridge.ready) || settings.direct === "allow"
 
       const status = input.error.status
       if (status === undefined || status === 0) {
@@ -533,5 +648,21 @@ export async function registerHooks(
     { providerID: PROVIDER_ID },
   )
 
-  return { request, response, retry }
+  // The pending announcement must not outlive the hooks: a timer that fires
+  // after they are gone would announce to a registration that no longer
+  // exists. Disposing the request hook stops it.
+  const requestDispose = request.dispose
+  return {
+    request: {
+      dispose: async () => {
+        if (pending !== undefined) {
+          clearTimeout(pending)
+          pending = undefined
+        }
+        await requestDispose()
+      },
+    },
+    response,
+    retry,
+  }
 }

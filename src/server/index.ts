@@ -35,7 +35,15 @@ export default Plugin.define({
         return proxy !== undefined && proxy.enabled ? proxy.url : undefined
       },
     })
-    bridge.start()
+    // A bridge that cannot start must not take the plugin with it: the
+    // relays still work, and the proxies are simply out of use until it does.
+    try {
+      bridge.start()
+    } catch (error) {
+      state.noteFailure(
+        `The local proxy bridge could not start, so the proxies are out of use: ${error instanceof Error ? error.message : String(error)}`,
+      )
+    }
 
     // The handlers and the health checks announce a change through the
     // registration, and the registration is built from the handlers, so the
@@ -70,7 +78,18 @@ export default Plugin.define({
     })
     await context.command.reload()
 
-    const hooks = await registerHooks(context, { state, catalog, bridge, tester })
+    const hooks = await registerHooks(context, {
+      state,
+      catalog,
+      bridge,
+      tester,
+      // The traffic counters moved, and the footer shows them. The hooks
+      // throttle this, so a busy session does not turn into a storm of
+      // status refreshes.
+      announceTraffic: () => {
+        void announce("traffic moved").catch(() => {})
+      },
+    })
 
     // Exits that were added but never checked (an import, a list of proxies)
     // are looked at once the plugin is fully set up, not before.

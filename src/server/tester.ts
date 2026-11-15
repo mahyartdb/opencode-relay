@@ -20,6 +20,7 @@ import {
   UPSTREAM_CHAT,
   UPSTREAM_MODELS,
   UPSTREAM_TRACE,
+  egressAddress,
   nextResetAt,
   type ExitRecord,
   type ExitStatus,
@@ -29,6 +30,7 @@ import {
   isFreeUsageLimit,
   parseRetryAfter,
   readBody,
+  readResponseState,
   relayRequest,
   RELAY_ID_HEADER,
 } from "../lib/routing.ts"
@@ -88,12 +90,32 @@ const NOT_REPLAYED = new Set([
   "x-bridge-key",
 ])
 
-/** The headers of a captured request, without the ones that belong to one hop. */
-function replayHeaders(sample: RequestSample | undefined): Headers {
+/**
+ * The headers an api check may carry.
+ *
+ * The api check runs on every exit on a timer, with nobody watching, so it
+ * must not carry anything that could be a credential. A short allowlist is
+ * the only way to be sure of that: a list of names to exclude breaks the
+ * moment OpenCode sends a credential in a header nobody thought of.
+ */
+const API_HEADERS = new Set(["accept", "accept-language", "user-agent"])
+
+/**
+ * The headers of a captured request, without the ones that belong to one hop.
+ *
+ * The session token is only among them when the request needs one. The model
+ * list is answered without a token, and the api check runs on every exit on
+ * a timer: replaying the token there would hand the user's credentials to
+ * whatever address an imported configuration named, without the user ever
+ * asking for a check.
+ */
+function replayHeaders(sample: RequestSample | undefined, withCredentials: boolean): Headers {
   const headers = new Headers()
   if (!sample) return headers
   for (const [name, value] of Object.entries(sample.headers)) {
-    if (NOT_REPLAYED.has(name.toLowerCase())) continue
+    const lower = name.toLowerCase()
+    if (NOT_REPLAYED.has(lower)) continue
+    if (!withCredentials && !API_HEADERS.has(lower)) continue
     headers.set(name, value)
   }
   return headers
@@ -142,11 +164,13 @@ function resetFrom(headers: Headers, body: string): number {
 
 /** Headers a relay or proxy test reports about itself. */
 function exitHeaders(response: Response): { egress?: string; runtime?: string } {
-  const egress = response.headers.get("x-relay-egress")
+  // The address goes into the avoid list that every relay receives, so it
+  // only counts when it looks like an address.
+  const egress = egressAddress(response.headers.get("x-relay-egress") ?? undefined)
   const runtime = response.headers.get("x-relay-runtime")
   return {
-    ...(egress !== null && egress.length > 0 ? { egress } : {}),
-    ...(runtime !== null && runtime.length > 0 ? { runtime } : {}),
+    ...(egress !== undefined ? { egress } : {}),
+    ...(runtime !== null && runtime.length > 0 ? { runtime: runtime.slice(0, 64) } : {}),
   }
 }
 
@@ -230,7 +254,7 @@ async function judge(response: Response, deep = false): Promise<Verdict> {
       note: `The exit redirected the request (HTTP ${code}).`,
     }
   }
-  if (code < 200 || code === 204) {
+  if (code < 200 || code === 204 || code === 205) {
     return {
       status: "bad",
       ok: false,
@@ -344,7 +368,10 @@ export class Tester {
     const signal = timeout(PING_TIMEOUT_MS)
     try {
       const response = await fetchThroughProxy(exit.url, UPSTREAM_TRACE, { signal })
-      const text = await response.text()
+      // The trace answer is a handful of short lines; a captive portal that
+      // answers with megabytes must not be read into memory whole, so the
+      // read is capped like every other body this plugin reads.
+      const text = (await readBody(response, 3000, 8000)) ?? ""
       const match = /^ip=(.+)$/m.exec(text)
       const egress = match?.[1]?.trim()
       // A 2xx alone is not proof: the trace endpoint answers in `ip=` lines,
@@ -373,13 +400,10 @@ export class Tester {
       }
     } catch (error) {
       const note = error instanceof Error ? error.message : String(error)
-      await this.record(exit.id, {
-        status: "unreachable",
-        latencyMs: elapsed(),
-        lastError: note.slice(0, 240),
-        checkedAt,
-        healthEpoch,
-      })
+      // Nothing was learned about the exit: it simply did not answer. A rest
+      // is the honest verdict, not a retirement that only another test
+      // could lift.
+      this.deps.state.markFailure(exit.id, note.slice(0, 240), "unreachable")
       return { ok: false, status: "unreachable", code: 0, ms: elapsed(), note }
     }
   }
@@ -395,6 +419,17 @@ export class Tester {
   }
 
   private async check(exit: ExitRecord, mode: "api" | "deep"): Promise<TestResult> {
+    // A deep check carries the user's OpenCode session token, and a paused
+    // exit is out of use on purpose: the token has no business going there.
+    if (mode === "deep" && !exit.enabled) {
+      return {
+        ok: false,
+        status: "unknown",
+        code: 0,
+        ms: 0,
+        note: "This exit is paused, so it was not asked for a real request.",
+      }
+    }
     // When this check started, not when it ended: two overlapping checks may
     // finish out of order, and the older verdict must not overwrite the newer.
     const checkedAt = Date.now()
@@ -404,7 +439,11 @@ export class Tester {
     const started = performance.now()
     const elapsed = () => Math.max(0, Math.round(performance.now() - started))
     const sample = this.deps.state.requestSample()
-    const headers = replayHeaders(sample)
+    // The api check needs no session token, and must not send one: it runs on
+    // every exit on a timer, and an exit the user never vetted would receive
+    // the credentials. The deep check asks for a real completion, which only
+    // answers for a request that carries them.
+    const headers = replayHeaders(sample, mode === "deep")
     const signal = timeout(mode === "api" ? API_TIMEOUT_MS : DEEP_TIMEOUT_MS)
     let target = UPSTREAM_MODELS
     let init: RequestInit = { method: "GET", headers, signal }
@@ -443,13 +482,10 @@ export class Tester {
       response = await send(exit, target, init)
     } catch (error) {
       const note = error instanceof Error ? error.message : String(error)
-      await this.record(exit.id, {
-        status: "unreachable",
-        latencyMs: elapsed(),
-        lastError: note.slice(0, 240),
-        checkedAt,
-        healthEpoch,
-      })
+      // The exit never answered, so nothing was learned about it. A rest
+      // (not a retirement) is the honest verdict: the exit is tried again
+      // later, rather than staying out of use until a person tests it.
+      this.deps.state.markFailure(exit.id, note.slice(0, 240), "unreachable")
       return {
         ok: false,
         status: "unreachable",
@@ -458,12 +494,54 @@ export class Tester {
         note: mode === "api" ? "OpenCode could not be reached through this exit." : note,
       }
     }
-    const verdict = await judge(response, mode === "deep")
+    let verdict = await judge(response, mode === "deep")
+    /**
+     * A refusal without credentials is the test's own doing.
+     *
+     * The deep check asks for a completion, which OpenCode only answers for
+     * a request that carries the real headers. A deep test without a
+     * captured request has nothing to imitate, so it goes out without the
+     * authorization header, and a refusal then says nothing about the exit:
+     * it would be the test that was refused. Recording it as "blocked" would
+     * retire the exit until another test came, which is a verdict the check
+     * never earned. The api check is not affected: the model list is answered
+     * without a session token, so a refusal there is a real one.
+     */
+    const sentCredentials = headers.has("authorization") || headers.has("cookie")
+    if (mode === "deep" && verdict.status === "blocked" && !sentCredentials) {
+      verdict = {
+        ...verdict,
+        status: "unknown",
+        ok: false,
+        note:
+          "OpenCode refused the test request, but it carried no credentials, so this says nothing about the exit.",
+      }
+    }
+    /**
+     * A refusal that never reached OpenCode is the relay's own.
+     *
+     * A relay with a wrong access token answers the request itself, and
+     * OpenCode never sees it. The forwarded answers carry the relay's own
+     * headers, so the difference is visible: blaming OpenCode for a refusal
+     * the relay made sends the user after the wrong party.
+     */
+    if (verdict.status === "blocked" && exit.kind === "relay" && !readResponseState(response).reachedExit) {
+      verdict = {
+        ...verdict,
+        status: "bad",
+        ok: false,
+        note: "The relay refused the plugin's access token.",
+      }
+    }
     const about = exitHeaders(response)
     const ms = elapsed()
     // An answered model list proves OpenCode is reachable, not that a model
-    // request will work; only the deep test can say "ready".
-    const status = mode === "api" && verdict.status === "ready" ? "reachable" : verdict.status
+    // request will work; only the deep test can say "ready". A check that does
+    // not disprove the stronger verdict must not replace it either: an exit
+    // that served a real request is still known to work.
+    const proven = this.deps.state.exit(exit.id)?.status === "ready"
+    const status =
+      mode === "api" && verdict.status === "ready" && !proven ? "reachable" : verdict.status
     // A proxy's address is fixed, so a spent address means a spent proxy. A
     // relay can rotate to another instance, so only the address is remembered.
     const until = verdict.until
@@ -504,11 +582,19 @@ export class Tester {
     try {
       const response = await send(exit, UPSTREAM_MODELS, {
         method: "GET",
-        headers: replayHeaders(undefined),
+        headers: replayHeaders(undefined, false),
         signal,
       })
       if (!response.ok) return undefined
-      const data = (await response.json()) as { data?: Array<{ id?: unknown }> }
+      // The model list is read with a cap: an exit that answers the endpoint
+      // with a huge or never-ending body must not fill the memory doing it.
+      const text = (await readBody(response, 5000, 200_000)) ?? ""
+      let data: { data?: Array<{ id?: unknown }> }
+      try {
+        data = JSON.parse(text) as { data?: Array<{ id?: unknown }> }
+      } catch {
+        return undefined
+      }
       const first = data.data?.find((entry) => typeof entry.id === "string")
       return typeof first?.id === "string" ? first.id : undefined
     } catch {
@@ -528,7 +614,7 @@ export class Tester {
   async canary(exit: ExitRecord): Promise<CanaryVerdict> {
     const sample = this.deps.state.requestSample()
     if (sample === undefined) return "inconclusive"
-    const headers = replayHeaders(sample)
+    const headers = replayHeaders(sample, true)
     headers.set("content-type", "application/json")
     try {
       const response = await send(exit, UPSTREAM_CHAT, {
@@ -564,7 +650,11 @@ export class Tester {
   /** Check every exit, one after another, and say how far it has got. */
   scan(mode: TestMode = "api"): Promise<void> {
     if (this.running !== undefined) return this.running
-    const total = this.deps.state.exits().length
+    // A deep check carries the user's OpenCode session token, so it only
+    // goes to the exits that are in use. The count says how many checks this
+    // run will really make.
+    const exits = this.deps.state.exits()
+    const total = mode === "deep" ? exits.filter((exit) => exit.enabled).length : exits.length
     if (total === 0) return Promise.resolve()
     this.running = this.runScan(mode, total).finally(() => {
       this.running = undefined
@@ -573,8 +663,12 @@ export class Tester {
     return this.running
   }
 
-  private async runScan(mode: TestMode, total: number): Promise<void> {
+  private async runScan(mode: TestMode, initialTotal: number): Promise<void> {
     const startedAt = Date.now()
+    // The total is the number of checks this run has to make. It only grows
+    // when an exit is added while the run is going, so the fraction the pill
+    // shows counts every check and not only the ones that are left.
+    let total = initialTotal
     const progress: ScanProgress = {
       startedAt,
       total,
@@ -584,13 +678,46 @@ export class Tester {
     let done = 0
     this.deps.state.setScanning(progress)
     // A list of fifty proxies must not take an hour, and hammering forty
-    // endpoints at once is how a provider decides to block the user. Four at a
-    // time keeps a long list moving without looking like an attack.
-    const queue = [...this.deps.state.exits()]
+    // endpoints at once is how a provider decides to block the user. Four at
+    // a time keeps a long list moving without looking like an attack.
+    //
+    // A deep check carries the user's OpenCode session token, so it only goes
+    // to the exits that are in use: a paused exit was put aside on purpose,
+    // and the token has no business going there.
+    const queue = this.deps.state
+      .exits()
+      .filter((exit) => mode !== "deep" || exit.enabled)
+    // An exit added while the scan runs (a paste finishing in the background,
+    // a deploy landing mid-scan) must not sit untested because the queue was
+    // copied once at the start: it is appended here, so the workers drain it
+    // before they stop.
+    const seen = new Set(queue.map((exit) => exit.id))
+    const appended = (): void => {
+      let added = 0
+      for (const exit of this.deps.state.exits()) {
+        if (seen.has(exit.id)) continue
+        seen.add(exit.id)
+        // A deep check carries the session token, so a paused exit is left
+        // out of it as well.
+        if (mode === "deep" && !exit.enabled) continue
+        queue.push(exit)
+        added += 1
+      }
+      if (added === 0) return
+      total += added
+      this.deps.state.setScanning({ startedAt, total, done, deep: mode === "deep" })
+    }
     const worker = async (): Promise<void> => {
       for (;;) {
         const exit = queue.shift()
-        if (exit === undefined || this.stopped) return
+        if (exit === undefined) {
+          // The queue ran dry, but an exit may have landed while the last
+          // check ran. One re-check catches it; the workers stop together.
+          appended()
+          if (queue.length === 0 || this.stopped) return
+          continue
+        }
+        if (this.stopped) return
         try {
           await this.test(exit.id, mode)
         } catch (error) {
