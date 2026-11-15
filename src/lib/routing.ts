@@ -10,6 +10,7 @@
 
 import {
   UPSTREAM_HOST,
+  egressAddress,
   type ExitKind,
   type ExitStatus,
   type ModelInfo,
@@ -112,6 +113,15 @@ export interface ExitCandidate {
   readonly name: string
   readonly status: ExitStatus
   readonly latencyMs?: number
+  /**
+   * The average of the recent round trips, when there is one.
+   *
+   * The fastest strategy compares this, not the last round trip: one long
+   * generation (minutes) would otherwise read as a slow exit and sideline
+   * it, and the exit that was slow once could never be picked again to
+   * prove otherwise.
+   */
+  readonly averageMs?: number
 }
 
 /** Why an exit is not in the usable list. */
@@ -175,12 +185,15 @@ export function nextExit<T extends ExitCandidate>(
       return { exit: usable[0], cursor: options.cursor }
     }
     case "fastest": {
-      // A relay with no measured latency is not assumed fast: it comes after
-      // every exit that has answered at least once. Ties keep list order.
+      // An exit with no measured latency is not assumed fast: it comes after
+      // every exit that has answered at least once. The comparison uses the
+      // average of the recent round trips, so one slow generation does not
+      // sideline an exit that is usually the quick one. Ties keep list order.
+      const speed = (exit: T): number => exit.averageMs ?? exit.latencyMs ?? Number.POSITIVE_INFINITY
       let best = usable[0]
-      let bestMs = best?.latencyMs ?? Number.POSITIVE_INFINITY
+      let bestMs = best === undefined ? Number.POSITIVE_INFINITY : speed(best)
       for (const exit of usable.slice(1)) {
-        const ms = exit.latencyMs ?? Number.POSITIVE_INFINITY
+        const ms = speed(exit)
         if (ms < bestMs) {
           best = exit
           bestMs = ms
@@ -233,7 +246,28 @@ type StreamedRequestInit = RequestInit & { duplex?: "half" }
 /** A relay url as people write it: without a scheme, or with a trailing slash. */
 export function normalizeRelayUrl(url: string): string {
   const withScheme = /^[a-z][a-z0-9+.-]*:\/\//i.test(url) ? url : `https://${url}`
-  return withScheme.endsWith("/") ? withScheme.slice(0, -1) : withScheme
+  // The scheme is lowercased: "HTTPS://host" is an https address, and a
+  // relay that is refused for the case of its scheme would be refused for
+  // nothing.
+  const lowered = withScheme.replace(/^([a-z][a-z0-9+.-]*):\/\//i, (_match, scheme: string) => `${scheme.toLowerCase()}://`)
+  return lowered.endsWith("/") ? lowered.slice(0, -1) : lowered
+}
+
+/**
+ * Whether a relay address may carry the access key in the clear.
+ *
+ * The key and the OpenCode authorization header travel to the relay, so a
+ * remote address has to be https. A loopback address is exempt: that is a
+ * relay on this machine, where nothing crosses a network.
+ */
+export function isSafeRelayUrl(url: string): boolean {
+  if (/^https:\/\//i.test(url)) return true
+  try {
+    const host = new URL(url).hostname.toLowerCase()
+    return host === "127.0.0.1" || host === "localhost" || host === "[::1]" || host === "::1"
+  } catch {
+    return false
+  }
 }
 
 /** Copy the headers of a request, dropping the hop-by-hop and exit-owned ones. */
@@ -263,6 +297,16 @@ function forwardedHeaders(request: Request): Headers {
  * access token to a host the user did not choose.
  */
 export function relayRequest(request: Request, target: RelayTarget): Request {
+  const address = normalizeRelayUrl(target.url)
+  // The access key and the OpenCode authorization header travel to the relay,
+  // so a remote relay in plain http would carry them in the clear. A relay
+  // stored by an older version may still have such an address: it is refused
+  // here rather than used, and the exit is marked as failing by the caller.
+  if (!isSafeRelayUrl(address)) {
+    throw new Error(
+      `The relay at ${address} is not an https address, so the access key cannot be sent to it safely.`,
+    )
+  }
   const source = new URL(request.url, UPSTREAM_ORIGIN)
   const path = `${source.pathname}${source.search}`
   const headers = forwardedHeaders(request)
@@ -288,7 +332,7 @@ export function relayRequest(request: Request, target: RelayTarget): Request {
     init.duplex = "half"
   }
 
-  return new Request(normalizeRelayUrl(target.url), init)
+  return new Request(address, init)
 }
 
 /**
@@ -364,7 +408,9 @@ export interface ResponseState {
  */
 export function readResponseState(response: Response): ResponseState {
   const rotate = response.status === 409 && response.headers.get("x-relay-rotate") === "1"
-  const egress = response.headers.get("x-relay-egress") ?? undefined
+  // The address goes into the avoid list that every relay receives, so it
+  // only counts when it looks like an address.
+  const egress = egressAddress(response.headers.get("x-relay-egress") ?? undefined)
   const instance = response.headers.get("x-relay-instance") ?? undefined
   const runtime = response.headers.get("x-relay-runtime") ?? undefined
   const reachedExit = instance !== undefined || runtime !== undefined || egress !== undefined
@@ -422,10 +468,20 @@ export async function readBody(
     const decoder = new TextDecoder()
     const read = (async (): Promise<string> => {
       let text = ""
+      let bytes = 0
       for (;;) {
         const { done, value } = await reader.read()
         if (done) break
-        if (value !== undefined) text += decoder.decode(value, { stream: true })
+        if (value !== undefined) {
+          bytes += value.byteLength
+          text += decoder.decode(value, { stream: true })
+          // The cap is applied while reading, not after it: a body that never
+          // ends would otherwise fill the memory until the timeout fires.
+          if (bytes >= limit) {
+            void reader.cancel().catch(() => {})
+            break
+          }
+        }
       }
       return text + decoder.decode()
     })()

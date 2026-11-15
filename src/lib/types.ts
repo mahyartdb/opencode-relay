@@ -25,6 +25,26 @@ export const UPSTREAM_MODELS = "https://opencode.ai/inference/v1/models"
 /** The chat endpoint a real test uses when no request shaped one is known. */
 export const UPSTREAM_CHAT = "https://opencode.ai/inference/openai/v1/chat/completions"
 
+/**
+ * The address an exit says it leaves from, when it looks like one.
+ *
+ * The address goes into the avoid list that every relay receives, so an
+ * exit must not be able to put anything there but an address: a value that
+ * is not an address would travel to every relay as a header, and one that
+ * is too long would make every relay's request fail.
+ */
+export function egressAddress(value: string | undefined): string | undefined {
+  if (value === undefined) return undefined
+  const trimmed = value.trim()
+  if (trimmed.length === 0 || trimmed.length > 45) return undefined
+  if (!/^[0-9a-fA-F:.]+$/.test(trimmed)) return undefined
+  // An IPv4 address has three dots; an IPv6 address has at least two colons.
+  const dots = (trimmed.match(/\./g) ?? []).length
+  const colons = (trimmed.match(/:/g) ?? []).length
+  if (dots !== 3 && colons < 2) return undefined
+  return trimmed
+}
+
 /** Where an exit says which address it is seen from. */
 export const UPSTREAM_TRACE = "https://opencode.ai/cdn-cgi/trace"
 
@@ -217,6 +237,14 @@ export interface RelayRecord extends ExitHealth {
   readonly access: string
   /** Id of the account this relay was deployed with. */
   readonly accountId: string
+  /**
+   * The runtime the relay was deployed with.
+   *
+   * A redeploy has to use the same one: a relay deployed with node and
+   * redeployed with bun is a different relay, and it may stop answering.
+   * This is what was deployed; `runtime` is what the relay reports.
+   */
+  readonly deployRuntime?: "bun" | "node"
 }
 
 /** An HTTP or SOCKS proxy the user added. */
@@ -252,6 +280,12 @@ export interface ExitSummary {
   readonly latencyMs?: number
   readonly lastCheck?: number
   readonly exhaustedUntil?: number
+  /**
+   * Why OpenCode said the address is used up, when it said. Read at
+   * used-up time and shown beside the reset, so "used up until X" can also
+   * say what OpenCode actually answered.
+   */
+  readonly spendReason?: string
   readonly lastError?: string
   readonly stats: ExitStats
 }
@@ -280,6 +314,7 @@ export function displayUrl(url: string): string {
 export function toExitSummary(
   exit: ExitRecord,
   stats: ExitStats = EMPTY_STATS,
+  spendReason?: string,
 ): ExitSummary {
   const common = {
     id: exit.id,
@@ -294,6 +329,7 @@ export function toExitSummary(
     ...(exit.latencyMs !== undefined ? { latencyMs: exit.latencyMs } : {}),
     ...(exit.lastCheck !== undefined ? { lastCheck: exit.lastCheck } : {}),
     ...(exit.exhaustedUntil !== undefined ? { exhaustedUntil: exit.exhaustedUntil } : {}),
+    ...(spendReason !== undefined ? { spendReason } : {}),
     ...(exit.lastError !== undefined ? { lastError: exit.lastError } : {}),
     stats,
   }
@@ -409,7 +445,6 @@ export interface ScanProgress {
   readonly startedAt: number
   readonly total: number
   readonly done: number
-  readonly kind?: ExitKind
   readonly deep: boolean
 }
 

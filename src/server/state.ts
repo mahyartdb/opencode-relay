@@ -37,6 +37,10 @@ import {
 } from "../lib/types.ts"
 import { nextExit } from "../lib/routing.ts"
 import {
+  ACCOUNTS_KEY,
+  PROXIES_KEY,
+  RELAYS_KEY,
+  SETTINGS_KEY,
   readAccounts,
   readProxies,
   readRelays,
@@ -46,6 +50,58 @@ import {
   writeRelays,
   writeSettings,
 } from "./storage.ts"
+
+/**
+ * Put back the fields one change set, where nothing else has touched them.
+ *
+ * A rollback that restored the whole object would throw away whatever
+ * another writer did while the write was in flight. Only the fields this
+ * call set are taken back, and only where they still hold what this call
+ * put there.
+ */
+function restoreFields(previous: Settings, changed: Settings, current: Settings): Settings {
+  const restored: Record<string, unknown> = { ...current }
+  const before = previous as unknown as Record<string, unknown>
+  const after = changed as unknown as Record<string, unknown>
+  const now = current as unknown as Record<string, unknown>
+  for (const key of Object.keys(after)) {
+    if (now[key] !== after[key]) continue
+    restored[key] = before[key]
+  }
+  return restored as unknown as Settings
+}
+
+/**
+ * A write that did not land.
+ *
+ * The change is in memory but not on disk, so the caller has to be told: a
+ * change that looks saved and is not would be lost at the next restart.
+ */export class StorageError extends Error {
+  constructor(
+    /** The stored list that could not be written, e.g. "relays". */
+    readonly key: string,
+    readonly reason: unknown,
+  ) {
+    super(
+      `The ${key} could not be written: ${reason instanceof Error ? reason.message : String(reason)}`,
+    )
+    this.name = "StorageError"
+  }
+}
+
+/**
+ * The proxies, with the reason they cannot serve.
+ *
+ * The local proxy bridge carries every proxy request, so a bridge that is
+ * not running stops all of them: the picker has to leave them out, or it
+ * would name an exit that cannot carry the request.
+ */
+export function proxyExclusions(state: RelayState): { readonly id: string; readonly reason: string }[] {
+  return state
+    .exits()
+    .filter((exit) => exit.kind === "proxy")
+    .map((exit) => ({ id: exit.id, reason: "the local proxy bridge is not running" }))
+}
 
 /** What the plugin is currently routing, and how. */
 export interface Settings {
@@ -61,6 +117,13 @@ export interface Settings {
   readonly customModels: string[]
   /** The exit preferred by the one-exit and until-exhausted strategies. */
   readonly activeExitId?: string
+  /**
+   * Where the round-robin rotation stood.
+   *
+   * The exit that served last, so a restart carries on from there instead of
+   * starting the rotation at the first exit every time.
+   */
+  readonly rotationId?: string
   /** Whether the server checks exits in the background. */
   readonly healthChecks: boolean
 }
@@ -82,6 +145,25 @@ const DEFAULT_SETTINGS: Settings = {
 
 /** How long a failing exit is left alone before it is tried again. */
 export const COOLDOWN_BASE_MS = 2 * 60_000
+
+/**
+ * How often the fastest strategy sends a request to another exit.
+ *
+ * The fastest exit is the only one that is picked, so the others would keep
+ * the measurement they had when they were last tried. Every few requests one
+ * goes to the least-measured exit instead, so it is measured again.
+ */
+const REMEASURE_EVERY = 5
+
+/**
+ * How often the rotation position is written.
+ *
+ * The position is written with the rules, so a restart carries on from where
+ * it was. Writing it on every request would write a file per request, so it
+ * is written at most this often: the position on disk is then at most a few
+ * seconds old.
+ */
+const ROTATION_WRITE_MS = 5_000
 
 /** The longest a failing exit is left alone. */
 export const COOLDOWN_MAX_MS = 30 * 60_000
@@ -173,6 +255,21 @@ export class RelayState {
   private notes_: string[] = []
   /** Where the last request went, for the strategy that moves on each time. */
   private cursor = 0
+  /**
+   * The exit the round-robin rotation served last.
+   *
+   * A place in the list cannot survive the list changing: an exit added or
+   * removed shifts every place after it, so a number would point at the
+   * wrong exit. The exit itself is remembered instead, and the rotation
+   * carries on from wherever it now stands.
+   */
+  private lastServedId: string | undefined
+  /** Where a round-robin rotation starts, when the user chose the exit. */
+  private rotationStartId: string | undefined
+  /** How many requests the fastest strategy has sent, for the re-measure. */
+  private fastestTurns = 0
+  /** When the rotation position was last written. */
+  private lastRotationWrite = 0
   /** Why an address was marked as spent, when the provider said why. */
   private readonly spendReasons = new Map<string, string>()
   /** Exits that did not answer, and how many times in a row. */
@@ -205,9 +302,25 @@ export class RelayState {
       readSettings(this.storage),
     ])
     this.accountList = accounts
+    // Whether a used-up latch has run out is decided on the stored records,
+    // before they are freshened: a record that was freshened first would
+    // never look expired, and the cleared state would never be written back.
+    const expired = [...relays, ...proxies].some(
+      (exit) => exit.status === "exhausted" && (exit.exhaustedUntil ?? 0) <= Date.now(),
+    )
     this.relayList = relays.map((relay) => this.fresh(relay))
     this.proxyList = proxies.map((proxy) => this.fresh(proxy))
     this.rules = settings ?? { ...DEFAULT_SETTINGS, customModels: [] }
+    // The rotation picks up where it was: a restart that always started at
+    // the first exit would let that one burn its allowance first every time.
+    // Where the position was never written, the exit the user chose is where
+    // the rotation starts: choosing an exit means starting the rotation
+    // there, and that choice outlives a restart too.
+    if (this.rules.rotationId !== undefined) {
+      this.lastServedId = this.rules.rotationId
+    } else if (this.rules.activeExitId !== undefined) {
+      this.rotationStartId = this.rules.activeExitId
+    }
     // A live failure's rest was written with its status, so a restart picks it
     // back up: `usable()` needs the entry to see both that the exit failed
     // live and when the rest is over. An entry whose rest has already passed
@@ -218,16 +331,18 @@ export class RelayState {
       if (exit.coolingUntil === undefined) continue
       this.cooling.set(exit.id, { until: exit.coolingUntil, failures: exit.failures ?? 0 })
     }
-    const expired = [...this.relayList, ...this.proxyList].some(
-      (exit) => exit.status === "exhausted" && (exit.exhaustedUntil ?? 0) <= Date.now(),
-    )
     if (expired) {
-      this.relayList = this.relayList.map((relay) => this.fresh(relay))
-      this.proxyList = this.proxyList.map((proxy) => this.fresh(proxy))
-      await Promise.all([
-        writeRelays(this.storage, this.relayList),
-        writeProxies(this.storage, this.proxyList),
-      ])
+      // The cleared latch is written back: the disk would otherwise keep
+      // saying "used up" until some unrelated write rewrote the list. A write
+      // that fails is reported and not waited for: the latch is already
+      // cleared in memory, and the plugin must still start.
+      void Promise.all([
+        this.enqueueWrite(RELAYS_KEY, () => writeRelays(this.storage, this.relayList)),
+        this.enqueueWrite(PROXIES_KEY, () => writeProxies(this.storage, this.proxyList)),
+      ]).catch((error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error)
+        this.noteFailure(`The used-up exits could not be cleared on disk: ${message}`)
+      })
     }
     // An active exit that is gone would leave the menu without one to test or
     // update, so the first exit takes its place. With no exit at all, there is
@@ -250,6 +365,33 @@ export class RelayState {
   /** The stored accounts. */
   accounts(): readonly Account[] {
     return this.accountList
+  }
+
+  /**
+   * One write queue per storage key.
+   *
+   * Every durable write rewrites its whole key, so two overlapping writes
+   * would land in completion order, not call order: a success after a
+   * failure could be overwritten on disk by the failure that preceded it,
+   * and a restart would then serve an exit that is really resting — or bench
+   * one that just worked. Queueing per key makes the last mutation win, and
+   * each queued write snapshots the list at run time, so it always persists
+   * the latest memory.
+   */
+  private readonly writeQueues = new Map<string, Promise<void>>()
+
+  private enqueueWrite(key: string, write: () => Promise<void>): Promise<void> {
+    const tail = this.writeQueues.get(key) ?? Promise.resolve()
+    // A write that fails must not be reported as a write that landed: the
+    // change is in memory but not on disk, and the caller has to know.
+    const next = tail.then(write).catch((reason: unknown) => {
+      throw new StorageError(key, reason)
+    })
+    this.writeQueues.set(
+      key,
+      next.catch(() => {}),
+    )
+    return next
   }
 
   /** The stored relays. */
@@ -315,53 +457,118 @@ export class RelayState {
       createdAt: Date.now(),
     }
     this.accountList = [...this.accountList, account]
-    await writeAccounts(this.storage, this.accountList)
+    try {
+      await this.enqueueWrite(ACCOUNTS_KEY, () => writeAccounts(this.storage, this.accountList))
+    } catch (error) {
+      // The change did not land, so it must not stay in memory either: a
+      // reader would see an account that is not stored.
+      this.accountList = this.accountList.filter((item) => item.id !== account.id)
+      throw error
+    }
     return account
   }
 
   /** Forget an account. The relays it deployed stay: they run on their own. */
   async removeAccount(id: string): Promise<boolean> {
-    const kept = this.accountList.filter((account) => account.id !== id)
-    if (kept.length === this.accountList.length) return false
-    this.accountList = kept
-    await writeAccounts(this.storage, this.accountList)
+    const index = this.accountList.findIndex((account) => account.id === id)
+    if (index < 0) return false
+    const removed = this.accountList[index] as Account
+    this.accountList = this.accountList.filter((account) => account.id !== id)
+    try {
+      await this.enqueueWrite(ACCOUNTS_KEY, () => writeAccounts(this.storage, this.accountList))
+    } catch (error) {
+      // The account was not forgotten, so it goes back where it was.
+      this.accountList = [...this.accountList.slice(0, index), removed, ...this.accountList.slice(index)]
+      throw error
+    }
     return true
   }
 
   /** Store a relay. */
   async addRelay(relay: RelayRecord): Promise<RelayRecord> {
     this.relayList = [...this.relayList, relay]
-    await writeRelays(this.storage, this.relayList)
+    try {
+      await this.enqueueWrite(RELAYS_KEY, () => writeRelays(this.storage, this.relayList))
+    } catch (error) {
+      this.relayList = this.relayList.filter((item) => item.id !== relay.id)
+      throw error
+    }
     // A plugin with one exit and no choice would report "no exit" while an exit
-    // sits right there, so the first one becomes the chosen one.
+    // sits right there, so the first one becomes the chosen one. That pointer
+    // is a second write, and it must not make the first one look lost: the
+    // exit is stored either way, and a stale pointer is repaired at the next
+    // load.
     if (this.rules.activeExitId === undefined) {
-      this.rules = { ...this.rules, activeExitId: relay.id }
-      await writeSettings(this.storage, this.rules)
+      await this.rememberChosenExit(relay.id)
     }
     return relay
+  }
+
+  /**
+   * Point the routing at the first exit, without making the exit look lost.
+   *
+   * The pointer is written after the exit itself. A write that fails there
+   * leaves the exit stored and the pointer stale, which the next load
+   * repairs; it must not be reported as if the exit had never been stored.
+   */
+  private async rememberChosenExit(id: string): Promise<void> {
+    try {
+      await this.writeRules(() => ({ ...this.rules, activeExitId: id }))
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      this.noteFailure(`The chosen exit could not be remembered: ${message}`)
+    }
   }
 
   /** Store a proxy. */
   async addProxy(proxy: ProxyRecord): Promise<ProxyRecord> {
     this.proxyList = [...this.proxyList, proxy]
-    await writeProxies(this.storage, this.proxyList)
+    try {
+      await this.enqueueWrite(PROXIES_KEY, () => writeProxies(this.storage, this.proxyList))
+    } catch (error) {
+      this.proxyList = this.proxyList.filter((item) => item.id !== proxy.id)
+      throw error
+    }
     if (this.rules.activeExitId === undefined) {
-      this.rules = { ...this.rules, activeExitId: proxy.id }
-      await writeSettings(this.storage, this.rules)
+      await this.rememberChosenExit(proxy.id)
     }
     return proxy
+  }
+
+  /** Store many relays with one write, so an import is not a disk wait per entry. */
+  async addRelayList(relays: readonly RelayRecord[]): Promise<void> {
+    if (relays.length === 0) return
+    const added = new Set(relays.map((relay) => relay.id))
+    this.relayList = [...this.relayList, ...relays]
+    try {
+      await this.enqueueWrite(RELAYS_KEY, () => writeRelays(this.storage, this.relayList))
+    } catch (error) {
+      this.relayList = this.relayList.filter((item) => !added.has(item.id))
+      throw error
+    }
+    if (this.rules.activeExitId === undefined) {
+      const first = this.exits()[0]
+      if (first) {
+        await this.rememberChosenExit(first.id)
+      }
+    }
   }
 
   /** Store many proxies with one write, so a long list is not a long disk wait. */
   async addProxyList(proxies: readonly ProxyRecord[]): Promise<void> {
     if (proxies.length === 0) return
+    const added = new Set(proxies.map((proxy) => proxy.id))
     this.proxyList = [...this.proxyList, ...proxies]
-    await writeProxies(this.storage, this.proxyList)
+    try {
+      await this.enqueueWrite(PROXIES_KEY, () => writeProxies(this.storage, this.proxyList))
+    } catch (error) {
+      this.proxyList = this.proxyList.filter((item) => !added.has(item.id))
+      throw error
+    }
     if (this.rules.activeExitId === undefined) {
       const first = this.exits()[0]
       if (first) {
-        this.rules = { ...this.rules, activeExitId: first.id }
-        await writeSettings(this.storage, this.rules)
+        await this.rememberChosenExit(first.id)
       }
     }
   }
@@ -378,7 +585,9 @@ export class RelayState {
     if (urlChanged && input.url !== undefined) {
       // A new address is a new exit: the verdicts, measurements and resting
       // state the old record gathered belong to a machine that is no longer
-      // behind this entry, so the record starts over untested.
+      // behind this entry, so the record starts over untested. The memory
+      // entries go with it — a record that kept `coolingUntil` beside a
+      // cleared map would put the rest back on the next restart.
       next = {
         kind: "proxy",
         id,
@@ -388,21 +597,32 @@ export class RelayState {
         status: "untested" as Status,
         createdAt: current.createdAt,
       }
+      this.cooling.delete(id)
+      this.stats.delete(id)
+      // Bump, never delete: a check that started before the URL changed
+      // stamps the epoch it saw, and deleting the entry would make that old
+      // stamp look current again — letting the old URL's verdict land on the
+      // new record.
+      this.bumpHealthEpoch(id)
     } else {
-      // The rest goes with the memory entry this write deletes: a record that
-      // kept `coolingUntil` beside a cleared map would put the rest back on
-      // the next restart. Every other field stays as it is.
-      const { coolingUntil: _cooling, failures: _failures, ...kept } = current
+      // A rename is not a new exit: the same machine sits behind the entry,
+      // so its verdicts, counters and any live rest all stay exactly as they
+      // are. Only the fields the user touched move.
       next = {
-        ...kept,
+        ...current,
         ...(input.name !== undefined ? { name: input.name } : {}),
         ...(input.url !== undefined ? { url: input.url } : {}),
       }
     }
     this.proxyList = this.proxyList.map((proxy) => (proxy.id === id ? next : proxy))
-    this.cooling.delete(id)
-    this.stats.delete(id)
-    await writeProxies(this.storage, this.proxyList)
+    try {
+      await this.enqueueWrite(PROXIES_KEY, () => writeProxies(this.storage, this.proxyList))
+    } catch (error) {
+      // The edit did not land, so the old proxy goes back: a reader would
+      // otherwise see an address the disk does not have.
+      this.proxyList = this.proxyList.map((proxy) => (proxy.id === id ? current : proxy))
+      throw error
+    }
     return next
   }
 
@@ -410,6 +630,14 @@ export class RelayState {
   async setHealth(id: string, update: HealthUpdate): Promise<boolean> {
     const current = this.exit(id)
     if (!current) return false
+    // The epoch as it stands now, so a rollback can restore exactly this:
+    // this call never bumps the epoch, and undoing a bump a live verdict
+    // made would let a stale check overwrite that verdict.
+    const epochAtEntry = this.healthEpoch(id)
+    // A verdict that proves nothing leaves the record alone. A check that
+    // could not tell (no captured request, a refusal it cannot read) would
+    // otherwise revive an exit that just failed a real request.
+    if (update.status === "unknown") return false
     // A live verdict bumps the epoch, so a check that started before it is
     // stale however new its own `checkedAt` looks: applying its answer would
     // overwrite what a real request just proved. Callers that do not stamp an
@@ -433,31 +661,64 @@ export class RelayState {
     // proved it works again, so it only travels with an exhausted status. The
     // live rest is dropped with it for every verdict: a test verdict governs
     // alone, so a `bad` one still stays retired until another test, and a
-    // restart must not resurrect a rest the test has just superseded.
+    // restart must not resurrect a rest the test has just superseded. The old
+    // failure note goes with the rest of the verdict: an update that carries
+    // no error of its own replaces the whole verdict, and a "ready" record
+    // that kept the previous error's text would show an error under a
+    // healthy status.
     const {
       exhaustedUntil: previousUntil,
       coolingUntil: _cooling,
       failures: _failures,
+      lastError: _previousError,
       ...rest
     } = current
-    const until = update.exhaustedUntil ?? previousUntil
+    // The "used up" latch only ends when something proves the allowance is
+    // back: a real model answer through this exit, which is what a "ready"
+    // verdict means. The model list answers even when the allowance is gone,
+    // so a check that only asked for it must not lift the latch - otherwise
+    // every ten minutes the record would be cleared and the next request
+    // would be sent to an address that has no allowance left.
+    const usedUp = previousUntil !== undefined && previousUntil > checkedAt
+    const stillUsedUp = usedUp && update.status !== "ready"
+    const until = stillUsedUp ? previousUntil : update.exhaustedUntil ?? previousUntil
     const next: ExitRecord = {
       ...rest,
-      status: update.status,
+      status: stillUsedUp ? "exhausted" : update.status,
       lastCheck: checkedAt,
       ...(update.latencyMs !== undefined ? { latencyMs: update.latencyMs } : {}),
       ...(update.egress !== undefined ? { egress: update.egress } : {}),
       ...(update.runtime !== undefined ? { runtime: update.runtime } : {}),
       ...(update.lastError !== undefined ? { lastError: update.lastError } : {}),
-      ...(update.status === "exhausted" && until !== undefined ? { exhaustedUntil: until } : {}),
+      ...(until !== undefined && (stillUsedUp || update.status === "exhausted")
+        ? { exhaustedUntil: until }
+        : {}),
     }
     // A verdict from a test or a probe supersedes whatever live rest was
     // armed: the record it writes carries no rest fields, and the in-memory
     // entry goes with it, for every status. A `bad` verdict then governs
     // alone — retired until another test — instead of reviving when an older
     // live rest happens to run out.
+    const previousCooling = this.cooling.get(id)
     this.cooling.delete(id)
-    await this.replaceExit(next)
+    try {
+      await this.replaceExit(next)
+    } catch (error) {
+      // The verdict did not land, so the old one goes back in full: the
+      // record, the rest, and the epoch are undone together, so memory, disk
+      // and the picker all agree again. The epoch is restored to what it was
+      // when this call started: this call never bumped it, and a rollback
+      // that removed a bump a live verdict made would let a check that
+      // started before that verdict overwrite it.
+      this.epochs.set(id, epochAtEntry)
+      if (current.kind === "relay") {
+        this.relayList = this.relayList.map((relay) => (relay.id === id ? current : relay))
+      } else {
+        this.proxyList = this.proxyList.map((proxy) => (proxy.id === id ? current : proxy))
+      }
+      if (previousCooling !== undefined) this.cooling.set(id, previousCooling)
+      throw error
+    }
     return (
       current.status !== next.status ||
       current.lastError !== next.lastError ||
@@ -484,11 +745,72 @@ export class RelayState {
   async setExitEnabled(id: string, enabled: boolean): Promise<boolean> {
     const current = this.exit(id)
     if (!current) return false
+    // An exit that is already in the state asked for is left alone: nothing
+    // changes, so nothing is written and nothing is announced.
+    if (current.enabled === enabled) return false
     // Pausing is not a health verdict, so the rest is left alone: resuming,
     // here or after a restart, finds the exit still resting out its failure.
     const next: ExitRecord = { ...current, enabled }
     await this.replaceExit(next)
     return true
+  }
+
+  /**
+   * Bring every paused exit back into use.
+   *
+   * The exits are written once per kind rather than once per exit, so
+   * resuming a list of ten costs two writes, not ten. The rests are left
+   * alone: a paused exit that was resting keeps resting, and comes back
+   * when its own rest is over.
+   */
+  async resumeAll(): Promise<string[]> {
+    const resumed: string[] = []
+    const relays = this.relayList.map((relay) => {
+      if (relay.enabled) return relay
+      resumed.push(relay.id)
+      return { ...relay, enabled: true }
+    })
+    const proxies = this.proxyList.map((proxy) => {
+      if (proxy.enabled) return proxy
+      resumed.push(proxy.id)
+      return { ...proxy, enabled: true }
+    })
+    if (resumed.length === 0) return resumed
+    // Only the exits this call resumed go back when a write fails: a verdict
+    // written meanwhile must not be discarded with them.
+    const resumedRelays = new Set(
+      resumed.filter((id) => this.relayList.some((relay) => relay.id === id)),
+    )
+    const resumedProxies = new Set(
+      resumed.filter((id) => this.proxyList.some((proxy) => proxy.id === id)),
+    )
+    this.relayList = relays
+    this.proxyList = proxies
+    try {
+      await this.enqueueWrite(RELAYS_KEY, () => writeRelays(this.storage, this.relayList))
+    } catch (error) {
+      // The relays were not written, so they go back to being paused. The
+      // proxies have not been touched yet.
+      this.relayList = this.relayList.map((relay) =>
+        resumedRelays.has(relay.id) ? { ...relay, enabled: false } : relay,
+      )
+      throw error
+    }
+    try {
+      await this.enqueueWrite(PROXIES_KEY, () => writeProxies(this.storage, this.proxyList))
+    } catch (error) {
+      // The proxies were not written, so they go back to being paused. The
+      // relays were written, so they stay as they are: a rollback of both
+      // would leave the disk saying something the memory does not.
+      this.proxyList = this.proxyList.map((proxy) =>
+        resumedProxies.has(proxy.id) ? { ...proxy, enabled: false } : proxy,
+      )
+      throw new StorageError(
+        "proxies",
+        `${error instanceof Error ? error.message : String(error)} The relays were resumed.`,
+      )
+    }
+    return resumed
   }
 
   /**
@@ -502,17 +824,22 @@ export class RelayState {
     if (!exit) return
     this.bumpHealthEpoch(id)
     const failures = this.cooling.get(id)?.failures ?? 0
-    this.cooling.set(id, { until, failures })
+    // The rest is capped here, at the one choke point every caller goes
+    // through: a Retry-After of years (a hostile or broken header) must not
+    // be written into the persisted record, where only another test or a
+    // success could ever clear it.
+    const capped = Math.min(until, Date.now() + COOLDOWN_MAX_MS * 8)
+    this.cooling.set(id, { until: capped, failures })
     // The rest is written with the status, so a restart keeps waiting it out
     // instead of serving before the cooldown has ended.
     const next: ExitRecord = {
       ...exit,
-      status: "limited",
-      coolingUntil: until,
+      status: this.failureStatus(exit, "limited"),
+      coolingUntil: capped,
       failures,
-      ...(note !== undefined ? { lastError: note.slice(0, 240) } : {}),
+      ...(note !== undefined ? { lastError: this.scrub(note).slice(0, 240) } : {}),
     }
-    void this.replaceExit(next).catch(() => {})
+    this.persistVerdict(next, "rate limit")
   }
 
   /** An exit OpenCode refuses to talk to, e.g. a blocked address. */
@@ -525,42 +852,91 @@ export class RelayState {
     const rested = this.rest(id)
     const next: ExitRecord = {
       ...exit,
-      status: "blocked",
+      status: this.failureStatus(exit, "blocked"),
       coolingUntil: rested.until,
       failures: rested.failures,
-      ...(note !== undefined ? { lastError: note.slice(0, 240) } : {}),
+      ...(note !== undefined ? { lastError: this.scrub(note).slice(0, 240) } : {}),
     }
-    void this.replaceExit(next).catch(() => {})
+    this.persistVerdict(next, "refusal")
+  }
+
+  /**
+   * The status a failure verdict leaves behind.
+   *
+   * A live "used up" latch outranks a failure verdict: the address has no
+   * allowance left, and that is the fact the user has to see. The rest the
+   * failure arms still applies on top of it.
+   */
+  private failureStatus(exit: ExitRecord, status: ExitStatus): ExitStatus {
+    if ((exit.exhaustedUntil ?? 0) > Date.now()) return "exhausted"
+    return status
   }
 
   /** One exit as the terminal UI sees it. */
   summaryOf(id: string): ExitSummary | undefined {
     const exit = this.exit(id)
-    return exit === undefined ? undefined : toExitSummary(exit, this.statsFor(id))
+    if (exit === undefined) return undefined
+    // The reason OpenCode gave for spending the address belongs next to the
+    // reset time; without it "used up until X" is all the user ever sees.
+    const egress = exit.egress
+    const reason = egress !== undefined ? this.spendReason(egress) : undefined
+    return toExitSummary(exit, this.statsFor(id), reason)
   }
 
-  /** Replace one exit in memory and on disk. */
-  private async replaceExit(next: ExitRecord): Promise<void> {
+  /** Replace one exit in memory and on disk, through its key's write queue. */
+  private replaceExit(next: ExitRecord): Promise<void> {
     if (next.kind === "relay") {
       this.relayList = this.relayList.map((relay) => (relay.id === next.id ? next : relay))
-      await writeRelays(this.storage, this.relayList)
-    } else {
-      this.proxyList = this.proxyList.map((proxy) => (proxy.id === next.id ? next : proxy))
-      await writeProxies(this.storage, this.proxyList)
+      // The list is read when the write runs, so a change that was rolled
+      // back in the meantime is not written back by this write.
+      return this.enqueueWrite(RELAYS_KEY, () => writeRelays(this.storage, this.relayList))
     }
+    this.proxyList = this.proxyList.map((proxy) => (proxy.id === next.id ? next : proxy))
+    return this.enqueueWrite(PROXIES_KEY, () => writeProxies(this.storage, this.proxyList))
   }
 
   /** Forget an exit, and stop routing through it when it was the active one. */
   async removeExit(id: string): Promise<ExitRecord | undefined> {
     const exit = this.exit(id)
     if (!exit) return undefined
+    // The exit goes back where it was if the write does not land, so memory
+    // and disk agree on whether it is still there.
+    const index = exit.kind === "relay"
+      ? this.relayList.findIndex((relay) => relay.id === id)
+      : this.proxyList.findIndex((proxy) => proxy.id === id)
+    // The rotation stands where it was: when the exit that served last is
+    // removed, the one before it takes its place, so the rotation carries on
+    // with the next one instead of starting over.
+    if (this.lastServedId === id) {
+      const before = this.exits()
+      const at = before.findIndex((item) => item.id === id)
+      const previous = at > 0 ? before[at - 1] : undefined
+      this.lastServedId = previous?.id
+      this.cursor = 0
+    }
     if (exit.kind === "relay") {
       this.relayList = this.relayList.filter((relay) => relay.id !== id)
-      await writeRelays(this.storage, this.relayList)
     } else {
       this.proxyList = this.proxyList.filter((proxy) => proxy.id !== id)
-      await writeProxies(this.storage, this.proxyList)
     }
+    try {
+      await this.enqueueWrite(
+        exit.kind === "relay" ? RELAYS_KEY : PROXIES_KEY,
+        () =>
+          exit.kind === "relay"
+            ? writeRelays(this.storage, this.relayList)
+            : writeProxies(this.storage, this.proxyList),
+      )
+    } catch (error) {
+      if (exit.kind === "relay") {
+        this.relayList = [...this.relayList.slice(0, index), exit as RelayRecord, ...this.relayList.slice(index)]
+      } else {
+        this.proxyList = [...this.proxyList.slice(0, index), exit as ProxyRecord, ...this.proxyList.slice(index)]
+      }
+      throw error
+    }
+    // The cleanup comes before the settings write: the exit is gone either
+    // way, and a rule that still names it is repaired at the next load.
     this.cooling.delete(id)
     this.epochs.delete(id)
     this.stats.delete(id)
@@ -570,8 +946,16 @@ export class RelayState {
     if (this.rules.activeExitId === id) {
       // The next exit takes the place of the one that is gone, so the menu and
       // the footer still have an exit to name and to test.
-      this.rules = { ...this.rules, activeExitId: this.exits()[0]?.id }
-      await writeSettings(this.storage, this.rules)
+      const next = this.exits()[0]?.id
+      try {
+        await this.writeRules(() => ({ ...this.rules, activeExitId: next }))
+      } catch (error) {
+        // The removal itself landed, so the answer is not a failure: the
+        // stale choice is fixed at the next load, and the user is told.
+        this.noteFailure(
+          `The chosen exit was reset in memory but could not be written: ${error instanceof Error ? error.message : String(error)}`,
+        )
+      }
     }
     return exit
   }
@@ -586,53 +970,132 @@ export class RelayState {
 
   /** Turn the routing on or off. */
   async setEnabled(enabled: boolean): Promise<void> {
-    this.rules = { ...this.rules, enabled }
-    await writeSettings(this.storage, this.rules)
+    await this.writeRules(() => ({ ...this.rules, enabled }))
   }
+
+  /** Write the rules through the queue, so the last mutation lands last. */
+  private writeSettingsQueued(): Promise<void> {
+    const rules = this.rules
+    return this.enqueueWrite(SETTINGS_KEY, () => writeSettings(this.storage, rules))
+  }
+
+  /**
+   * Put the rules in place, and take them back if the write did not land.
+   *
+   * A rule that could not be saved must not stay in memory: the menu would
+   * show it as in force and the next restart would quietly undo it. Only the
+   * change this call made is taken back, and only when nothing else has
+   * changed the rules meanwhile.
+   *
+   * The whole read-modify-write runs in a chain, so two rule changes never
+   * overlap: a change that was rolled back can never be written by a write
+   * that was queued before the rollback, and the disk and the memory always
+   * agree.
+   */
+  private async writeRules(build: (current: Settings) => Settings): Promise<void> {
+    // The whole read-modify-write runs in the chain, so two rule changes
+    // never overlap: the value is built when the write runs, after any
+    // earlier write has rolled back, and a value that was rolled back can
+    // never be written by a write that was queued behind it.
+    const write = this.rulesChain.then(async () => {
+      const previous = this.rules
+      const next = build(this.rules)
+      this.rules = next
+      try {
+        await this.enqueueWrite(SETTINGS_KEY, () => writeSettings(this.storage, next))
+      } catch (error) {
+        this.rules = restoreFields(previous, next, this.rules)
+        throw error
+      }
+    })
+    this.rulesChain = write.catch(() => {})
+    return write
+  }
+
+  /** The rules write in flight, so two rule changes never overlap. */
+  private rulesChain: Promise<void> = Promise.resolve()
 
   /** Choose which models are routed. Without a list, the custom one is kept as it is. */
   async setSelection(selection: Selection, models?: readonly string[]): Promise<Settings> {
-    this.rules = {
-      ...this.rules,
+    await this.writeRules((current) => ({
+      ...current,
       selection,
-      customModels: models === undefined ? [...this.rules.customModels] : [...models],
-    }
-    await writeSettings(this.storage, this.rules)
+      customModels: models === undefined ? [...current.customModels] : [...models],
+    }))
     return this.rules
   }
 
   /** Pick the exit traffic prefers, or none at all. */
   async setActiveExit(id: string | undefined): Promise<void> {
-    this.rules = { ...this.rules, activeExitId: id }
     // In round robin, choosing an exit means starting the rotation there.
-    const index = id === undefined ? -1 : this.exits().findIndex((exit) => exit.id === id)
-    if (this.rules.strategy === "round-robin" && index >= 0) this.cursor = index
-    await writeSettings(this.storage, this.rules)
+    const previousStart = this.rotationStartId
+    const previousServed = this.lastServedId
+    this.rotationStartId = id
+    this.lastServedId = undefined
+    // The stored position goes with it: a restart would otherwise resume the
+    // rotation where it was. With no position on record, the load falls back
+    // to the chosen exit, which is the start the user asked for.
+    try {
+      await this.writeRules(() => ({ ...this.rules, activeExitId: id, rotationId: undefined }))
+    } catch (error) {
+      // The choice did not land, so the rotation goes back to where it was.
+      this.rotationStartId = previousStart
+      this.lastServedId = previousServed
+      throw error
+    }
   }
 
   /** How requests that cannot use an exit behave. */
   async setDirect(direct: DirectPolicy): Promise<void> {
-    this.rules = { ...this.rules, direct }
-    await writeSettings(this.storage, this.rules)
+    await this.writeRules(() => ({ ...this.rules, direct }))
   }
 
   /** Whether the server checks exits in the background. */
   async setHealthChecks(healthChecks: boolean): Promise<void> {
-    this.rules = { ...this.rules, healthChecks }
-    await writeSettings(this.storage, this.rules)
+    await this.writeRules(() => ({ ...this.rules, healthChecks }))
   }
 
   /** Choose how the exits are used. */
   async setStrategy(strategy: Strategy): Promise<void> {
-    this.rules = { ...this.rules, strategy }
     // Round robin starts at the exit the user chose, so switching to it does
     // not silently move the first request somewhere else.
-    const index =
-      this.rules.activeExitId === undefined
-        ? -1
-        : this.exits().findIndex((exit) => exit.id === this.rules.activeExitId)
-    this.cursor = strategy === "round-robin" && index >= 0 ? index : 0
-    await writeSettings(this.storage, this.rules)
+    const previousStart = this.rotationStartId
+    const previousServed = this.lastServedId
+    const previousCursor = this.cursor
+    this.rotationStartId = strategy === "round-robin" ? this.rules.activeExitId : undefined
+    this.lastServedId = undefined
+    this.cursor = 0
+    // The stored position goes with it: a restart would otherwise resume the
+    // rotation where it was. With no position on record, the load falls back
+    // to the chosen exit, which is where the strategy starts.
+    try {
+      await this.writeRules(() => ({ ...this.rules, strategy, rotationId: undefined }))
+    } catch (error) {
+      // The change did not land, so the rotation goes back to where it was.
+      this.rotationStartId = previousStart
+      this.lastServedId = previousServed
+      this.cursor = previousCursor
+      throw error
+    }
+  }
+
+  /**
+   * Put several rules in place with one write.
+   *
+   * An import that wrote the rules one at a time could fail halfway and leave
+   * a mixture of the old settings and the new ones.
+   */
+  async applySettings(update: Partial<Settings>): Promise<void> {
+    if (update.strategy !== undefined) {
+      // Round robin starts at the exit the user chose, so switching to it does
+      // not silently move the first request somewhere else.
+      this.rotationStartId = update.strategy === "round-robin" ? this.rules.activeExitId : undefined
+      this.lastServedId = undefined
+      this.cursor = 0
+    }
+    // The stored position goes with the strategy: a restart would otherwise
+    // resume the rotation where it was.
+    await this.writeRules(() => ({ ...this.rules, ...update, rotationId: undefined }))
   }
 
   /**
@@ -653,12 +1116,31 @@ export class RelayState {
 
   /** Why an address was marked as spent, when the provider said. */
   noteSpendReason(egress: string, body: string): void {
-    this.spendReasons.set(egress, body.replace(/\s+/g, " ").slice(0, 200))
+    this.spendReasons.set(egress, this.scrub(body.replace(/\s+/g, " ").slice(0, 200)))
     while (this.spendReasons.size > 64) {
       const first = this.spendReasons.keys().next().value
       if (first === undefined) break
       this.spendReasons.delete(first)
     }
+  }
+
+  /**
+   * Take the captured credentials out of a text that came back through an exit.
+   *
+   * The body of a 429 travels through the exit, and a relay terminates the
+   * connection: it could echo the request's own authorization header back.
+   * The text is shown on the exit's page, so every captured value that is
+   * long enough to be worth hiding is taken out of it.
+   */
+  private scrub(text: string): string {
+    const sample = this.requestSample()
+    if (sample === undefined) return text
+    let out = text
+    for (const value of Object.values(sample.headers)) {
+      if (value.length < 8) continue
+      out = out.split(value).join("***")
+    }
+    return out
   }
 
   /** Why an address was marked as spent, when the provider said. */
@@ -669,7 +1151,11 @@ export class RelayState {
   /** Whether an exit may serve a request now. */
   private usable(exit: ExitRecord, now: number): boolean {
     if (!exit.enabled) return false
-    if (exit.status === "exhausted" && (exit.exhaustedUntil ?? 0) > now) return false
+    // A live "used up" latch outranks every failure verdict: a transport
+    // failure that lands after the exhaustion verdict would otherwise clear
+    // the latch in all but name, and the exit would serve an address whose
+    // allowance is gone once the short rest is over.
+    if ((exit.exhaustedUntil ?? 0) > now) return false
     if (exit.status === "untested") return false
     const cool = this.cooling.get(exit.id)
     // A live failure rests the exit for a while, but it is not a retirement:
@@ -690,11 +1176,10 @@ export class RelayState {
   /** Why an exit is not usable, in words the menu can show. */
   private skipReason(exit: ExitRecord, now: number): string {
     if (!exit.enabled) return "paused"
-    if (exit.status === "exhausted") {
-      return exit.exhaustedUntil !== undefined && exit.exhaustedUntil > now
-        ? `used up until ${resetTime(exit.exhaustedUntil)}`
-        : "used up"
-    }
+    // A live "used up" latch outranks every failure verdict, so the reason
+    // says so too: the exit is not failing, its allowance is gone.
+    if ((exit.exhaustedUntil ?? 0) > now) return `used up until ${resetTime(exit.exhaustedUntil ?? 0)}`
+    if (exit.status === "exhausted") return "used up"
     if (exit.status === "untested") return "not tested yet"
     if (exit.status === "unreachable") return "not answering"
     if (exit.status === "blocked") return "blocked by OpenCode"
@@ -715,13 +1200,24 @@ export class RelayState {
    *
    * `now` is for asking about another moment, as the other predicates here do.
    */
-  pickExit(options: { readonly advance?: boolean; readonly now?: number } = {}): PickResult {
+  pickExit(options: {
+    readonly advance?: boolean
+    readonly now?: number
+    /** Exits to leave out, and why. */
+    readonly exclude?: readonly { readonly id: string; readonly reason: string }[]
+  } = {}): PickResult {
     const advance = options.advance ?? true
     const now = options.now ?? Date.now()
     const all = this.exits()
     const usable: ExitRecord[] = []
     const skipped: SkippedExit[] = []
+    const excluded = new Map((options.exclude ?? []).map((entry) => [entry.id, entry.reason]))
     for (const exit of all) {
+      const reason = excluded.get(exit.id)
+      if (reason !== undefined) {
+        skipped.push({ id: exit.id, name: exit.name, kind: exit.kind, reason })
+        continue
+      }
       if (this.usable(exit, now)) usable.push(exit)
       else {
         skipped.push({
@@ -732,12 +1228,92 @@ export class RelayState {
         })
       }
     }
-    const { exit, cursor } = nextExit(usable, all, {
-      strategy: this.rules.strategy,
-      ...(this.rules.activeExitId !== undefined ? { activeId: this.rules.activeExitId } : {}),
-      cursor: this.cursor,
-    })
+    /**
+     * Where the round-robin rotation stands.
+     *
+     * The rotation walks the exits in order, so its position is remembered
+     * as the place it reached in that order - not as a number into the
+     * usable list, which changes as exits rest and come back. When the exit
+     * that served last is resting, the rotation carries on to the next one
+     * that can serve, so an exit that comes back is served in turn rather
+     * than twice in a row.
+     */
+    const rotationStart = (): number => {
+      const start = this.rotationStartId
+      if (start !== undefined) {
+        const index = usable.findIndex((candidate) => candidate.id === start)
+        if (index >= 0) return index
+        // The exit the user chose as the start cannot serve right now. The
+        // rotation starts at the next one that can, and the chosen exit
+        // keeps its place for when it comes back.
+        const at = all.findIndex((candidate) => candidate.id === start)
+        for (let step = 1; at >= 0 && step <= all.length; step++) {
+          const candidate = all[(at + step) % all.length]
+          if (candidate === undefined) continue
+          const index = usable.findIndex((usableExit) => usableExit.id === candidate.id)
+          if (index >= 0) return index
+        }
+      }
+      const last = this.lastServedId
+      if (last !== undefined) {
+        // The exit that served last is looked up by id, not by the place it
+        // had: an exit added or removed shifts every place after it, and a
+        // number would then point at the wrong exit.
+        const from = all.findIndex((candidate) => candidate.id === last)
+        for (let step = 1; from >= 0 && step <= all.length; step++) {
+          const candidate = all[(from + step) % all.length]
+          if (candidate === undefined) continue
+          const index = usable.findIndex((usableExit) => usableExit.id === candidate.id)
+          if (index >= 0) return index
+        }
+      }
+      return this.cursor
+    }
+    const { exit, cursor } = nextExit(
+      usable.map((candidate) => this.withSpeed(candidate)),
+      all.map((candidate) => this.withSpeed(candidate)),
+      {
+        strategy: this.rules.strategy,
+        ...(this.rules.activeExitId !== undefined ? { activeId: this.rules.activeExitId } : {}),
+        cursor: this.rules.strategy === "round-robin" ? rotationStart() : this.cursor,
+      },
+    )
     if (advance) this.cursor = cursor
+    if (advance && this.rules.strategy === "round-robin" && exit !== undefined) {
+      // The rotation remembers where it is by the exit it served, not by a
+      // number that means different things as the list changes. A pick that
+      // found nothing does not move the rotation: the exit the user chose as
+      // its start is still the start when the exits come back.
+      this.lastServedId = exit.id
+      this.rotationStartId = undefined
+      this.rememberRotation()
+    }
+    // The fastest strategy needs the other exits measured too: the fastest
+    // exit is the only one that is ever picked, so an exit that was slow
+    // once would be sidelined for the whole session and never get the chance
+    // to prove the first measurement was a fluke. Every few turns one request
+    // goes to the least-measured exit instead, and it is measured again.
+    //
+    // The turn is counted from the next request, so a preview that does not
+    // advance anything still names the exit the next request would use.
+    if (this.rules.strategy === "fastest" && usable.length > 1) {
+      const turn = this.fastestTurns + 1
+      const remeasure = turn % REMEASURE_EVERY === 0
+      if (remeasure) {
+        const least = usable.reduce<ExitRecord | undefined>((best, candidate) => {
+          if (best === undefined) return candidate
+          return this.statsFor(candidate.id).ok < this.statsFor(best.id).ok ? candidate : best
+        }, undefined)
+        if (least !== undefined && least.id !== exit?.id) {
+          if (advance) {
+            this.fastestTurns = turn
+            this.lastServedId = least.id
+          }
+          return { exit: least, skipped, reason: "" }
+        }
+      }
+      if (advance) this.fastestTurns = turn
+    }
     if (exit === undefined) {
       const used = skipped.filter((entry) => entry.reason.startsWith("used up")).length
       const reason =
@@ -748,24 +1324,57 @@ export class RelayState {
             : "No exit can serve a request right now."
       return { skipped, reason }
     }
-    if (
-      advance &&
-      this.rules.strategy === "exhausted" &&
-      exit.id !== this.rules.activeExitId
-    ) {
-      // The chosen exit ran out; the state remembers the next one so the
-      // fallback is not recomputed from a shrinking list on every request.
-      this.rules = { ...this.rules, activeExitId: exit.id }
-      void writeSettings(this.storage, this.rules).catch((error: unknown) => {
-        const message = error instanceof Error ? error.message : String(error)
-        this.noteFailure(`The next exit could not be remembered: ${message}`)
-      })
-    }
     return { exit, skipped, reason: "" }
   }
 
   /**
-   * Remember that an exit did not answer.
+   * An exit with the average of its recent round trips attached.
+   *
+   * The fastest strategy compares this rather than the last round trip: a
+   * single long generation is not a slow exit, and the exit that was slow
+   * once must still be able to be picked again to prove otherwise.
+   */  private withSpeed<T extends ExitRecord>(exit: T): T & { readonly averageMs?: number } {
+    const average = this.statsFor(exit.id).averageMs
+    return average === undefined ? exit : { ...exit, averageMs: average }
+  }
+
+  /**
+   * Write where the rotation stands, at most every few seconds.
+   *
+   * A restart that always starts the rotation at the first exit would let
+   * that one burn its allowance first every time. The position is written
+   * with the rules, at most once every few seconds, so a busy session does
+   * not write a file per request.
+   */
+  private rememberRotation(): void {
+    const id = this.lastServedId
+    const now = Date.now()
+    if (now - this.lastRotationWrite < ROTATION_WRITE_MS) return
+    this.lastRotationWrite = now
+    // The position goes into the rules, so it is written with them and it
+    // survives a restart.
+    void this.writeRules(() => ({ ...this.rules, rotationId: id })).catch((error: unknown) => {
+      const message = error instanceof Error ? error.message : String(error)
+      this.noteFailure(`The rotation could not be remembered: ${message}`)
+    })
+  }
+
+  /**
+   * Persist a verdict that has to land, and say so when it does not.
+   *
+   * A verdict that is only in memory is lost at the next restart, and the
+   * exit comes back as if it had never failed. The user is told instead: a
+   * silent divergence between what the menu says and what the disk holds is
+   * worse than a loud one.
+   */
+  private persistVerdict(next: ExitRecord, what: string): void {
+    void this.replaceExit(next).catch((error: unknown) => {
+      const message = error instanceof Error ? error.message : String(error)
+      this.noteFailure(`The ${what} could not be saved: ${message}`)
+    })
+  }
+
+  /** Remember that an exit did not answer.
    *
    * The wait starts at two minutes and doubles with every consecutive failure,
    * capped at thirty minutes; one success clears it. A single dropped
@@ -773,22 +1382,21 @@ export class RelayState {
    * keeps failing should not be tried on every request.
    */
   markFailure(id: string, note?: string, status: ExitStatus = "unreachable"): void {
-    const rested = this.rest(id)
     const exit = this.exit(id)
-    if (exit) {
-      this.bumpHealthEpoch(id)
-      // The rest is written with the status in one replaceExit, so a crash
-      // cannot persist a live failure whose rest is lost: a restart would
-      // otherwise read the failure as a test verdict and skip the exit forever.
-      const next: ExitRecord = {
-        ...exit,
-        status,
-        coolingUntil: rested.until,
-        failures: rested.failures,
-        ...(note !== undefined ? { lastError: note.slice(0, 240) } : {}),
-      }
-      void this.replaceExit(next).catch(() => {})
+    if (!exit) return
+    const rested = this.rest(id)
+    this.bumpHealthEpoch(id)
+    // The rest is written with the status in one replaceExit, so a crash
+    // cannot persist a live failure whose rest is lost: a restart would
+    // otherwise read the failure as a test verdict and skip the exit forever.
+    const next: ExitRecord = {
+      ...exit,
+      status: this.failureStatus(exit, status),
+      coolingUntil: rested.until,
+      failures: rested.failures,
+      ...(note !== undefined ? { lastError: this.scrub(note).slice(0, 240) } : {}),
     }
+    this.persistVerdict(next, "failure")
   }
 
   /** Arm the next rest for this exit, twice as long as the one before. */
@@ -873,14 +1481,18 @@ export class RelayState {
       exit.status !== "ready" ||
       exit.coolingUntil !== undefined ||
       exit.failures !== undefined ||
-      exit.exhaustedUntil !== undefined
+      exit.exhaustedUntil !== undefined ||
+      exit.lastError !== undefined
     ) {
       // The keys are removed rather than set to null-ish, so the stored JSON
-      // keeps its optional fields optional.
+      // keeps its optional fields optional. The old failure note goes too:
+      // a "ready" record that still carried the last error's text would have
+      // the menu show an error under a healthy status.
       const {
         exhaustedUntil: _until,
         coolingUntil: _cooling,
         failures: _failures,
+        lastError: _error,
         ...cleared
       } = exit
       const next: ExitRecord = {
@@ -889,7 +1501,7 @@ export class RelayState {
         lastCheck: Date.now(),
         ...(measured !== undefined ? { latencyMs: measured } : {}),
       }
-      void this.replaceExit(next).catch(() => {})
+      this.persistVerdict(next, "result")
       return
     }
     // The in-memory record is what the menu and the fastest strategy read.
@@ -941,12 +1553,22 @@ export class RelayState {
     // A used-up verdict is live evidence: a check that began before it must not
     // bring the exit back with an answer of its own.
     this.bumpHealthEpoch(id)
+    // The used-up verdict is the stronger one, so an older rest goes with it:
+    // the rest of a rate limit would otherwise keep the exit out of use after
+    // the allowance is back, and a restart would restore a rest the running
+    // process was not enforcing.
+    this.cooling.delete(id)
+    const {
+      coolingUntil: _cooling,
+      failures: _failures,
+      ...rest
+    } = exit
     const next: ExitRecord = {
-      ...exit,
+      ...rest,
       status: "exhausted",
       exhaustedUntil: until,
       lastCheck: Date.now(),
-      ...(note !== undefined ? { lastError: note.slice(0, 240) } : {}),
+      ...(note !== undefined ? { lastError: this.scrub(note).slice(0, 240) } : {}),
     }
     if (next.kind === "relay") {
       this.relayList = this.relayList.map((relay) => (relay.id === id ? next : relay))
@@ -954,8 +1576,8 @@ export class RelayState {
       this.proxyList = this.proxyList.map((proxy) => (proxy.id === id ? next : proxy))
     }
     void (next.kind === "relay"
-      ? writeRelays(this.storage, this.relayList)
-      : writeProxies(this.storage, this.proxyList)
+      ? this.enqueueWrite(RELAYS_KEY, () => writeRelays(this.storage, this.relayList))
+      : this.enqueueWrite(PROXIES_KEY, () => writeProxies(this.storage, this.proxyList))
     ).catch((error: unknown) => {
       const message = error instanceof Error ? error.message : String(error)
       this.noteFailure(`The used-up exit could not be remembered: ${message}`)
@@ -963,9 +1585,14 @@ export class RelayState {
     if (this.rules.strategy !== "exhausted") return
     if (this.rules.activeExitId !== id) return
     const pick = this.pickExit({ advance: false })
-    if (!pick.exit) return
-    this.rules = { ...this.rules, activeExitId: pick.exit.id }
-    void writeSettings(this.storage, this.rules).catch((error: unknown) => {
+    const chosen = pick.exit
+    if (!chosen) return
+    // The change is in memory at once, so a caller that reads the rules in
+    // the same tick sees what was decided. The write goes through the rules
+    // writer, so a failed write takes it back: the state must not name an
+    // exit the disk does not.
+    this.rules = { ...this.rules, activeExitId: chosen.id }
+    void this.writeRules(() => ({ ...this.rules, activeExitId: chosen.id })).catch((error: unknown) => {
       const message = error instanceof Error ? error.message : String(error)
       this.noteFailure(`The next exit could not be remembered: ${message}`)
     })
@@ -986,6 +1613,9 @@ export class RelayState {
       for (const exit of expired) {
         const { exhaustedUntil: _until, coolingUntil: _cooling, failures: _failures, ...rest } = exit
         const next: ExitRecord = { ...rest, status: "reachable" }
+        // The rest goes with the latch: the record no longer carries it, so
+        // the live map must not keep it either.
+        this.cooling.delete(exit.id)
         if (next.kind === "relay") {
           this.relayList = this.relayList.map((relay) => (relay.id === exit.id ? next : relay))
         } else {
@@ -993,9 +1623,12 @@ export class RelayState {
         }
       }
       void Promise.all([
-        writeRelays(this.storage, this.relayList),
-        writeProxies(this.storage, this.proxyList),
-      ]).catch(() => {})
+        this.enqueueWrite(RELAYS_KEY, () => writeRelays(this.storage, this.relayList)),
+        this.enqueueWrite(PROXIES_KEY, () => writeProxies(this.storage, this.proxyList)),
+      ]).catch((error: unknown) => {
+        const message = error instanceof Error ? error.message : String(error)
+        this.noteFailure(`The used-up exits could not be cleared: ${message}`)
+      })
     }
     return exhausted
   }
@@ -1009,10 +1642,14 @@ export class RelayState {
    */
   async restoreExhausted(): Promise<string[]> {
     const restored: string[] = []
-    this.relayList = this.relayList.map((relay) => {
-      if (relay.status !== "exhausted") return relay
+    const beforeRelays = this.relayList
+    const beforeProxies = this.proxyList
+    this.relayList = this.relayList.map((relay) => {      if (relay.status !== "exhausted") return relay
       restored.push(relay.id)
       this.cooling.delete(relay.id)
+      // A restore is live evidence too: a check that began before it must
+      // not re-mark the exit used up with an answer of its own.
+      this.bumpHealthEpoch(relay.id)
       const { exhaustedUntil: _until, coolingUntil: _cooling, failures: _failures, ...rest } = relay
       return { ...rest, status: "reachable" as Status }
     })
@@ -1020,15 +1657,30 @@ export class RelayState {
       if (proxy.status !== "exhausted") return proxy
       restored.push(proxy.id)
       this.cooling.delete(proxy.id)
+      this.bumpHealthEpoch(proxy.id)
       const { exhaustedUntil: _until, coolingUntil: _cooling, failures: _failures, ...rest } = proxy
       return { ...rest, status: "reachable" as Status }
     })
     this.cursor = 0
-    if (restored.length > 0) {
-      await Promise.all([
-        writeRelays(this.storage, this.relayList),
-        writeProxies(this.storage, this.proxyList),
-      ])
+    if (restored.length === 0) return restored
+    try {
+      await this.enqueueWrite(RELAYS_KEY, () => writeRelays(this.storage, this.relayList))
+    } catch (error) {
+      // The relays were not written, so they go back to being used up. The
+      // proxies have not been touched yet.
+      this.relayList = beforeRelays
+      throw error
+    }
+    try {
+      await this.enqueueWrite(PROXIES_KEY, () => writeProxies(this.storage, this.proxyList))
+    } catch (error) {
+      // The proxies were not written, so they go back to being used up. The
+      // relays were written, so they stay as they are.
+      this.proxyList = beforeProxies
+      throw new StorageError(
+        "proxies",
+        `${error instanceof Error ? error.message : String(error)} The relays were brought back.`,
+      )
     }
     return restored
   }
@@ -1041,6 +1693,19 @@ export class RelayState {
       if (first === undefined) break
       this.spent.delete(first)
     }
+  }
+
+  /**
+   * When an address is known to be used up, and until when.
+   *
+   * The window the provider gave is the one that counts: an exit that sits
+   * on a spent address must not be retired for longer than the provider
+   * said, and the window must not be pushed further out.
+   */
+  spentUntil(egress: string, now = Date.now()): number | undefined {
+    const until = this.spent.get(egress)
+    if (until === undefined || until <= now) return undefined
+    return until
   }
 
   /** The addresses the exits should not send from, with expired entries dropped. */
@@ -1095,7 +1760,17 @@ export class RelayState {
 
   /** The moment a routed request started, so its answer can be timed. */
   noteStarted(sessionID: string, modelID: string): void {
-    this.started.set(`${sessionID}\u0000${modelID}`, Date.now())
+    const now = Date.now()
+    // The entry is cleared when the answer arrives, but a rewrite that threw,
+    // or an answer the hook never saw, leaves it behind: the map is pruned on
+    // the same bound the other attribution maps keep, so a long session does
+    // not grow it without end.
+    if (this.started.size > 200) {
+      for (const [key, at] of this.started) {
+        if (now - at > ATTRIBUTION_TTL_MS) this.started.delete(key)
+      }
+    }
+    this.started.set(`${sessionID}\u0000${modelID}`, now)
   }
 
   /** How long the routed request took, when the answer arrived. */
@@ -1160,13 +1835,28 @@ export class RelayState {
     return this.scanning_
   }
 
-  /** Whether another attempt after a used-up answer can reach an exit that still works. */
-  canRetryAfterAllowance(): boolean {
-    return this.pickExit({ advance: false }).exit !== undefined
+  /**
+   * Whether another attempt after a used-up answer can reach an exit that
+   * still works.
+   *
+   * `bridgeReady` says whether the local proxy bridge is running: a proxy
+   * without it cannot carry a request, so counting one would promise a way
+   * out that is not there, and the retry would fail for a different reason
+   * than the one it was given for.
+   */
+  canRetryAfterAllowance(bridgeReady = true): boolean {
+    const pick = this.pickExit({
+      advance: false,
+      ...(bridgeReady ? {} : { exclude: proxyExclusions(this) }),
+    })
+    return pick.exit !== undefined
   }
 
   /** Every exit as the terminal UI sees it. */
   summaries(): ExitSummary[] {
-    return this.exits().map((exit) => toExitSummary(exit, this.statsFor(exit.id)))
+    return this.exits().map((exit) => {
+      const reason = exit.egress !== undefined ? this.spendReason(exit.egress) : undefined
+      return toExitSummary(exit, this.statsFor(exit.id), reason)
+    })
   }
 }

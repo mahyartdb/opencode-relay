@@ -75,6 +75,8 @@ const StoredRelay = Schema.Struct({
   url: Schema.String,
   access: Schema.String,
   accountId: Schema.String,
+  // The runtime the relay was deployed with, so a redeploy uses the same one.
+  deployRuntime: Schema.optionalKey(Schema.Literals(["bun", "node"])),
   ...HealthFields,
 })
 
@@ -104,6 +106,8 @@ const StoredSettings = Schema.Struct({
   activeRelayId: Schema.optionalKey(Schema.String),
   direct: Schema.optionalKey(Schema.Literals(["allow", "never"])),
   healthChecks: Schema.optionalKey(Schema.Boolean),
+  /** Where the round-robin rotation stood, so a restart does not start over. */
+  rotationId: Schema.optionalKey(Schema.String),
 })
 
 type StoredHealth = {
@@ -194,6 +198,7 @@ function relayJson(relay: RelayRecord): Schema.JsonObject {
     url: relay.url,
     access: relay.access,
     accountId: relay.accountId,
+    ...(relay.deployRuntime !== undefined ? { deployRuntime: relay.deployRuntime } : {}),
     ...healthJson(relay),
   }
 }
@@ -220,6 +225,7 @@ function settingsJson(settings: Settings): Schema.JsonObject {
     healthChecks: settings.healthChecks,
   }
   if (settings.activeExitId !== undefined) json.activeExitId = settings.activeExitId
+  if (settings.rotationId !== undefined) json.rotationId = settings.rotationId
   return json
 }
 
@@ -252,6 +258,7 @@ function decodeRelay(value: unknown): RelayRecord | undefined {
     url: relay.url,
     access: relay.access,
     accountId: relay.accountId,
+    ...(relay.deployRuntime !== undefined ? { deployRuntime: relay.deployRuntime } : {}),
     ...healthOf(relay),
   }
 }
@@ -323,6 +330,7 @@ export async function readSettings(storage: StorageDomain): Promise<Settings | u
     direct: (settings.direct ?? "allow") as DirectPolicy,
     healthChecks: settings.healthChecks ?? true,
     ...(activeExitId !== undefined ? { activeExitId } : {}),
+    ...(settings.rotationId !== undefined ? { rotationId: settings.rotationId } : {}),
   }
 }
 

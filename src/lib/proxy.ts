@@ -76,8 +76,31 @@ export function proxyKey(url: string): string {
 /** Remove credentials from an entry before it is shown in an error. */
 export function redactProxyToken(value: string): string {
   const at = value.lastIndexOf("@")
-  if (at < 0) return value.slice(0, 120)
-  return `***@${value.slice(at + 1).slice(0, 100)}`
+  if (at >= 0) {
+    const after = value.slice(at + 1)
+    // Only the part after the @ may be shown when it really is an address:
+    // the swapped host:port@user:pass shape would otherwise show the
+    // password where the host belongs.
+    const address = splitHostPort(after)
+    const shown = address !== undefined && address.port !== undefined ? after.slice(0, 100) : "***"
+    return `***@${shown}`.slice(0, 120)
+  }
+  // The legacy host:port:user[:pass] shapes carry credentials after the
+  // port with no @ to mark them. The port is what tells the two apart: a
+  // number after the first colon is a port, so what follows it is a
+  // credential. Anything else after the first colon is a credential itself,
+  // so the password never reaches the screen.
+  const scheme = /^([a-z][a-z0-9+.-]*):\/\//i.exec(value)
+  const prefix = scheme ? scheme[0] : ""
+  const rest = scheme ? value.slice(prefix.length) : value
+  const bracket = rest.startsWith("[") ? rest.indexOf("]") : -1
+  const first = rest.indexOf(":", bracket >= 0 ? bracket : 0)
+  if (first < 0) return value.slice(0, 120)
+  const second = rest.indexOf(":", first + 1)
+  const port = second < 0 ? rest.slice(first + 1) : rest.slice(first + 1, second)
+  if (!/^\d+$/.test(port)) return `${prefix}${rest.slice(0, first)}:***`.slice(0, 120)
+  if (second < 0) return value.slice(0, 120)
+  return `${prefix}${rest.slice(0, second)}:***`.slice(0, 120)
 }
 
 /** Decode a credential when it is percent-encoded; keep it otherwise. */
@@ -284,6 +307,14 @@ function finish(
       username = auth.slice(0, colon)
       password = auth.slice(colon + 1)
     }
+    // The masked form the details page shows is a display artifact, not a
+    // credential. Accepting it would silently replace the real password with
+    // three asterisks the next time a user edits an address that was shown
+    // to them masked.
+    if (username === "***" || password === "***") {
+      invalid(redactProxyToken(original), "the credentials are masked; paste the full address with its credentials")
+      return
+    }
   }
   const proxy = buildProxy(scheme, host, port, username, password)
   if (!proxy) {
@@ -319,16 +350,33 @@ function jsonEntry(item: unknown): string | { readonly reason: string } {
   return `${prefix}${auth}${host}:${portText}`
 }
 
-/** Show a failed JSON entry with its credential fields replaced. */
+/**
+ * Show a failed JSON entry with its credentials removed.
+ *
+ * The address may sit under any key, at any depth, so every string in the
+ * entry is run through the same masking: an entry whose password lives under
+ * "proxies[0].url" must not show it either.
+ */
 function redactJsonEntry(item: unknown): string {
-  if (item !== null && typeof item === "object" && !Array.isArray(item)) {
-    const record = { ...(item as Record<string, unknown>) }
-    for (const key of ["username", "user", "password", "pass"]) {
-      if (typeof record[key] === "string") record[key] = "***"
+  const walk = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(walk)
+    if (value !== null && typeof value === "object") {
+      const record: Record<string, unknown> = {}
+      for (const [key, inner] of Object.entries(value as Record<string, unknown>)) {
+        // A field whose name says it holds a credential is masked outright;
+        // the rest go through the same masking as a pasted line, because the
+        // address may sit under any key at all.
+        record[key] =
+          typeof inner === "string" &&
+          /pass|pwd|secret|token|key|user|auth|credential|login|session|cookie/i.test(key)
+            ? "***"
+            : walk(inner)
+      }
+      return record
     }
-    return JSON.stringify(record)
+    return typeof value === "string" ? redactProxyToken(value) : value
   }
-  return JSON.stringify(item)
+  return JSON.stringify(walk(item))
 }
 
 /** An entry refused before it could become a token, with its reason. */

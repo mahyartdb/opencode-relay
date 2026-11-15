@@ -1,5 +1,6 @@
-import { PLAN_LIMITS, type AccountPlan } from "./types.ts"
+import { PLAN_LIMITS, type AccountPlan, egressAddress } from "./types.ts"
 import { redact } from "./redact.ts"
+import { isSafeRelayUrl, readBody } from "./routing.ts"
 
 export interface VercelAccount {
   readonly token: string
@@ -42,6 +43,15 @@ const DEPLOY_POLL_MS = 2000
 const DEPLOY_TIMEOUT_MS = 120000
 const DEPLOY_STATUS_TIMEOUT_MS = 15000
 const PROBE_TIMEOUT_MS = 15000
+
+/**
+ * How much of a ping answer is read.
+ *
+ * The answer comes from the exit, which the user added: a body that never
+ * ends would fill the memory until the timeout fires, and a body of a
+ * megabyte of text would only be thrown away.
+ */
+const PROBE_BODY_LIMIT = 64 * 1024
 const REQUEST_TIMEOUT_MS = 30000
 
 function authHeader(token: string): Record<string, string> {
@@ -99,9 +109,49 @@ async function vercelFetch(
     })
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
-    throw new Error(redact(`Vercel request failed: ${msg}`, [token, ...(secrets ?? [])]))
+    throw new VercelError(redact(`Vercel request failed: ${msg}`, [token, ...(secrets ?? [])]))
   }
   return res
+}
+
+/**
+ * Read an answer as JSON, with the secrets taken out of a failure.
+ *
+ * The parser's own message quotes the text it choked on, and that text is
+ * whatever Vercel sent back: it could name the environment values the
+ * deployment carried.
+ */
+async function readJson(response: Response, secrets: readonly (string | undefined)[]): Promise<unknown> {
+  let text: string
+  try {
+    text = await response.text()
+  } catch (err) {
+    throw new Error(redact(`Vercel answer could not be read: ${err instanceof Error ? err.message : String(err)}`, secrets))
+  }
+  try {
+    return JSON.parse(text) as unknown
+  } catch (err) {
+    throw new Error(
+      redact(`Vercel answer was not JSON: ${err instanceof Error ? err.message : String(err)}`, secrets),
+    )
+  }
+}
+
+/**
+ * A failure from the Vercel API.
+ *
+ * The status is carried with it, so the caller can tell a refused token from
+ * an answer it did not like, without reading the wording.
+ */
+export class VercelError extends Error {
+  constructor(
+    message: string,
+    /** The HTTP status Vercel answered with, when it answered at all. */
+    readonly status?: number,
+  ) {
+    super(message)
+    this.name = "VercelError"
+  }
 }
 
 async function expectOk(
@@ -113,11 +163,17 @@ async function expectOk(
   if (res.ok) return
   const allSecrets = [token, ...secrets]
   if (res.status === 401 || res.status === 403) {
-    throw new Error("Vercel refused the request (HTTP 401/403). Check the token and its permissions.")
+    throw new VercelError(
+      "Vercel refused the request (HTTP 401/403). Check the token and its permissions.",
+      res.status,
+    )
   }
   const detail = redact(await readErrorText(res), allSecrets)
   const suffix = detail ? `: ${detail}` : ""
-  throw new Error(redact(`${context} (HTTP ${res.status})${suffix}`, allSecrets))
+  throw new VercelError(
+    redact(`${context} (HTTP ${res.status})${suffix}`, allSecrets),
+    res.status,
+  )
 }
 
 function normalizeUrl(url: string): string {
@@ -126,7 +182,12 @@ function normalizeUrl(url: string): string {
 }
 
 function pickDeploymentUrl(alias: string[] | undefined, fallback: string | undefined): string {
-  const stable = alias?.find((a) => a.endsWith(".vercel.app") && !/-[a-z0-9]{9}-/.test(a))
+  // A deployment URL carries a nine-character hash right before the domain,
+  // optionally followed by further segments (a per-deployment branch or team
+  // tag). Matching the hash against the domain anchor is what tells
+  // `project-9charhash.vercel.app` apart from a project whose own name ends
+  // in a shorter dash segment, which `-[a-z0-9]{9}-` alone would miss.
+  const stable = alias?.find((a) => a.endsWith(".vercel.app") && !/-[a-z0-9]{9}(-[a-z0-9]+)?\.vercel\.app$/i.test(a))
   const chosen = stable ?? alias?.[0] ?? fallback
   if (!chosen) throw new Error("Vercel deployment did not return a URL.")
   return normalizeUrl(chosen)
@@ -141,7 +202,10 @@ export async function inspectVercel(account: VercelAccount): Promise<AccountPlan
 
   const teamsRes = await vercelFetch("/v2/teams", { token })
   if (teamsRes.status === 401 || teamsRes.status === 403) {
-    throw new Error("Vercel refused the request (HTTP 401/403). Check the token and its permissions.")
+    throw new VercelError(
+      "Vercel refused the request (HTTP 401/403). Check the token and its permissions.",
+      teamsRes.status,
+    )
   }
   await expectOk(teamsRes, "Failed to read Vercel teams", token)
   const teamsData = (await teamsRes.json()) as {
@@ -224,7 +288,10 @@ export async function deployRelay(input: DeployRelayInput): Promise<DeployRelayR
     secrets,
   })
   await expectOk(createRes, "Failed to create Vercel deployment", account.token, secrets)
-  const created = (await createRes.json()) as {
+  // A body that is not JSON is read with a parser whose message quotes the
+  // text it choked on, and that text could be anything Vercel sent back: the
+  // secrets are taken out of it before it is shown.
+  const created = (await readJson(createRes, secrets)) as {
     id?: string
     readyState?: string
     alias?: string[]
@@ -258,7 +325,7 @@ export async function deployRelay(input: DeployRelayInput): Promise<DeployRelayR
       timeoutMs: DEPLOY_STATUS_TIMEOUT_MS,
     })
     await expectOk(statusRes, "Failed to read Vercel deployment status", account.token, secrets)
-    last = (await statusRes.json()) as typeof created
+    last = (await readJson(statusRes, secrets)) as typeof created
   }
   throw new Error("Vercel deployment timed out after 120 seconds.")
 }
@@ -283,6 +350,12 @@ export async function deleteVercelProject(account: VercelAccount, project: strin
 export async function probeRelay(url: string, access: string): Promise<RelayProbe> {
   const started = performance.now()
   const elapsed = () => Math.max(0, Math.round(performance.now() - started))
+  // The access key travels in a header, so the ping must not be able to hand
+  // it to another host: a redirect is not followed, and a remote address has
+  // to be one that carries the key in the clear.
+  if (!isSafeRelayUrl(url)) {
+    return { reachable: false, status: 0, ms: elapsed() }
+  }
   try {
     const res = await fetch(url, {
       method: "GET",
@@ -290,15 +363,25 @@ export async function probeRelay(url: string, access: string): Promise<RelayProb
         "x-relay-key": access,
         "x-relay-control": "ping",
       },
+      redirect: "manual",
       signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
     })
     const status = res.status
+    // A redirect is not a relay answering: following it would carry the
+    // access key to a host the user never chose.
+    if (status >= 300 && status < 400) {
+      return { reachable: false, status, ms: elapsed() }
+    }
     if (!res.ok) {
       return { reachable: false, status, ms: elapsed() }
     }
     let data: unknown
     try {
-      data = await res.json()
+      // The body is read through a cap, not with `json()`: an exit the user
+      // added answers this ping, and a body that never ends would fill the
+      // memory until the timeout fires.
+      const text = await readBody(res, 2000, PROBE_BODY_LIMIT)
+      data = text === undefined ? undefined : (JSON.parse(text) as unknown)
     } catch {
       data = undefined
     }
@@ -308,9 +391,13 @@ export async function probeRelay(url: string, access: string): Promise<RelayProb
       return { reachable: false, status, ms: elapsed() }
     }
     const obj = data as Record<string, unknown>
-    const egress = typeof obj?.["egress"] === "string" ? (obj["egress"] as string) : undefined
-    const runtime = typeof obj?.["runtime"] === "string" ? (obj["runtime"] as string) : undefined
-    const instance = typeof obj?.["instance"] === "string" ? (obj["instance"] as string) : undefined
+    // The three strings are what the exit says about itself. The address only
+    // counts when it looks like one, and they are cut to a length the menu
+    // can show: an exit controls them, and they are stored and displayed as
+    // they are.
+    const egress = egressAddress(typeof obj?.["egress"] === "string" ? obj["egress"] : undefined)
+    const runtime = typeof obj?.["runtime"] === "string" ? (obj["runtime"] as string).slice(0, 64) : undefined
+    const instance = typeof obj?.["instance"] === "string" ? (obj["instance"] as string).slice(0, 64) : undefined
     return {
       reachable: true,
       status,
