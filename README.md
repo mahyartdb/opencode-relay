@@ -126,14 +126,17 @@ can carry a request, and the strategy picks among both.
 
 - **The exits list** - one entry per exit with its state, latency, requests,
   and whether it is chosen; a deployed relay's name already carries its
-  region. **Test all exits**, **Update all relays**, and **Bring used-up
-  exits back** sit under the list, and **Add exits** below them.
+  region. **Test all exits**, **Deep test all exits**, **Update all relays**,
+  **Bring used-up exits back**, and **Resume all paused exits** sit under the
+  list, and **Add exits** below them.
 - **Add exits** - **Deploy a relay** (pick a Vercel account and one or more
   regions; each relay is its own Vercel project, and a Hobby project runs in
   one region, so a multi-region setup deploys one relay per region), **Track
   an existing relay** by its URL and access token, or **Add proxies** from a
   pasted list. Deploying with no Vercel account offers to add one instead of
-  stopping.
+  stopping. A tracked relay needs an `https://` address, because it carries
+  the access token; a relay on this machine (`127.0.0.1`, `localhost`) is
+  accepted over plain `http://`, since nothing leaves the machine.
 - **Exit detail** - open an exit for **Details** (a read-only page with the
   address, project when it has one, health, egress, runtime, request
   counters, and the last error),
@@ -165,12 +168,19 @@ through a loopback HTTP-to-SOCKS bridge started by the plugin on first use.
 ### Checks
 
 - **Test through OpenCode** - asks the models endpoint through the exit. It
-  proves the exit can reach OpenCode without spending a chat completion.
+  proves the exit can reach OpenCode without spending a chat completion, and
+  it sends no credentials: the model list is answered without a session token,
+  and this check runs on every exit on a timer.
 - **Deep test with a real model** - sends a one-token chat request with the
   headers of a captured real request. This is the only check that can tell
-  "OpenCode accepts this address" from "this address is used up".
+  "OpenCode accepts this address" from "this address is used up". It is the
+  one that carries your OpenCode session token, so it asks first, and it only
+  goes to exits that are in use: a paused exit was put aside on purpose.
 - **Test all exits** (Exits) - starts the same checks for all exits in the
   background; the status page and the pill show progress.
+- **Deep test all exits** (Exits) - the same, with a real model request
+  through each exit that is in use. It asks first, because it sends your
+  OpenCode session token to every one of them.
 
 A 429 that looks like the free usage limit is only a suspicion. The plugin sends
 a tiny canary through the same exit; only a canary that is refused too marks the
@@ -179,7 +189,9 @@ so the exit is rested briefly instead of retired.
 
 A used-up exit returns at the time OpenCode says (`Retry-After`, capped at 24
 hours) or at the next UTC midnight. The state is persisted, so a restart does not
-forget it.
+forget it. Only a real model answer through the exit lifts that mark: the model
+list is answered even when the allowance is gone, so a background check cannot
+clear it.
 
 ### Accounts and transfer
 
@@ -191,7 +203,10 @@ Accounts, export, import, and the background checks live in **Settings**:
 - **Remove a Vercel account** - relays it deployed keep running; only the token
   and name are forgotten.
 - **Export or import** - writes exits and rules as JSON, credentials included.
-  Accounts are never exported or imported.
+  Accounts are never exported or imported. Imported exits are tracked only and
+  are not tested: a deep test carries your OpenCode session token, and a
+  shared configuration must not be able to aim that at an address of its own
+  choosing. Test an imported exit yourself to put it in use.
 - **Background checks** - when on, and while routing is on, every exit is
   checked every ten minutes, four at a time. When off, exits are only checked
   when you ask.
@@ -238,11 +253,22 @@ theme's quiet color when everything is fine.
   relay, so only track relays you trust.
 - The proxy bridge listens on loopback only and requires a random per-process
   secret. A request without it is rejected.
+- The HTTP-to-SOCKS bridge also listens on loopback only, and asks for a secret
+  of its own before it opens a tunnel: without it, any process on the machine
+  could spend the user's SOCKS credentials. It only ever dials
+  `opencode.ai` and its subdomains.
+- A relay address has to be `https`, because the access key and the OpenCode
+  authorization header travel to it. A relay on this machine (`127.0.0.1`,
+  `localhost`) is accepted over plain `http://`, since nothing leaves the
+  machine. A relay stored by an older version with a plain `http://` address
+  is refused rather than used, so the key cannot travel in the clear.
 - A relay has its own access token, sent as `x-relay-key`; requests without it
   are rejected by the relay.
 - A relay answers with `x-relay-egress`, the address it sent from. The plugin
   remembers used-up relay addresses and asks relays to avoid them. A proxy has
-  one fixed address, so a used-up proxy is retired until it returns.
+  one fixed address, so a used-up proxy is retired until it returns. Only an
+  address that looks like one is remembered: an exit that reports something
+  else cannot put it into the list that every relay receives.
 - Vercel API tokens, relay access tokens, and proxy passwords are stored as they
   are, unencrypted, in OpenCode's plugin storage for the local user. No key to
   lose, nothing to recover. Anyone who can read your profile can read them, so
@@ -250,7 +276,9 @@ theme's quiet color when everything is fine.
 - The TUI never receives a relay token or proxy password, except in Export,
   which is explicitly credential-bearing and opens in a read-only page you can
   scroll and copy from. Otherwise proxy addresses are shown with their
-  credentials replaced by `***`.
+  credentials replaced by `***`. A relay address may not carry credentials at
+  all: its token is asked for separately, so an address that carries a
+  password is refused rather than stored in the clear.
 - The plugin is tested against OpenCode 2.2.7 and declares
   `@opencode/plugin >=2.2.7 <3`.
 

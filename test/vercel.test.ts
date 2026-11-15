@@ -119,6 +119,30 @@ describe("deployRelay", () => {
     expect(vercelJson?.data).toContain('"bunVersion":"1.x"')
   })
 
+  test("prefers the stable alias over a bare deployment URL, whatever its shape", async () => {
+    globalThis.fetch = (async () => {
+      // The hashed alias here has no team suffix: `project-9chars.vercel.app`
+      // is a deployment URL exactly like `project-hash-team.vercel.app`, and
+      // the old dash-only check took it for the stable one.
+      return jsonResponse({
+        id: "dep_2",
+        readyState: "READY",
+        alias: ["my-relay-a1b2c3d4e.vercel.app", "my-relay.vercel.app"],
+        url: "my-relay-a1b2c3d4e.vercel.app",
+      })
+    }) as unknown as typeof fetch
+
+    const result = await deployRelay({
+      account: { token: "tok-secret" },
+      project: "my-relay",
+      region: "fra1",
+      access: "access-secret",
+      relaySource: "export default {}",
+    })
+
+    expect(result.url).toBe("https://my-relay.vercel.app")
+  })
+
   test("throws when deployment ends in ERROR", async () => {
     globalThis.fetch = (async (input: RequestInfo | URL) => {
       const url = String(input)
@@ -212,8 +236,7 @@ describe("probeRelay", () => {
     expect(probe.ms).toBeGreaterThanOrEqual(0)
   })
 
-  test("a 200 that is not JSON is not a reachable relay", async () => {
-    globalThis.fetch = (async () => {
+  test("a 200 that is not JSON is not a reachable relay", async () => {    globalThis.fetch = (async () => {
       return new Response("<html><body>Sign in</body></html>", {
         status: 200,
         headers: { "content-type": "text/html" },
@@ -233,6 +256,67 @@ describe("probeRelay", () => {
     const probe = await probeRelay("https://relay.example.com", "access-secret")
     expect(probe).toMatchObject({ reachable: false, status: 200 })
     expect(probe.ms).toBeGreaterThanOrEqual(0)
+  })
+
+  test("a redirect is not followed, so the access key stays put", async () => {
+    let seen: { readonly url: string; readonly redirect?: string } | undefined
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      seen = { url: String(input), ...(init?.redirect !== undefined ? { redirect: init.redirect } : {}) }
+      return new Response(null, { status: 302, headers: { location: "https://elsewhere.example.com" } })
+    }) as unknown as typeof fetch
+
+    const probe = await probeRelay("https://relay.example.com", "access-secret")
+    // The ping must not be able to hand the access key to another host.
+    expect(seen?.redirect).toBe("manual")
+    expect(probe).toMatchObject({ reachable: false, status: 302 })
+  })
+
+  test("a remote relay in plain http is never pinged", async () => {
+    let called = false
+    globalThis.fetch = (async () => {
+      called = true
+      return jsonResponse({ control: "ping" }, 200)
+    }) as unknown as typeof fetch
+
+    const probe = await probeRelay("http://relay.example.com", "access-secret")
+    expect(called).toBe(false)
+    expect(probe).toMatchObject({ reachable: false, status: 0 })
+  })
+
+  test("an address that is not an address does not count", async () => {
+    // The address goes into the avoid list that every relay receives, so an
+    // exit must not be able to put anything there but an address.
+    globalThis.fetch = (async () => {
+      return jsonResponse({ egress: "not an address", runtime: "bun", instance: "i1" }, 200)
+    }) as unknown as typeof fetch
+
+    const probe = await probeRelay("https://relay.example.com", "access-secret")
+    expect(probe.reachable).toBe(true)
+    expect(probe.egress).toBeUndefined()
+    expect(probe.runtime).toBe("bun")
+  })
+
+  test("a huge answer is not read whole", async () => {
+    // The answer comes from the exit, which the user added: a body that
+    // never ends would fill the memory until the timeout fires.
+    const body = JSON.stringify({ egress: "1.2.3.4", padding: "x".repeat(2 * 1024 * 1024) })
+    globalThis.fetch = (async () => {
+      return new Response(body, { status: 200, headers: { "content-type": "application/json" } })
+    }) as unknown as typeof fetch
+
+    const probe = await probeRelay("https://relay.example.com", "access-secret")
+    // The body was cut, so it is not valid JSON any more: the answer is not
+    // a relay, and nothing huge was kept.
+    expect(probe.reachable).toBe(false)
+  })
+
+  test("a relay on this machine may be plain http", async () => {
+    globalThis.fetch = (async () => {
+      return jsonResponse({ control: "ping" }, 200)
+    }) as unknown as typeof fetch
+
+    const probe = await probeRelay("http://127.0.0.1:4321", "access-secret")
+    expect(probe).toMatchObject({ reachable: true, status: 200 })
   })
 })
 

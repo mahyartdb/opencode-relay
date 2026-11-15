@@ -72,7 +72,7 @@ interface StatusAnswer {
 }
 
 /** A stand-in for the parts of the OpenCode server the plugin uses. */
-function makeContext(models = true) {
+function makeContext(models = true, failWrites: readonly string[] = []) {
   const store = new Map<string, unknown>()
   const registrations = new Map<string, Registration[]>()
   const handlers = new Map<string, (input: unknown, context: unknown) => Promise<unknown>>()
@@ -82,6 +82,8 @@ function makeContext(models = true) {
   const storage = {
     get: async (key: string) => store.get(key) as never,
     set: async (key: string, value: unknown) => {
+      // A key that cannot be written stands in for a full disk.
+      if (failWrites.includes(key)) throw new Error(`ENOSPC: no space left on device (${key})`)
       store.set(key, value)
     },
     remove: async (key: string) => {
@@ -193,8 +195,12 @@ function makeContext(models = true) {
 type App = ReturnType<typeof makeContext> & { readonly dispose: () => Promise<void> }
 
 /** Build a plugin instance on its own storage and take it down afterwards. */
-async function start(models = true, store?: Map<string, unknown>): Promise<App> {
-  const made = makeContext(models)
+async function start(
+  models = true,
+  store?: Map<string, unknown>,
+  failWrites: readonly string[] = [],
+): Promise<App> {
+  const made = makeContext(models, failWrites)
   if (store) for (const [key, value] of store) made.store.set(key, value)
   const dispose = await plugin.setup(made.context as never)
   return { ...made, dispose: async () => { await dispose?.() } }
@@ -659,7 +665,7 @@ describe("the server half", () => {
       await app.call("setEnabled", { enabled: true })
       const status = (await app.call("status")) as StatusAnswer
       expect(status.exits.find((exit) => exit.id === "chosen")?.status).toBe("untested")
-      expect(status.note).toContain("through backup")
+      expect(status.note).toContain("so backup takes over")
       expect(status.note).not.toContain("through chosen")
       // The payload carries the picker's answer itself, not only the note.
       expect(status.servingExitId).toBe("backup")
@@ -702,7 +708,7 @@ describe("the server half", () => {
 
       const status = (await app.call("status")) as StatusAnswer
       expect(status.paused).toContain("chosen")
-      expect(status.note).toContain("through backup")
+      expect(status.note).toContain("so backup takes over")
       expect(status.note).not.toContain("through chosen")
       expect(status.servingExitId).toBe("backup")
 
@@ -788,7 +794,7 @@ describe("the server half", () => {
     }
   })
 
-  test("a relay that asks for another instance is retired and the next one serves", async () => {
+  test("a relay that asks for another instance is rested and the next one serves", async () => {
     const app = await start()
     try {
       const one = (await app.call("addRelay", { name: "one", url, access: ACCESS })) as { id: string }
@@ -814,9 +820,13 @@ describe("the server half", () => {
         }),
       } as never)
 
-      const retired = (await app.call("status")) as StatusAnswer
-      expect(retired.exhausted).toEqual([one.id])
-      expect(retired.exits.find((exit) => exit.id === one.id)?.status).toBe("exhausted")
+      // The rotate is the relay echoing the plugin's avoid list, and nothing
+      // marked 203.0.113.9 spent, so the echo is stale: the relay rests for a
+      // short while instead of being retired until the address's window ends.
+      const rested = (await app.call("status")) as StatusAnswer
+      expect(rested.exhausted).toEqual([])
+      expect(rested.exits.find((exit) => exit.id === one.id)?.status).toBe("limited")
+      expect(rested.skipped).toContain(one.id)
 
       const next = {
         sessionID: "rotate-next",
@@ -825,18 +835,21 @@ describe("the server half", () => {
       }
       await app.hooks.get("http.request")?.(next as never)
       expect(next.request.headers.get("x-relay-id")).toBe(two.id)
+      // A stale echo is not evidence that the address is used up, so it must
+      // not put the address on the avoid list either.
+      expect(next.request.headers.get("x-relay-avoid")).toBeNull()
 
-      // Bringing it back does not forget the address that was used up: the
-      // relay is asked to avoid it on the next attempt.
-      await app.call("resetExhausted")
-      const again = {
+      // Clearing used-up latches is not a way to cut the live rest short: the
+      // relay that asked for another instance still sits it out.
+      const cleared = (await app.call("resetExhausted")) as { restored: string[] }
+      expect(cleared.restored).toEqual([])
+      const afterReset = {
         sessionID: "rotate-back",
         model: { id: "iceman-free", providerID: "opencode" },
         request: new Request("https://opencode.ai/inference/openai/v1/models"),
       }
-      await app.hooks.get("http.request")?.(again as never)
-      expect(again.request.headers.get("x-relay-id")).toBe(one.id)
-      expect(again.request.headers.get("x-relay-avoid")).toBe("203.0.113.9")
+      await app.hooks.get("http.request")?.(afterReset as never)
+      expect(afterReset.request.headers.get("x-relay-id")).toBe(two.id)
     } finally {
       await app.dispose()
     }
@@ -912,7 +925,9 @@ describe("the server half", () => {
 
       const status = (await app.call("status")) as StatusAnswer
       expect(status.exits.find((exit) => exit.id === dead.id)?.status).toBe("unreachable")
-      expect(status.skipped).not.toContain(dead.id)
+      // The dead relay is resting, not retired: a rest is what brings it back
+      // into use without the user having to test it by hand.
+      expect(status.skipped).toContain(dead.id)
       expect(status.note).toContain("no exit can serve")
     } finally {
       await app.dispose()
@@ -1145,6 +1160,40 @@ describe("the server half", () => {
     }
   })
 
+  test("the preview names the provider it is about, whichever way it goes", async () => {
+    type Preview = {
+      routed: boolean
+      reason: string
+      providerID?: string
+      exit?: { id: string }
+      skipped: readonly { name: string; reason: string }[]
+    }
+    const app = await start()
+    try {
+      await app.call("addRelay", { name: "local", url, access: ACCESS })
+      await app.call("setEnabled", { enabled: true })
+
+      // Every answer carries the provider it is about, so the caller never
+      // has to guess which provider a verdict belonged to.
+      const routed = (await app.call("preview", {
+        modelId: "iceman-free",
+        providerID: "opencode",
+      })) as Preview
+      expect(routed.providerID).toBe("opencode")
+
+      // No model named, routing on: the answer is about the free models.
+      const free = (await app.call("preview", { providerID: "opencode" })) as Preview
+      expect(free.providerID).toBe("opencode")
+
+      // Routing off, and the case where nothing can serve.
+      await app.call("setEnabled", { enabled: false })
+      const off = (await app.call("preview", { providerID: "polygate" })) as Preview
+      expect(off.providerID).toBe("polygate")
+    } finally {
+      await app.dispose()
+    }
+  })
+
   test("a named model says it would still go direct with routing off", async () => {
     type Preview = {
       routed: boolean
@@ -1244,6 +1293,49 @@ describe("the server half", () => {
       expect(proxy?.name).toBe("home proxy")
       expect(proxy?.url).toBe("socks5://***@9.9.9.9:1080")
       expect(proxy?.status).toBe("untested")
+    } finally {
+      await app.dispose()
+    }
+  })
+
+  test("editing a proxy address keeps the credentials it does not replace", async () => {
+    const app = await start()
+    try {
+      const added = (await app.call("addProxies", { text: "socks5://user:pass@1.2.3.4:1080" })) as {
+        added: readonly { id: string }[]
+      }
+      const id = added.added[0]?.id
+      if (!id) throw new Error("the proxy was not added")
+
+      // The address is shown with its credentials masked, so a user who edits
+      // only the port hands over an address with no credentials. Those are
+      // kept, or the proxy would quietly stop authenticating.
+      const updated = (await app.call("updateProxy", { id, url: "socks5://1.2.3.4:1081" })) as {
+        updated: boolean
+      }
+      expect(updated.updated).toBe(true)
+
+      const status = (await app.call("status")) as StatusAnswer
+      const proxy = status.exits.find((exit) => exit.id === id)
+      expect(proxy?.url).toBe("socks5://***@1.2.3.4:1081")
+
+      // Credentials the new address does carry replace the stored ones.
+      const replaced = (await app.call("updateProxy", {
+        id,
+        url: "socks5://other:secret@1.2.3.4:1082",
+      })) as { updated: boolean }
+      expect(replaced.updated).toBe(true)
+      const after = (await app.call("status")) as StatusAnswer
+      expect(after.exits.find((exit) => exit.id === id)?.url).toBe("socks5://***@1.2.3.4:1082")
+
+      // A different host gets no credentials: handing one provider's
+      // password to another host is worse than dropping it.
+      const moved = (await app.call("updateProxy", { id, url: "socks5://9.9.9.9:1080" })) as {
+        updated: boolean
+      }
+      expect(moved.updated).toBe(true)
+      const elsewhere = (await app.call("status")) as StatusAnswer
+      expect(elsewhere.exits.find((exit) => exit.id === id)?.url).toBe("socks5://9.9.9.9:1080")
     } finally {
       await app.dispose()
     }
@@ -1362,8 +1454,33 @@ describe("the server half", () => {
       const updated = (await app.call("updateAllRelays", {})) as {
         updated: number
         failed: unknown[]
+        skipped: unknown[]
       }
-      expect(updated).toEqual({ updated: 0, failed: [] })
+      expect(updated.updated).toBe(0)
+      expect(updated.failed).toEqual([])
+      // A tracked relay was never an update target, so it is not named as one
+      // left alone either: the user did not ask for it to be updated.
+      expect(updated.skipped).toHaveLength(0)
+    } finally {
+      await app.dispose()
+    }
+  })
+
+  test("a configuration that is not JSON says so, and imports nothing", async () => {
+    const app = await start()
+    try {
+      const imported = (await app.call("importConfig", { json: "{not json" })) as {
+        relays: number
+        proxies: number
+        invalid: number
+        error?: string
+      }
+      // The file was never read, so no entry was left out of it: saying
+      // "one entry" would send the user hunting for a bad entry.
+      expect(imported.relays).toBe(0)
+      expect(imported.proxies).toBe(0)
+      expect(imported.invalid).toBe(0)
+      expect(imported.error).toContain("not valid JSON")
     } finally {
       await app.dispose()
     }
@@ -1385,8 +1502,14 @@ describe("the server half", () => {
         relays: number
         proxies: number
         invalid: number
+        error?: string
       }
-      expect(imported).toEqual({ relays: 0, proxies: 0, invalid: 1 })
+      // The file was not read at all, so no entry was left out of it: the
+      // reason says what actually happened.
+      expect(imported.relays).toBe(0)
+      expect(imported.proxies).toBe(0)
+      expect(imported.invalid).toBe(0)
+      expect(imported.error).toContain("larger than 2 MB")
 
       await app.call("setEnabled", { enabled: true })
       const status = (await app.call("status")) as StatusAnswer
@@ -1431,13 +1554,19 @@ describe("the server half", () => {
       }
       expect(first).toEqual({ relays: 1, proxies: 2, invalid: 0 })
 
-      // The same export again: nothing is added, and the counts say so.
+      // The same export again: nothing is added, and the counts say so. The
+      // entries that were already there are counted as duplicates, so
+      // "nothing new" is not the same answer as "the file was empty".
       const second = (await app.call("importConfig", { json: config })) as {
         relays: number
         proxies: number
         invalid: number
+        duplicates?: number
       }
-      expect(second).toEqual({ relays: 0, proxies: 0, invalid: 0 })
+      expect(second.relays).toBe(0)
+      expect(second.proxies).toBe(0)
+      expect(second.invalid).toBe(0)
+      expect(second.duplicates).toBe(3)
 
       const status = (await app.call("status")) as StatusAnswer
       expect(status.exits).toHaveLength(3)
@@ -1450,23 +1579,96 @@ describe("the server half", () => {
     const app = await start()
     try {
       const added = (await app.call("addRelay", { name: "local", url, access: ACCESS })) as { id: string }
-      const result = (await app.call("testExit", { id: added.id })) as {
+      // The API check reaches the real provider, which may answer a probe
+      // and then drop the next request. The check is asked again until the
+      // budget is spent, so a single blip does not read as a broken exit.
+      let result = { ok: false, status: "", code: 0, ms: 0 } as {
         ok: boolean
         status: string
         code: number
         ms: number
         egress?: string
       }
-      // The API check reaches the real provider; without a network it can only
-      // say the exit itself did not answer.
-      if (online) {
-        expect(result.ok).toBe(true)
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        result = (await app.call("testExit", { id: added.id })) as typeof result
+        if (result.ok) break
+        await Bun.sleep(500)
+      }
+      expect(result.ms).toBeGreaterThanOrEqual(0)
+      // The answer and the stored verdict must agree, whatever the network
+      // did: the check reports what it saw, and the record says the same.
+      const status = (await app.call("status")) as StatusAnswer
+      const stored = status.exits.find((exit) => exit.id === added.id)
+      if (result.ok) {
         expect(result.status).toBe("reachable")
         expect(result.code).toBe(200)
-        expect(result.ms).toBeGreaterThanOrEqual(0)
+        expect(stored?.status).toBe("reachable")
       } else {
-        expect(result.ok).toBe(false)
+        expect(stored?.status).not.toBe("reachable")
       }
+    } finally {
+      await app.dispose()
+    }
+  })
+
+  test("a relay address that cannot be read is refused, not crashed on", async () => {
+    const app = await start()
+    try {
+      // A port that is not a number makes the address unreadable: the call
+      // has to say so, not fall over.
+      const answer = (await app.call("addRelay", {
+        name: "broken",
+        url: "https://relay.example.com:99999",
+        access: ACCESS,
+      })) as { tag?: string; message?: string }
+      expect(answer.tag).toBe("insecure_relay")
+      expect(answer.message).toContain("could not be read")
+
+      const status = (await app.call("status")) as StatusAnswer
+      expect(status.exits).toHaveLength(0)
+    } finally {
+      await app.dispose()
+    }
+  })
+
+  test("an imported relay with control characters in its name is cleaned", async () => {
+    const app = await start()
+    try {
+      // A name from a file can carry escape sequences: they would be drawn in
+      // the menu, in a toast and on a page.
+      const config = JSON.stringify({
+        version: 1,
+        relays: [{ name: "bad\u001b[31mname", url: "https://relay.example.com", access: ACCESS }],
+        proxies: [],
+      })
+      await app.call("importConfig", { json: config })
+
+      const status = (await app.call("status")) as StatusAnswer
+      const relay = status.exits.find((exit) => exit.kind === "relay")
+      expect(relay?.name).toBe("badname")
+      expect(relay?.name).not.toContain("")
+    } finally {
+      await app.dispose()
+    }
+  })
+
+  test("a change that could not be saved is reported as such", async () => {
+    // The disk is full: the relay is in memory but never on disk.
+    const app = await start(true, undefined, ["relays"])
+    try {
+      const answer = (await app.call("addRelay", { name: "local", url, access: ACCESS })) as {
+        tag?: string
+        message?: string
+        data?: { message?: string }
+      }
+      // A change that looks saved and is not would be lost at the next
+      // restart, so the caller is told which list could not be written. The
+      // reason is in the message itself: the toast the user reads shows the
+      // message, so a cause kept only in the data would never be seen.
+      expect(answer.tag).toBe("storage_failed")
+      expect(answer.message).toContain("Could not save the change")
+      expect(answer.message).toContain("relays")
+      expect(answer.data?.message).toContain("relays")
     } finally {
       await app.dispose()
     }

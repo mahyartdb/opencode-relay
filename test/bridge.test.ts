@@ -256,6 +256,15 @@ describe("the SOCKS handshake hands the socket over safely", () => {
   })
 })
 
+/**
+ * The `Proxy-Authorization` header a client has to send to use a bridge.
+ *
+ * The blank line ends the request head, so this is the last thing in it.
+ */
+function authHeader(secret: string): string {
+  return `Proxy-Authorization: Basic ${Buffer.from(`${secret}:`).toString("base64")}\r\n\r\n`
+}
+
 /** Send one raw HTTP-proxy request and return the first response head. */
 function rawProxyRequest(port: number, head: string): Promise<string> {
   return new Promise((resolve, reject) => {
@@ -336,10 +345,10 @@ function badAuthStub(): Promise<{ server: net.Server; port: number }> {
 async function connectThrough(host: string): Promise<string> {
   const stub = await grantingStub()
   try {
-    const origin = await socksBridge({ version: 5, host: "127.0.0.1", port: stub.port })
+    const bridge = await socksBridge({ version: 5, host: "127.0.0.1", port: stub.port })
     return await rawProxyRequest(
-      Number(new URL(origin).port),
-      `CONNECT ${host}:443 HTTP/1.1\r\nHost: ${host}:443\r\n\r\n`,
+      Number(new URL(bridge.url).port),
+      `CONNECT ${host}:443 HTTP/1.1\r\nHost: ${host}:443\r\n${authHeader(bridge.secret)}`,
     )
   } finally {
     closeSocksBridges()
@@ -350,10 +359,10 @@ async function connectThrough(host: string): Promise<string> {
 describe("the local SOCKS bridge only dials opencode.ai and its subdomains", () => {
   test("refuses a CONNECT to another host", async () => {
     try {
-      const origin = await socksBridge({ version: 5, host: "127.0.0.1", port: 9 })
+      const bridge = await socksBridge({ version: 5, host: "127.0.0.1", port: 9 })
       const answer = await rawProxyRequest(
-        Number(new URL(origin).port),
-        "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n",
+        Number(new URL(bridge.url).port),
+        `CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n${authHeader(bridge.secret)}`,
       )
       expect(answer.startsWith("HTTP/1.1 403")).toBe(true)
     } finally {
@@ -363,12 +372,50 @@ describe("the local SOCKS bridge only dials opencode.ai and its subdomains", () 
 
   test("refuses an absolute-form request to another host", async () => {
     try {
-      const origin = await socksBridge({ version: 5, host: "127.0.0.1", port: 9 })
+      const bridge = await socksBridge({ version: 5, host: "127.0.0.1", port: 9 })
       const answer = await rawProxyRequest(
-        Number(new URL(origin).port),
-        "GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n",
+        Number(new URL(bridge.url).port),
+        `GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n${authHeader(bridge.secret)}`,
       )
       expect(answer.startsWith("HTTP/1.1 403")).toBe(true)
+    } finally {
+      closeSocksBridges()
+    }
+  })
+
+  test("refuses a client that does not know the bridge's secret", async () => {
+    try {
+      const bridge = await socksBridge({ version: 5, host: "127.0.0.1", port: 9 })
+      const answer = await rawProxyRequest(
+        Number(new URL(bridge.url).port),
+        "CONNECT opencode.ai:443 HTTP/1.1\r\nHost: opencode.ai:443\r\n\r\n",
+      )
+      // The bridge spends the user's SOCKS credentials, so it asks for a
+      // secret of its own before it opens a tunnel.
+      expect(answer.startsWith("HTTP/1.1 407")).toBe(true)
+    } finally {
+      closeSocksBridges()
+    }
+  })
+
+  test("refuses a client with the wrong secret", async () => {
+    try {
+      const bridge = await socksBridge({ version: 5, host: "127.0.0.1", port: 9 })
+      const answer = await rawProxyRequest(
+        Number(new URL(bridge.url).port),
+        `CONNECT opencode.ai:443 HTTP/1.1\r\nHost: opencode.ai:443\r\n${authHeader("not-the-secret")}`,
+      )
+      expect(answer.startsWith("HTTP/1.1 407")).toBe(true)
+    } finally {
+      closeSocksBridges()
+    }
+  })
+
+  test("gives every bridge its own secret", async () => {
+    try {
+      const first = await socksBridge({ version: 5, host: "127.0.0.1", port: 9 })
+      const second = await socksBridge({ version: 5, host: "127.0.0.1", port: 8 })
+      expect(first.secret).not.toBe(second.secret)
     } finally {
       closeSocksBridges()
     }
@@ -395,14 +442,14 @@ describe("the local SOCKS bridge only dials opencode.ai and its subdomains", () 
   test("creating a bridge reaps one that has been idle", async () => {
     try {
       const first = await socksBridge({ version: 5, host: "127.0.0.1", port: 9 })
-      const firstPort = Number(new URL(first).port)
+      const firstPort = Number(new URL(first.url).port)
       expect(await canConnect(firstPort)).toBe(true)
       // Let the probe's close event land, so the bridge counts as idle.
       await Bun.sleep(25)
 
       setSystemTime(Date.now() + 11 * 60_000)
       const second = await socksBridge({ version: 5, host: "127.0.0.1", port: 8 })
-      expect(await canConnect(Number(new URL(second).port))).toBe(true)
+      expect(await canConnect(Number(new URL(second.url).port))).toBe(true)
       expect(await canConnect(firstPort)).toBe(false)
     } finally {
       setSystemTime()

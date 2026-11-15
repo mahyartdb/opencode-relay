@@ -176,6 +176,52 @@ describe("the api check", () => {
     expect(result.code).toBe(200)
   })
 
+  test("it never carries the user's session token", async () => {
+    // The api check runs on every exit on a timer, so a credential in it
+    // would be handed to whatever address an imported configuration named.
+    let seen: Headers | undefined
+    const made = await setup((request) => {
+      seen = request.headers
+      return new Response("{}", { status: 200 })
+    })
+    made.state.noteSample({
+      modelID: "iceman-free",
+      path: "/inference/openai/v1/chat/completions",
+      headers: {
+        authorization: "Bearer session-token",
+        cookie: "session=cookie-value",
+        "x-custom": "kept",
+      },
+    })
+
+    await made.tester.test(made.id, "api")
+
+    expect(seen?.get("authorization")).toBeNull()
+    expect(seen?.get("cookie")).toBeNull()
+    // Only the headers that cannot be a credential travel: a list of names
+    // to exclude would break the day OpenCode sends a new one.
+    expect(seen?.get("x-custom")).toBeNull()
+  })
+
+  test("the deep check does carry the session token, or it cannot work", async () => {
+    let seen: Headers | undefined
+    const made = await setup((request) => {
+      seen = request.headers
+      const path = request.headers.get("x-relay-path") ?? ""
+      if (path.includes("/models")) return json({ data: [{ id: "iceman-free" }] })
+      return json({ choices: [{ message: { content: "ok" } }] })
+    })
+    made.state.noteSample({
+      modelID: "iceman-free",
+      path: "/inference/openai/v1/chat/completions",
+      headers: { authorization: "Bearer session-token" },
+    })
+
+    await made.tester.test(made.id, "deep")
+
+    expect(seen?.get("authorization")).toBe("Bearer session-token")
+  })
+
   test("a 204 answer is a failure, not a routable exit", async () => {
     const made = await setup(() => new Response(null, { status: 204 }))
 
@@ -204,14 +250,32 @@ describe("the api check", () => {
     expect(made.state.exit(made.id)?.status).toBe("bad")
   })
 
-  test("401 and 403 block the exit", async () => {
+  test("401 and 403 from OpenCode block the exit", async () => {
     for (const status of [401, 403]) {
-      const made = await setup(() => new Response("{}", { status }))
+      // The relay's own headers say the answer came from the upstream through
+      // it, so the refusal is OpenCode's.
+      const made = await setup(() =>
+        new Response("{}", { status, headers: { "x-relay-instance": "i1" } }),
+      )
       const result = await made.tester.test(made.id, "api")
 
       expect(result.status).toBe("blocked")
       expect(result.code).toBe(status)
       expect(made.state.exit(made.id)?.status).toBe("blocked")
+    }
+  })
+
+  test("401 and 403 from the relay itself fail the exit", async () => {
+    // The relay answered without reaching the upstream, so it refused the
+    // plugin: the access token is wrong. Blaming OpenCode would send the
+    // user after the wrong party.
+    for (const status of [401, 403]) {
+      const made = await setup(() => new Response("{}", { status }))
+      const result = await made.tester.test(made.id, "api")
+
+      expect(result.status).toBe("bad")
+      expect(result.note).toContain("access token")
+      expect(made.state.exit(made.id)?.status).toBe("bad")
     }
   })
 
@@ -481,6 +545,52 @@ describe("the background tester", () => {
     await made.tester.scan("api")
     made.tester.stop()
 
+    expect(made.state.exit(made.id)?.status).toBe("reachable")
+  })
+
+  test("an exit added while the scan runs is checked by the same scan", async () => {
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    let arrived!: () => void
+    const firstArrived = new Promise<void>((resolve) => {
+      arrived = resolve
+    })
+
+    const made = await setup(async () => {
+      arrived()
+      await gate
+      return new Response("{}", { status: 200 })
+    })
+
+    const scanning = made.tester.scan("api")
+    await firstArrived
+
+    // A second exit lands while the first check is still in flight - the way
+    // a paste or a deploy finishes behind a running background check. The old
+    // scan copied its queue once and would have left this one untested.
+    const second = await made.state.addRelay({
+      kind: "relay",
+      id: "relay-2",
+      name: "late",
+      project: "",
+      region: "",
+      url: made.state.exit(made.id)?.url ?? "",
+      access: "test-access",
+      accountId: "",
+      enabled: true,
+      status: "untested",
+      createdAt: Date.now(),
+    })
+
+    release()
+    await scanning
+    await made.tester.scan("api")
+
+    // Both ends are checked: the late exit by the drain of the first scan or
+    // the second one, never left "not tested" behind a finished run.
+    expect(made.state.exit(second.id)?.status).not.toBe("untested")
     expect(made.state.exit(made.id)?.status).toBe("reachable")
   })
 })

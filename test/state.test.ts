@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test"
 import { relayRequest } from "../src/lib/routing.ts"
 import type { RelayRecord } from "../src/lib/types.ts"
 import { registerHooks, ROTATE_DELAY_MS } from "../src/server/hooks.ts"
-import { RelayState, COOLDOWN_BASE_MS } from "../src/server/state.ts"
+import { RelayState, StorageError, COOLDOWN_BASE_MS } from "../src/server/state.ts"
 
 /**
  * The state rules that keep an exit from serving when it should not.
@@ -108,6 +108,7 @@ async function makeHooks() {
     catalog: { list: async () => [] } as never,
     bridge: { ready: true, origin: "http://127.0.0.1:1", key: "bridge-key" } as never,
     tester: { canary: async () => "inconclusive" } as never,
+    announceTraffic: () => {},
   })
   return { state, hooks: made.hooks }
 }
@@ -381,6 +382,281 @@ describe("across a restart", () => {
     })
   })
 
+  test("a rename keeps the counters and the rest that a URL change would drop", async () => {
+    const { state } = await makeRestartable()
+    const proxy = await state.addProxy({
+      kind: "proxy",
+      id: "proxy-1",
+      name: "proxy",
+      url: "http://1.2.3.4:8080",
+      enabled: true,
+      status: "ready",
+      createdAt: Date.now(),
+    })
+    state.noteRequest(proxy.id)
+    state.noteRequest(proxy.id)
+    state.markFailed(proxy.id)
+    // A live failure, armed the way the hooks arm it.
+    state.markFailure(proxy.id, "The exit did not answer.", "unreachable")
+
+    await state.updateProxy(proxy.id, { name: "just renamed" })
+
+    // A rename is the same machine behind the same address, so the counters,
+    // the verdict and the armed rest all survive it. Dropping them here would
+    // make a resting proxy usable again without anything changing but its
+    // name.
+    expect(state.proxy(proxy.id)?.status).toBe("unreachable")
+    expect(state.proxy(proxy.id)?.failures).toBe(1)
+    expect(state.proxy(proxy.id)?.lastError).toBe("The exit did not answer.")
+    expect(state.statsFor(proxy.id).requests).toBe(2)
+    expect(state.statsFor(proxy.id).failed).toBe(1)
+    expect(state.pickExit({ advance: false }).exit).toBeUndefined()
+    expect(
+      state.pickExit({ advance: false, now: Date.now() + 5 * 60_000 }).exit?.id,
+    ).toBe(proxy.id)
+  })
+
+  test("a success clears the failure note a previous verdict left behind", async () => {
+    const state = await readyState(["relay-1"])
+    state.markFailure("relay-1", "The exit did not answer.", "unreachable")
+    expect(state.summaryOf("relay-1")?.lastError).toContain("did not answer")
+
+    state.markSuccess("relay-1", 90)
+
+    const summary = state.summaryOf("relay-1")
+    expect(summary?.status).toBe("ready")
+    // A healthy record that still carried the old error's text would have the
+    // details page show a failure under a ready status.
+    expect(summary?.lastError).toBeUndefined()
+  })
+
+  test("a passing check drops the previous failure's note", async () => {
+    const state = await readyState(["relay-1"])
+    await state.setHealth("relay-1", {
+      status: "bad",
+      lastError: "The exit answered with HTTP 500.",
+      checkedAt: Date.now(),
+    })
+    expect(state.summaryOf("relay-1")?.lastError).toContain("500")
+
+    await state.setHealth("relay-1", { status: "ready", checkedAt: Date.now() })
+
+    expect(state.summaryOf("relay-1")?.status).toBe("ready")
+    expect(state.summaryOf("relay-1")?.lastError).toBeUndefined()
+  })
+
+  test("the rotation does not serve one exit twice when another comes back", async () => {
+    const { state } = await makeRestartable()
+    await state.addRelay(relay("relay-a"))
+    await state.addRelay(relay("relay-b"))
+    await state.addRelay(relay("relay-c"))
+    await state.setEnabled(true)
+    await state.setStrategy("round-robin")
+    await state.setHealth("relay-a", { status: "ready" })
+    await state.setHealth("relay-b", { status: "ready" })
+    await state.setHealth("relay-c", { status: "ready" })
+
+    const first = state.pickExit({ advance: true }).exit?.id
+    const second = state.pickExit({ advance: true }).exit?.id
+    expect(first).toBe("relay-a")
+    expect(second).toBe("relay-b")
+
+    // The middle exit rests and comes back. The rotation stands where it was,
+    // so the exit that comes back is served in turn rather than twice.
+    state.markFailure("relay-b", "The exit did not answer.", "unreachable")
+    const duringRest = state.pickExit({ advance: true }).exit?.id
+    expect(duringRest).toBe("relay-c")
+
+    const later = state.pickExit({ advance: true, now: Date.now() + 10 * 60_000 }).exit?.id
+    expect(later).toBe("relay-a")
+  })
+
+  test("choosing an exit starts the rotation there", async () => {
+    const { state } = await makeRestartable()
+    await state.addRelay(relay("relay-a"))
+    await state.addRelay(relay("relay-b"))
+    await state.addRelay(relay("relay-c"))
+    await state.setEnabled(true)
+    await state.setStrategy("round-robin")
+    await state.setHealth("relay-a", { status: "ready" })
+    await state.setHealth("relay-b", { status: "ready" })
+    await state.setHealth("relay-c", { status: "ready" })
+
+    // The chosen exit is where the rotation starts, not wherever the last
+    // request happened to leave it.
+    await state.setActiveExit("relay-c")
+    expect(state.pickExit({ advance: true }).exit?.id).toBe("relay-c")
+    expect(state.pickExit({ advance: true }).exit?.id).toBe("relay-a")
+  })
+
+  test("a rate limit rests an exit for a bounded time, whatever the header said", async () => {
+    const { state } = await makeRestartable()
+    await state.addRelay(relay("relay-1"))
+    await state.setHealth("relay-1", { status: "ready" })
+
+    // A Retry-After of years must not bench the exit for years: it would
+    // only ever be lifted by another test.
+    state.markRateLimited("relay-1", Date.now() + 365 * 24 * 60 * 60_000, "OpenCode rate-limited this exit.")
+
+    const cooling = state.exit("relay-1")?.coolingUntil
+    expect(cooling).toBeDefined()
+    expect(cooling as number).toBeLessThanOrEqual(Date.now() + 24 * 60 * 60_000)
+  })
+
+  test("a failed write is reported, not passed off as saved", async () => {
+    const store = new Map<string, unknown>()
+    const storage = {
+      store,
+      get: async (key: string) => store.get(key),
+      set: async (key: string, value: unknown) => {
+        // The disk is full: the change is in memory but never on disk.
+        if (key === "relays") throw new Error("ENOSPC: no space left on device")
+        store.set(key, value)
+      },
+      remove: async (key: string) => {
+        store.delete(key)
+      },
+      scan: async () => ({ entries: [] }),
+    }
+    const state = new RelayState(storage as never)
+    await state.load()
+
+    // A change that could not be saved must say so: the caller has to know
+    // that the next restart would undo it.
+    let failed: unknown
+    try {
+      await state.addRelay(relay("relay-1"))
+    } catch (error) {
+      failed = error
+    }
+    expect(failed).toBeInstanceOf(StorageError)
+    expect((failed as StorageError).key).toBe("relays")
+    expect((failed as StorageError).message).toContain("relays")
+    expect((failed as StorageError).message).toContain("ENOSPC")
+  })
+
+  test("a used-up exit stays used up until something proves the allowance is back", async () => {
+    const { state } = await makeRestartable()
+    await state.addRelay(relay("relay-1"))
+    await state.setHealth("relay-1", { status: "ready" })
+
+    const until = Date.now() + 60 * 60_000
+    await state.setHealth("relay-1", { status: "exhausted", exhaustedUntil: until })
+
+    // The model list answers even when the chat allowance is gone, so a check
+    // that only asked for it must not lift the latch.
+    await state.setHealth("relay-1", { status: "reachable" })
+    expect(state.exit("relay-1")?.status).toBe("exhausted")
+    expect(state.exit("relay-1")?.exhaustedUntil).toBe(until)
+
+    // A real model answer through the exit proves it, and lifts the latch.
+    await state.setHealth("relay-1", { status: "ready" })
+    expect(state.exit("relay-1")?.status).toBe("ready")
+  })
+
+  test("a verdict that proves nothing leaves a resting exit alone", async () => {
+    const { state } = await makeRestartable()
+    await state.addRelay(relay("relay-1"))
+    await state.setHealth("relay-1", { status: "ready" })
+    state.markFailure("relay-1", "The exit did not answer.", "unreachable")
+    expect(state.exit("relay-1")?.status).toBe("unreachable")
+
+    // A check that could not tell must not revive the exit: the next request
+    // would land on it again.
+    const changed = await state.setHealth("relay-1", { status: "unknown" })
+    expect(changed).toBe(false)
+    expect(state.exit("relay-1")?.status).toBe("unreachable")
+  })
+
+  test("a failed write takes the change back with it", async () => {
+    const store = new Map<string, unknown>()
+    const storage = {
+      get: async (key: string) => store.get(key),
+      set: async (key: string, value: unknown) => {
+        if (key === "relays") throw new Error("ENOSPC: no space left on device")
+        store.set(key, value)
+      },
+      remove: async (key: string) => {
+        store.delete(key)
+      },
+      scan: async () => ({ entries: [] }),
+    }
+    const state = new RelayState(storage as never)
+    await state.load()
+
+    await state.addRelay(relay("relay-1")).catch(() => {})
+
+    // The relay is not on the disk, so it must not be in memory either: a
+    // reader would see an exit that the next restart would lose.
+    expect(state.relays()).toHaveLength(0)
+  })
+
+  test("the rotation carries on where it was after a restart", async () => {
+    const { state, restart } = await makeRestartable()
+    await state.addRelay(relay("relay-a"))
+    await state.addRelay(relay("relay-b"))
+    await state.addRelay(relay("relay-c"))
+    await state.setEnabled(true)
+    await state.setStrategy("round-robin")
+    await state.setHealth("relay-a", { status: "ready" })
+    await state.setHealth("relay-b", { status: "ready" })
+    await state.setHealth("relay-c", { status: "ready" })
+
+    expect(state.pickExit({ advance: true }).exit?.id).toBe("relay-a")
+    expect(state.pickExit({ advance: true }).exit?.id).toBe("relay-b")
+    await Bun.sleep(0)
+
+    // A restart that always started the rotation at the first exit would
+    // let that one burn its allowance first every time. The position is
+    // written with the rules, so the rotation carries on from where it was.
+    const next = await restart()
+    await next.setHealth("relay-a", { status: "ready" })
+    await next.setHealth("relay-b", { status: "ready" })
+    await next.setHealth("relay-c", { status: "ready" })
+    const served = next.pickExit({ advance: true }).exit?.id
+    expect(served).not.toBe("relay-a")
+  })
+
+  test("a live used-up latch outranks a failure verdict", async () => {
+    const { state } = await makeRestartable()
+    await state.addRelay(relay("relay-1"))
+    await state.setHealth("relay-1", { status: "ready" })
+
+    const until = Date.now() + 60 * 60_000
+    await state.setHealth("relay-1", { status: "exhausted", exhaustedUntil: until })
+
+    // A transport failure that lands after the exhaustion verdict must not
+    // clear the latch: the address has no allowance left, whatever the
+    // connection did.
+    state.markFailure("relay-1", "The exit did not answer.", "unreachable")
+
+    expect(state.exit("relay-1")?.status).toBe("exhausted")
+    expect(state.pickExit({ advance: true }).exit).toBeUndefined()
+    const later = state.pickExit({ advance: true, now: Date.now() + 10 * 60_000 })
+    expect(later.exit).toBeUndefined()
+    expect(later.skipped[0]?.reason).toContain("used up")
+  })
+
+  test("the rotation carries on after the exit it served is removed", async () => {
+    const { state } = await makeRestartable()
+    await state.addRelay(relay("relay-a"))
+    await state.addRelay(relay("relay-b"))
+    await state.addRelay(relay("relay-c"))
+    await state.setEnabled(true)
+    await state.setStrategy("round-robin")
+    await state.setHealth("relay-a", { status: "ready" })
+    await state.setHealth("relay-b", { status: "ready" })
+    await state.setHealth("relay-c", { status: "ready" })
+
+    expect(state.pickExit({ advance: true }).exit?.id).toBe("relay-a")
+    expect(state.pickExit({ advance: true }).exit?.id).toBe("relay-b")
+
+    // The exit that served last is gone: the rotation carries on with the
+    // next one instead of starting over.
+    await state.removeExit("relay-b")
+    expect(state.pickExit({ advance: true }).exit?.id).toBe("relay-c")
+  })
+
   test("a partial settings object keeps what it says and defaults the rest", async () => {
     const { state, restart, store } = await makeRestartable()
     await state.addRelay(relay("relay-1"))
@@ -573,13 +849,52 @@ describe("the response and retry hooks on a 409", () => {
     expect(retry.decision).toEqual({ retry: false })
   })
 
-  test("a rotate 409 still retires the exit and asks for another attempt", async () => {
+  test("the exhausted strategy keeps the chosen exit through a short rest", async () => {
+    const { state } = await makeRestartable()
+    await state.addRelay(relay("relay-a"))
+    await state.addRelay(relay("relay-b"))
+    await state.setHealth("relay-a", { status: "ready" })
+    await state.setHealth("relay-b", { status: "ready" })
+    await state.setActiveExit("relay-a")
+    await state.setStrategy("exhausted")
+
+    // A failure rests the chosen exit for a while. The backup takes the
+    // request meanwhile, but the choice is not the user's to lose.
+    state.markFailure("relay-a", "The exit did not answer.", "unreachable")
+    expect(state.pickExit({ advance: true }).exit?.id).toBe("relay-b")
+    expect(state.settings().activeExitId).toBe("relay-a")
+
+    // When the rest is over, the chosen exit serves again.
+    const later = state.pickExit({ advance: true, now: Date.now() + 10 * 60_000 }).exit?.id
+    expect(later).toBe("relay-a")
+    expect(state.settings().activeExitId).toBe("relay-a")
+  })
+
+  test("a used-up exit does change the choice, because that is the strategy", async () => {
+    const { state } = await makeRestartable()
+    await state.addRelay(relay("relay-a"))
+    await state.addRelay(relay("relay-b"))
+    await state.setHealth("relay-a", { status: "ready" })
+    await state.setHealth("relay-b", { status: "ready" })
+    await state.setActiveExit("relay-a")
+    await state.setStrategy("exhausted")
+
+    state.markExhausted("relay-a", Date.now() + 60 * 60_000, "The allowance is gone.")
+
+    expect(state.settings().activeExitId).toBe("relay-b")
+  })
+
+  test("a rotate 409 with a spent address retires the exit, and asks for another attempt", async () => {
     const { state, hooks } = await makeHooks()
     await state.addRelay(relay("relay-1"))
     await state.addRelay(relay("relay-2"))
     await state.setHealth("relay-1", { status: "ready" })
     await state.setHealth("relay-2", { status: "ready" })
     state.noteRelayed("session-2", "iceman-free", "relay-1")
+    // The avoid list the relay echoes back is built from the live spent
+    // entries, so the address is spent before the echo arrives: the window
+    // the provider gave is what the exit rests for.
+    state.markSpent("203.0.113.9", Date.now() + 60 * 60_000)
 
     await hooks.get("http.response")?.(
       responseInput("session-2", "relay-1", 409, {
@@ -589,11 +904,48 @@ describe("the response and retry hooks on a 409", () => {
     )
 
     expect(state.exit("relay-1")?.status).toBe("exhausted")
+    expect(state.exit("relay-1")?.exhaustedUntil).toBeGreaterThan(Date.now() + 59 * 60_000)
     expect(state.failureFor("session-2", "iceman-free")?.kind).toBe("rotate")
     expect(state.spentEgresses()).toContain("203.0.113.9")
 
     const retry = {
       sessionID: "session-2",
+      model: { id: "iceman-free", providerID: "opencode" },
+      error: { status: 409 },
+      attempt: 1,
+      decision: { retry: false } as { retry: boolean; delay?: number },
+    }
+    await hooks.get("retry")?.(retry as never)
+
+    expect(retry.decision).toEqual({ retry: true, delay: ROTATE_DELAY_MS })
+  })
+
+  test("a rotate 409 with an unknown address is a short rest, not a retirement", async () => {
+    const { state, hooks } = await makeHooks()
+    await state.addRelay(relay("relay-1"))
+    await state.addRelay(relay("relay-2"))
+    await state.setHealth("relay-1", { status: "ready" })
+    await state.setHealth("relay-2", { status: "ready" })
+    state.noteRelayed("session-3", "iceman-free", "relay-1")
+
+    await hooks.get("http.response")?.(
+      responseInput("session-3", "relay-1", 409, {
+        "x-relay-rotate": "1",
+        "x-relay-egress": "203.0.113.9",
+      }) as never,
+    )
+
+    // The echo names an address that is not spent, so it is a stale echo and
+    // not provider evidence: the exit rests instead of retiring until the
+    // window would have ended, and the address is not marked spent for longer.
+    expect(state.exit("relay-1")?.status).toBe("limited")
+    expect(state.exit("relay-1")?.exhaustedUntil).toBeUndefined()
+    expect(state.coolingExits()).toContain("relay-1")
+    expect(state.spentEgresses()).not.toContain("203.0.113.9")
+    expect(state.failureFor("session-3", "iceman-free")?.kind).toBe("rotate")
+
+    const retry = {
+      sessionID: "session-3",
       model: { id: "iceman-free", providerID: "opencode" },
       error: { status: 409 },
       attempt: 1,

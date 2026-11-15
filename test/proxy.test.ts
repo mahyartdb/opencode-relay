@@ -318,6 +318,68 @@ describe("redactProxyToken", () => {
     expect(redactProxyToken("alice:secret@1.2.3.4:8080")).toBe("***@1.2.3.4:8080")
     expect(redactProxyToken("1.2.3.4:8080")).toBe("1.2.3.4:8080")
   })
+
+  test("removes the credentials of the colon forms too", () => {
+    // The legacy host:port:user:pass shapes carry credentials after the
+    // port, with no @ to mark them: showing them would echo the password
+    // back into the menu, which is the one thing this function is for.
+    expect(redactProxyToken("h:99999:alice:MyS3cretPw")).toBe("h:99999:***")
+    expect(redactProxyToken("bad_host!:8080:alice:MyS3cretPw")).toBe("bad_host!:8080:***")
+    expect(redactProxyToken("socks5://h:1080:alice:MyS3cretPw")).toBe("socks5://h:1080:***")
+    expect(redactProxyToken("[::1]:8080:alice:MyS3cretPw")).toBe("[::1]:8080:***")
+    // A port is a number, so "abc" cannot be one: the first colon already
+    // starts the credentials, and everything after it is hidden.
+    expect(redactProxyToken("a:abc:alice:MyS3cretPw")).toBe("a:***")
+  })
+
+  test("does not show a password as if it were the host", () => {
+    // The swapped host:port@user:pass shape puts the credentials after the
+    // @, where the address belongs: masking only the @ would show the
+    // password where the host should be.
+    expect(redactProxyToken("host:port@alice:MyS3cretPw")).not.toContain("MyS3cretPw")
+  })
+
+  test("does not show a password that has no port to mark it", () => {
+    // There is no @ and no port: the first colon already starts the
+    // credentials, so everything after it is hidden.
+    expect(redactProxyToken("http://alice:MyS3cretPw")).toBe("http://alice:***")
+    expect(redactProxyToken("alice:MyS3cretPw")).toBe("alice:***")
+    expect(redactProxyToken("alice:MyS3cretPw:1.2.3.4:8080")).not.toContain("MyS3cretPw")
+    expect(redactProxyToken("http://alice:MyS3cretPw")).not.toContain("MyS3cretPw")
+  })
+
+  test("a plain address is shown as it is", () => {
+    expect(redactProxyToken("1.2.3.4:8080")).toBe("1.2.3.4:8080")
+    expect(redactProxyToken("http://1.2.3.4:8080")).toBe("http://1.2.3.4:8080")
+    expect(redactProxyToken("[::1]:8080")).toBe("[::1]:8080")
+  })
+})
+
+describe("masked credentials", () => {
+  test("an address carrying the mask is refused, not stored", () => {
+    // The details page shows a proxy's address with its credentials
+    // replaced by ***. Storing that back would replace the real password
+    // with three asterisks.
+    const parsed = parseProxyList("http://***@1.2.3.4:8080")
+    expect(parsed.proxies).toHaveLength(0)
+    expect(parsed.invalid).toHaveLength(1)
+    expect(parsed.invalid[0]?.reason).toContain("masked")
+  })
+
+  test("a refused entry never carries the password back", () => {
+    const parsed = parseProxyList("1.2.3.4:99999:alice:MyS3cretPw")
+    expect(parsed.invalid).toHaveLength(1)
+    expect(parsed.invalid[0]?.value).not.toContain("MyS3cretPw")
+  })
+
+  test("a refused JSON entry never carries the password back", () => {
+    // The address may sit under any key at all, so every string in the entry
+    // is masked the same way a pasted line is.
+    const parsed = parseProxyList('{"proxy_url":"http://alice:MyS3cretPw@host:8080"}')
+    expect(parsed.invalid).toHaveLength(1)
+    expect(parsed.invalid[0]?.value).not.toContain("MyS3cretPw")
+    expect(parsed.invalid[0]?.value).toContain("***")
+  })
 })
 
 describe("readBody", () => {

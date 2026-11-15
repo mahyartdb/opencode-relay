@@ -291,6 +291,21 @@ describe("relayRequest", () => {
     )
   })
 
+  test("refuses a remote relay in plain http, so the access key stays safe", () => {
+    const original = new Request("https://opencode.ai/inference/openai/v1/models")
+
+    // The key and the authorization header travel to the relay, so a remote
+    // address in plain http would carry them in the clear. A relay stored by
+    // an older version may still have such an address.
+    expect(() => relayRequest(original, { url: "http://relay.example.com", access: "k" })).toThrow(
+      /not an https address/,
+    )
+    // A relay on this machine is fine: nothing crosses a network.
+    expect(relayRequest(original, { url: "http://127.0.0.1:4321", access: "k" }).url).toBe(
+      "http://127.0.0.1:4321/",
+    )
+  })
+
   test("drops the hop-by-hop headers", () => {
     const original = new Request("https://opencode.ai/inference/openai/v1/chat/completions", {
       method: "POST",
@@ -613,6 +628,7 @@ async function makeHooks(canary: () => Promise<string> = async () => "inconclusi
       } as never,
       bridge: { ready: true, origin: "http://127.0.0.1:1", key: "bridge-key" } as never,
       tester: { canary } as never,
+      announceTraffic: () => {},
     },
   )
   return { state, hooks: handlers }
@@ -766,12 +782,18 @@ describe("the response and retry hooks on another provider", () => {
 })
 
 describe("the retry hook on 401 and 403", () => {
+  // The relay's own headers say the answer came from the upstream through
+  // it, so the refusal is OpenCode's.
+  const fromUpstream = { "x-relay-egress": "203.0.113.7", "x-relay-instance": "i1" }
+
   for (const status of [401, 403]) {
     test(`${status} retries through a backup exit`, async () => {
       const { state, hooks } = await setup(["relay-1", "relay-2"])
       state.noteRelayed("blocked", freeModel.id, "relay-1")
 
-      await hooks.get("http.response")?.(responseInput("blocked", "relay-1", status) as never)
+      await hooks.get("http.response")?.(
+        responseInput("blocked", "relay-1", status, fromUpstream) as never,
+      )
 
       expect(state.exit("relay-1")?.status).toBe("blocked")
       expect(state.statsFor("relay-1").failed).toBe(0)
@@ -785,6 +807,21 @@ describe("the retry hook on 401 and 403", () => {
       expect(retry.decision).toEqual({ retry: true, delay: ROTATE_DELAY_MS })
       expect(state.statsFor("relay-1").failed).toBe(0)
       expect(state.failureCount("relay-1")).toBe(1)
+    })
+
+    test(`${status} from the relay itself is a configuration failure`, async () => {
+      // The relay answered without reaching the upstream, so it refused the
+      // plugin: the access token is wrong. Blaming OpenCode would point the
+      // user at the wrong thing.
+      const { state, hooks } = await setup(["relay-1", "relay-2"])
+      state.noteRelayed("bad-token", freeModel.id, "relay-1")
+
+      await hooks.get("http.response")?.(
+        responseInput("bad-token", "relay-1", status) as never,
+      )
+
+      expect(state.exit("relay-1")?.status).toBe("bad")
+      expect(state.exit("relay-1")?.lastError).toContain("access token")
     })
 
     test(`${status} retries direct when no exit remains and direct is allowed`, async () => {
@@ -1060,6 +1097,62 @@ describe("the retry hook on 5xx", () => {
   })
 })
 
+describe("an answer the local bridge made", () => {
+  test("is not booked as the exit's health", async () => {
+    // The bridge answers a few requests itself: a wrong secret, a target it
+    // does not allow, a proxy that is gone. Those say nothing about the exit.
+    const { state, hooks } = await setup([], ["proxy-1"])
+    state.noteRelayed("bridge-error", freeModel.id, "proxy-1")
+
+    await hooks.get("http.response")?.(
+      responseInput("bridge-error", "proxy-1", 409, { "x-bridge-error": "1" }) as never,
+    )
+
+    expect(state.exit("proxy-1")?.status).toBe("ready")
+    expect(state.failureCount("proxy-1")).toBe(0)
+  })
+})
+
+describe("the retry hook on a 429 the canary cleared", () => {  test("a canary that answered leaves the exit in use", async () => {
+    // The canary proved the exit works: the refusal was about the request,
+    // so the exit must not be benched for a quarter of an hour.
+    const { state, hooks } = await setup(["relay-1"], [], async () => "clean")
+    state.noteRelayed("clean-canary", freeModel.id, "relay-1")
+
+    await hooks.get("http.response")?.(
+      answerInput(
+        "clean-canary",
+        requestFor("relay-1"),
+        429,
+        { "x-relay-egress": "203.0.113.12" },
+        '{"error":{"message":"Free usage limit reached"}}',
+      ) as never,
+    )
+
+    expect(state.exit("relay-1")?.status).toBe("limited")
+    const cooling = state.exit("relay-1")?.coolingUntil ?? 0
+    expect(cooling - Date.now()).toBeLessThanOrEqual(2 * 60_000)
+  })
+
+  test("a canary that could not tell leaves the doubt where it was", async () => {
+    const { state, hooks } = await setup(["relay-1"], [], async () => "inconclusive")
+    state.noteRelayed("unknown-canary", freeModel.id, "relay-1")
+
+    await hooks.get("http.response")?.(
+      answerInput(
+        "unknown-canary",
+        requestFor("relay-1"),
+        429,
+        { "x-relay-egress": "203.0.113.12" },
+        '{"error":{"message":"Free usage limit reached"}}',
+      ) as never,
+    )
+
+    const cooling = state.exit("relay-1")?.coolingUntil ?? 0
+    expect(cooling - Date.now()).toBeGreaterThan(5 * 60_000)
+  })
+})
+
 describe("the retry hook on a 429 free-allowance answer with no exit left", () => {
   function freeLimitAnswer(sessionID: string) {
     return answerInput(
@@ -1115,7 +1208,9 @@ describe("the retry hook on a rotate 409 with one exit", () => {
       }) as never,
     )
 
-    expect(state.exit("relay-1")?.status).toBe("exhausted")
+    // Nothing marked the echoed address spent, so the echo is stale and the
+    // exit rests for a while instead of being retired.
+    expect(state.exit("relay-1")?.status).toBe("limited")
 
     const retry = retryInput("rotate-direct", 409)
     await hooks.get("retry")?.(retry as never)

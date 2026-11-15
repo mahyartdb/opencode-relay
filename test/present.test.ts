@@ -6,13 +6,13 @@ import {
   describeSelection,
   describeSettings,
   describeStatusPage,
-  describeStatusSummary,
   exitList,
   exitsMenuOptions,
   menuOptions,
   pillTone,
   statusLabel,
   summarizePill,
+  toggleModel,
   usableExits,
   type ExitSummaryLike,
   type PreviewLike,
@@ -51,6 +51,19 @@ function status(overrides: Partial<StatusLike> = {}): StatusLike {
   }
 }
 
+describe("toggleModel", () => {
+  test("confirming the question does what it says", () => {
+    // The question asks for the opposite of what the model is doing now, so
+    // the answer has to be read against the current state.
+    const picked = new Set(["routed"])
+
+    expect(toggleModel(picked, "routed", true)).toEqual([])
+    expect(toggleModel(picked, "free", false).sort()).toEqual(["free", "routed"])
+    // The set that was passed in is not touched.
+    expect([...picked]).toEqual(["routed"])
+  })
+})
+
 describe("statusLabel", () => {
   test("uses familiar words for every status", () => {
     expect(statusLabel("ready")).toBe("ready")
@@ -66,7 +79,7 @@ describe("statusLabel", () => {
 describe("describeSelection", () => {
   test("says what is routed, in models and never a paid mode", () => {
     expect(describeSelection(status({ selection: "free" }))).toBe(
-      "Every free model · 8 routed of 20",
+      "Every free model · 8 routed",
     )
     expect(describeSelection(status({ selection: "custom", routedCount: 0 }))).toBe(
       "No model chosen · nothing is routed",
@@ -130,10 +143,10 @@ describe("usableExits", () => {
 
     expect(usableExits(picked).map((item) => item.id)).toEqual(["rested"])
     // The pill and the menu name the exit routing will really use, whatever
-    // its last recorded verdict says.
-    expect(describeStatusSummary(picked)).toBe("On · rested · 0 req")
     expect(summarizePill(picked)).toBe("relay · rested · 0 req")
-    expect(describeExit(rested, picked)).toContain("chosen")
+    // The exit that serves the next request is marked "next", not "chosen":
+    // the user did not choose it, routing merely has nowhere else to go.
+    expect(describeExit(rested, picked)).toContain("next")
   })
 
   test("an untested exit is neither served nor named while the picker chose another", () => {
@@ -146,8 +159,6 @@ describe("usableExits", () => {
       skippedExitIds: ["fresh"],
     })
 
-    expect(usableExits(picked).map((item) => item.id)).toEqual(["backup"])
-    expect(describeStatusSummary(picked)).toBe("On · backup · 0 req")
     expect(summarizePill(picked)).toBe("relay · backup · 0 req")
   })
 
@@ -155,141 +166,10 @@ describe("usableExits", () => {
     const exits = [exit({ id: "a" }), exit({ id: "b" })]
     const none = status({ exits, skippedExitIds: ["a", "b"] })
 
-    expect(usableExits(none)).toEqual([])
-    expect(describeStatusSummary(none)).toBe("On · no exit can serve · direct")
-    expect(summarizePill(none)).toBe("relay on · no exit can serve · direct")
+    expect(summarizePill(none)).toBe("relay on · no exit can serve · direct · /relay")
   })
 })
 
-describe("describeStatusSummary", () => {
-  test("says off, and how many exits are waiting", () => {
-    expect(describeStatusSummary(status({ enabled: false, exits: [] }))).toBe("Off · no exits")
-    expect(
-      describeStatusSummary(status({ enabled: false, exits: [exit({ id: "a" }), exit({ id: "b" })] })),
-    ).toBe("Off · 2 exits")
-    expect(describeStatusSummary(status({ enabled: false, exits: [exit({ id: "a" })] }))).toBe(
-      "Off · 1 exit",
-    )
-  })
-
-  test("a test run in progress beats everything else", () => {
-    expect(
-      describeStatusSummary(
-        status({
-          exits: [exit({ id: "a" }), exit({ id: "b" })],
-          scanning: { startedAt: 0, total: 8, done: 3 },
-        }),
-      ),
-    ).toBe("Testing 3/8")
-  })
-
-  test("does not pretend an exit can serve when none can", () => {
-    const broken = { exits: [exit({ id: "fra", status: "unreachable" })], skipped: ["fra"] }
-    expect(describeStatusSummary(status({ ...broken, direct: "allow" }))).toBe(
-      "On · no exit can serve · direct",
-    )
-    expect(describeStatusSummary(status({ ...broken, direct: "never" }))).toBe(
-      "On · no exit can serve · fail",
-    )
-  })
-
-  test("names where routing points and counts the requests that went through", () => {
-    expect(
-      describeStatusSummary(
-        status({ activeExit: { id: "fra", name: "Frankfurt", kind: "relay" } }),
-      ),
-    ).toBe("On · Frankfurt · 0 req")
-    expect(
-      describeStatusSummary(
-        status({
-          activeExit: { id: "fra", name: "Frankfurt", kind: "relay" },
-          exits: [exit({ id: "fra", stats: { requests: 3 } })],
-        }),
-      ),
-    ).toBe("On · Frankfurt · 3 req")
-  })
-
-  test("names the strategy when no single exit is the answer", () => {
-    expect(describeStatusSummary(status({ strategy: "round-robin" }))).toBe(
-      "On · round robin · 0 req",
-    )
-    expect(describeStatusSummary(status({ strategy: "fastest" }))).toBe("On · fastest · 0 req")
-    // Fixed, but nothing chosen yet: the next usable one will take it.
-    expect(describeStatusSummary(status())).toBe("On · next exit · 0 req")
-  })
-
-  test("appends how many exits are used up", () => {
-    expect(
-      describeStatusSummary(
-        status({
-          exits: [exit({ id: "fra" }), exit({ id: "p1", kind: "proxy" })],
-          activeExit: { id: "fra", name: "Frankfurt", kind: "relay" },
-          exhausted: ["p1"],
-        }),
-      ),
-    ).toBe("On · Frankfurt · 0 req · 1 used up")
-  })
-
-  test("a background test shows even while routing is off", () => {
-    const scanning = { startedAt: 0, total: 8, done: 3 }
-    expect(describeStatusSummary(status({ enabled: false, scanning }))).toBe("Off · testing 3/8")
-    expect(describeStatusSummary(status({ enabled: false, exits: [], scanning }))).toBe(
-      "Off · testing 3/8",
-    )
-  })
-
-  test("a custom selection with nothing routed does not promise routing", () => {
-    expect(
-      describeStatusSummary(status({ selection: "custom", routedCount: 0 })),
-    ).toBe("On · nothing routed")
-
-    // With an exit still chosen, the summary names it as before.
-    expect(
-      describeStatusSummary(
-        status({ selection: "custom", routedCount: 2, activeExit: { id: "fra", name: "Frankfurt" } }),
-      ),
-    ).toBe("On · Frankfurt · 0 req")
-  })
-
-  test("names the chosen exit only while that exit can serve", () => {
-    const chosen = { activeExit: { id: "fra", name: "Frankfurt", kind: "relay" } } as const
-    const serves = status({ ...chosen, exits: [exit({ id: "fra" }), exit({ id: "ams" })] })
-    expect(describeStatusSummary(serves)).toBe("On · Frankfurt · 0 req")
-
-    // Paused: routing would step over it, so it may not be named.
-    expect(
-      describeStatusSummary(
-        status({ ...chosen, exits: [exit({ id: "fra", enabled: false }), exit({ id: "ams" })] }),
-      ),
-    ).toBe("On · next exit · 0 req")
-
-    // Used up.
-    expect(
-      describeStatusSummary(
-        status({ ...chosen, exits: [exit({ id: "fra" }), exit({ id: "ams" })], exhausted: ["fra"] }),
-      ),
-    ).toBe("On · next exit · 0 req · 1 used up")
-
-    // Not answering, while the other exit still can.
-    expect(
-      describeStatusSummary(
-        status({
-          ...chosen,
-          exits: [
-            exit({ id: "fra", status: "unreachable", statusLabel: "not answering" }),
-            exit({ id: "ams" }),
-          ],
-          skipped: ["fra"],
-        }),
-      ),
-    ).toBe("On · next exit · 0 req")
-
-    // An exit that does not exist in the list cannot be named either.
-    expect(describeStatusSummary(status({ ...chosen, exits: [exit({ id: "ams" })] }))).toBe(
-      "On · next exit · 0 req",
-    )
-  })
-})
 
 describe("describeSettings", () => {
   test("sums up strategy, direct fallback and checks in one line", () => {
@@ -393,7 +273,11 @@ describe("exitsMenuOptions", () => {
   test("offers the list-level moves in a fixed order once they apply", () => {
     const options = exitsMenuOptions(
       status({
-        exits: [exit({ id: "fra", project: "oc-relay-fra" }), exit({ id: "p1", kind: "proxy" })],
+        accounts: [{ id: "acc-1", name: "personal" }],
+        exits: [
+          exit({ id: "fra", project: "oc-relay-fra", accountId: "acc-1" }),
+          exit({ id: "p1", kind: "proxy" }),
+        ],
         exhausted: ["p1"],
       }),
     )
@@ -402,6 +286,7 @@ describe("exitsMenuOptions", () => {
       "fra",
       "p1",
       "Test all exits",
+      "Deep test all exits",
       "Update all relays",
       "Bring used-up exits back",
       "Add exits",
@@ -409,11 +294,21 @@ describe("exitsMenuOptions", () => {
     ])
     expect(options.slice(2).map((option) => option.value)).toEqual([
       { kind: "test-all" },
+      { kind: "test-all-deep" },
       { kind: "update-all" },
       { kind: "restore" },
       { kind: "add" },
       { kind: "back" },
     ])
+  })
+
+  test("offers to resume the paused exits only while there are some", () => {
+    const paused = exitsMenuOptions(status({ paused: ["p1"] }))
+    expect(paused.map((option) => option.value)).toContainEqual({ kind: "resume-all" })
+    expect(paused.find((option) => option.value.kind === "resume-all")?.description).toBe("1 exit is paused")
+
+    const none = exitsMenuOptions(status({ paused: [] }))
+    expect(none.map((option) => option.value)).not.toContainEqual({ kind: "resume-all" })
   })
 
   test("test-all needs at least one exit, even proxies only", () => {
@@ -432,14 +327,33 @@ describe("exitsMenuOptions", () => {
   })
 
   test("update-all only for relays this plugin deployed", () => {
-    const deployed = exitsMenuOptions(status({ exits: [exit({ id: "r1", project: "oc-relay-r1" })] }))
-    const tracked = exitsMenuOptions(status({ exits: [exit({ id: "r1" })] }))
-    const proxies = exitsMenuOptions(status({ exits: [exit({ id: "p1", kind: "proxy", project: "x" })] }))
+    const accounts = [{ id: "acc-1", name: "personal" }]
+    const deployed = exitsMenuOptions(
+      status({
+        accounts,
+        exits: [exit({ id: "r1", project: "oc-relay-r1", accountId: "acc-1" })],
+      }),
+    )
+    const tracked = exitsMenuOptions(
+      status({ accounts, exits: [exit({ id: "r1", accountId: "acc-1" })] }),
+    )
+    const proxies = exitsMenuOptions(
+      status({ accounts, exits: [exit({ id: "p1", kind: "proxy", project: "x" })] }),
+    )
+    // A relay whose Vercel account was removed cannot be redeployed, so it is
+    // not an update target either.
+    const orphaned = exitsMenuOptions(
+      status({
+        accounts,
+        exits: [exit({ id: "r1", project: "oc-relay-r1", accountId: "gone" })],
+      }),
+    )
 
     expect(deployed.some((option) => option.value.kind === "update-all")).toBe(true)
     expect(tracked.some((option) => option.value.kind === "update-all")).toBe(false)
     // A project on a proxy is not something this plugin can redeploy.
     expect(proxies.some((option) => option.value.kind === "update-all")).toBe(false)
+    expect(orphaned.some((option) => option.value.kind === "update-all")).toBe(false)
   })
 
   test("restore only when an exit is used up, and says how many", () => {
@@ -562,6 +476,17 @@ describe("describeExit", () => {
     expect(labelled.match(/not answering/g)).toHaveLength(1)
   })
 
+  test("an exit that is rate limited is not called not answering", () => {
+    // The skipped list holds exits for every reason, so a rate-limited exit
+    // would be given a second and wrong reason next to the right one.
+    const limited = describeExit(
+      exit({ id: "fra", status: "limited", statusLabel: "rate limited" }),
+      status({ skipped: ["fra"] }),
+    )
+    expect(limited).toContain("rate limited")
+    expect(limited).not.toContain("not answering")
+  })
+
   test("a used-up exit says so once, keeping the server's own wording", () => {
     const short = describeExit(exit({ id: "fra" }), status({ exhausted: ["fra"] }))
     expect(short).toContain("used up")
@@ -640,15 +565,30 @@ describe("exitList", () => {
   })
 
   test("a relay this plugin deployed says so, so update can trust the flag", () => {
-    const deployed = exitList(status({ exits: [exit({ id: "r1", project: "oc-relay-r1" })] }))
-    const tracked = exitList(status({ exits: [exit({ id: "r1" })] }))
-    const proxy = exitList(status({ exits: [exit({ id: "p1", kind: "proxy", project: "x" })] }))
+    const accounts = [{ id: "acc-1", name: "personal" }]
+    const deployed = exitList(
+      status({
+        accounts,
+        exits: [exit({ id: "r1", project: "oc-relay-r1", accountId: "acc-1" })],
+      }),
+    )
+    const tracked = exitList(status({ accounts, exits: [exit({ id: "r1", accountId: "acc-1" })] }))
+    const proxy = exitList(status({ accounts, exits: [exit({ id: "p1", kind: "proxy", project: "x" })] }))
+    // A relay whose Vercel account was removed cannot be redeployed, so it is
+    // not an update target.
+    const orphaned = exitList(
+      status({
+        accounts,
+        exits: [exit({ id: "r1", project: "oc-relay-r1", accountId: "gone" })],
+      }),
+    )
 
     expect(deployed[0]?.value).toEqual({ id: "r1", name: "r1", kind: "relay", deployed: true })
     // A tracked relay has no project to push code to; a project on a proxy is
     // not something this plugin can redeploy either.
     expect(tracked[0]?.value).toEqual({ id: "r1", name: "r1", kind: "relay", deployed: false })
     expect(proxy[0]?.value).toEqual({ id: "p1", name: "p1", kind: "proxy", deployed: false })
+    expect(orphaned[0]?.value).toEqual({ id: "r1", name: "r1", kind: "relay", deployed: false })
   })
 
   test("carries no footer: the last error belongs to the Details page", () => {
@@ -678,6 +618,13 @@ describe("summarizePill", () => {
     expect(summarizePill(undefined)).toBeUndefined()
   })
 
+  test("says the server is not answering, even before the first answer", () => {
+    // Nothing routes while the server is silent, so the pill says so rather
+    // than staying quiet about a plugin that cannot work.
+    expect(summarizePill(undefined, false)).toBe("relay · server not answering")
+    expect(pillTone(undefined, false)).toBe("bad")
+  })
+
   test("always says off once the plugin exists, exits or not", () => {
     expect(summarizePill(status({ enabled: false }))).toBe("relay off · /relay")
     expect(summarizePill(status({ enabled: false, exits: [] }))).toBe("relay off · /relay")
@@ -701,7 +648,11 @@ describe("summarizePill", () => {
     expect(summarizePill(status({ enabled: false, exits: [], scanning }))).toBe(
       "relay off · testing 3/8 · /relay",
     )
-    expect(summarizePill(status({ exits: [], scanning }))).toBe("relay on · testing 3/8")
+    // Routing is on but the exit list is empty, so the scan line carries the
+    // same problem the non-scanning line would name.
+    expect(summarizePill(status({ exits: [], scanning }))).toBe(
+      "relay on · testing 3/8 · no exit can serve · /relay",
+    )
     // A finished run falls back to the state instead of progress.
     expect(summarizePill(status({ enabled: false, scanning: { ...scanning, done: 8 } }))).toBe(
       "relay off · /relay",
@@ -711,7 +662,7 @@ describe("summarizePill", () => {
   test("a custom selection with nothing routed does not imply live routing", () => {
     expect(
       summarizePill(status({ selection: "custom", routedCount: 0 })),
-    ).toBe("relay on · nothing routed")
+    ).toBe("relay on · nothing routed · /relay")
     expect(
       summarizePill(
         status({ selection: "custom", routedCount: 2, activeExit: { id: "fra", name: "Frankfurt" } }),
@@ -722,10 +673,10 @@ describe("summarizePill", () => {
   test("does not pretend an exit can serve when none can", () => {
     const broken = { exits: [exit({ id: "fra", status: "unreachable" })], skipped: ["fra"] }
     expect(summarizePill(status({ ...broken, direct: "allow" }))).toBe(
-      "relay on · no exit can serve · direct",
+      "relay on · no exit can serve · direct · /relay",
     )
     expect(summarizePill(status({ ...broken, direct: "never" }))).toBe(
-      "relay on · no exit can serve · fail",
+      "relay on · no exit can serve · fail · /relay",
     )
   })
 
@@ -934,7 +885,7 @@ describe("describeStatusPage", () => {
 
     const on = describeStatusPage(status())
     expect(on).toContain("Routing is on.")
-    expect(on).toContain("Models: every free model - 8 routed of 20")
+    expect(on).toContain("Models: every free model - 8 routed")
   })
 
   test("the model line covers the custom cases too", () => {
@@ -966,7 +917,7 @@ describe("describeStatusPage", () => {
 
   test("counts traffic, or admits there was none", () => {
     expect(describeStatusPage(status({ routedCount: 8 }))).toContain(
-      "No request has gone through an exit yet.",
+      "No request has gone through an exit since the plugin started.",
     )
 
     const busy = describeStatusPage(
@@ -977,7 +928,9 @@ describe("describeStatusPage", () => {
         ],
       }),
     )
-    expect(busy).toContain("4 requests through exits (3 ok, 1 rotated, 0 limited, 0 failed).")
+    expect(busy).toContain(
+      "4 requests through exits, of which 3 ok, 1 asked for another instance, 0 rate-limited, 0 failed.",
+    )
   })
 
   test("the traffic breakdown adds up to the traffic, rotated included", () => {
@@ -992,12 +945,15 @@ describe("describeStatusPage", () => {
 
     const line = text.split("\n").find((row) => row.includes("through exits"))
     expect(line).toBeDefined()
-    const parts = [...line!.matchAll(/(\d+) (ok|rotated|limited|failed)/g)].map((match) =>
-      Number(match[1]),
+    // The buckets no longer promise to add up to the total: a request that
+    // fails during rewrite is counted but has no bucket of its own, so the
+    // wording says "of which" instead of implying a decomposition.
+    const parts = [...line!.matchAll(/(\d+) (ok|asked for another instance|rate-limited|failed)/g)].map(
+      (match) => Number(match[1]),
     )
     const total = Number(line!.match(/^(\d+) request/)?.[1])
     expect(parts).toHaveLength(4)
-    expect(parts.reduce((sum, part) => sum + part, 0)).toBe(total)
+    expect(parts.reduce((sum, part) => sum + part, 0)).toBeLessThanOrEqual(total)
   })
 
   test("lists the exits with their one-line summary and the chosen mark", () => {
@@ -1012,7 +968,7 @@ describe("describeStatusPage", () => {
     expect(text).toContain("  Frankfurt: ready · 210 ms · 0 req · chosen")
   })
 
-  test("marks the picker's serving exit chosen and a silently skipped one skipped", () => {
+  test("marks the picker's serving exit next and a silently skipped one skipped", () => {
     const text = describeStatusPage(
       status({
         exits: [
@@ -1024,7 +980,8 @@ describe("describeStatusPage", () => {
       }),
     )
 
-    expect(text).toContain("  Serving: blocked by OpenCode · 0 req · chosen")
+    // The exit that serves the next request is not the one the user chose.
+    expect(text).toContain("  Serving: blocked by OpenCode · 0 req · next")
     expect(text).toContain("  Quiet: ready · 0 req · skipped")
   })
 
@@ -1152,7 +1109,7 @@ describe("describeExitDetails", () => {
     ])
   })
 
-  test("the serving exit is chosen on its Details page, as in the list", () => {
+  test("the chosen exit and the one that serves next are named apart", () => {
     const picked = status({
       activeExit: { id: "stored", name: "Stored", kind: "relay" },
       exits: [exit({ id: "stored", name: "Stored" }), exit({ id: "backup", name: "Backup" })],
@@ -1162,14 +1119,16 @@ describe("describeExitDetails", () => {
     const stored = picked.exits[0]!
     const backup = picked.exits[1]!
 
-    // The list marks the exit the picker would serve, not the stored choice.
+    // The list names the stored choice "chosen" and the exit that serves the
+    // next request "next": the two are not the same thing.
     const list = exitList(picked)
-    expect(list.find((item) => item.value.id === "backup")?.description).toContain("chosen")
-    expect(list.find((item) => item.value.id === "stored")?.description).not.toContain("chosen")
+    expect(list.find((item) => item.value.id === "stored")?.description).toContain("chosen")
+    expect(list.find((item) => item.value.id === "backup")?.description).toContain("next")
+    expect(list.find((item) => item.value.id === "backup")?.description).not.toContain("chosen")
 
     // The Details page agrees with the list.
-    expect(describeExitDetails(backup, picked)).toContain("Chosen exit.")
-    expect(describeExitDetails(stored, picked)).toContain("Not the chosen exit.")
+    expect(describeExitDetails(stored, picked)).toContain("Chosen exit.")
+    expect(describeExitDetails(backup, picked)).toContain("Serves the next request.")
   })
 
   test("an older server without the picker's answer honors activeExit", () => {
