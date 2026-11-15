@@ -9,7 +9,7 @@
 import { createMemo, createSignal, Show } from "solid-js"
 import { TextAttributes, type ColorInput } from "@opentui/core"
 import { pillTone, summarizePill, type PillTone } from "./present.ts"
-import { currentStatus } from "./state.ts"
+import { currentStatus, isReachable } from "./state.ts"
 
 /** The colors the pill needs, resolved from the theme by the entry point. */
 export interface PillColors {
@@ -37,9 +37,23 @@ function toneColor(tone: PillTone, colors: PillColors): ColorInput {
 
 /** The pill itself. */
 export function RelayPill(props: { readonly colors: PillColors; readonly onOpen: () => void }) {
-  const line = createMemo(() => summarizePill(currentStatus()))
-  const tone = createMemo(() => pillTone(currentStatus()))
+  const line = createMemo(() => summarizePill(currentStatus(), isReachable()))
+  const tone = createMemo(() => pillTone(currentStatus(), isReachable()))
   const [hover, setHover] = createSignal(false)
+  // A click is a press and a release on the pill itself. A drag that
+  // started in the prompt and ended over the pill is a selection, not a
+  // click, and opening the menu on it would be a surprise.
+  const [pressed, setPressed] = createSignal(false)
+  // Only the primary button opens the menu: a right-click's context menu and
+  // a middle-click's paste are the terminal's own, and opening the relay menu
+  // behind them would be a surprise.
+  const open = (event: { readonly button?: number }): void => {
+    const wasPressed = pressed()
+    setPressed(false)
+    if (event.button !== undefined && event.button !== 0) return
+    if (!wasPressed) return
+    props.onOpen()
+  }
   return (
     <Show when={line()}>
       {(text) => (
@@ -50,8 +64,18 @@ export function RelayPill(props: { readonly colors: PillColors; readonly onOpen:
             fg={toneColor(tone(), props.colors)}
             attributes={hover() ? TextAttributes.UNDERLINE : TextAttributes.NONE}
             onMouseOver={() => setHover(true)}
-            onMouseOut={() => setHover(false)}
-            onMouseUp={props.onOpen}
+            onMouseOut={() => {
+              setHover(false)
+              // A press that is released away from the pill is not a click,
+              // and the press must not stay armed: the next release over the
+              // pill would open the menu, which is the drag the comment above
+              // is about.
+              setPressed(false)
+            }}
+            onMouseDown={(event: { readonly button?: number }) => {
+              setPressed(event.button === undefined || event.button === 0)
+            }}
+            onMouseUp={open}
           >
             {text()}
           </text>
