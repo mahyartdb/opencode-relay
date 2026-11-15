@@ -306,13 +306,28 @@ describe("relayRequest", () => {
     )
   })
 
+  test("an exit-reported runtime is bounded and stripped before it is kept", () => {
+    const response = new Response("{}", {
+      status: 200,
+      headers: {
+        "x-relay-instance": "\u001b]0;evil\u0007title",
+        "x-relay-runtime": "x".repeat(100),
+        "x-relay-egress": "1.2.3.4",
+      },
+    })
+    const answer = readResponseState(response)
+    // The exit controls these headers, and they are drawn on the exit's page
+    // and persisted with the record: an escape sequence must not survive.
+    expect(answer.instance).not.toContain("\u001b")
+    expect(answer.runtime).toHaveLength(64)
+  })
+
   test("drops the hop-by-hop headers", () => {
     const original = new Request("https://opencode.ai/inference/openai/v1/chat/completions", {
       method: "POST",
       headers: {
         host: "opencode.ai",
-        "content-length": "2",
-        connection: "keep-alive",
+        "content-length": "2",        connection: "keep-alive",
         "keep-alive": "timeout=5",
         "transfer-encoding": "chunked",
         "proxy-authorization": "Basic abc",

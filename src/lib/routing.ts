@@ -11,6 +11,7 @@
 import {
   UPSTREAM_HOST,
   egressAddress,
+  exitReportedText,
   type ExitKind,
   type ExitStatus,
   type ModelInfo,
@@ -409,10 +410,12 @@ export interface ResponseState {
 export function readResponseState(response: Response): ResponseState {
   const rotate = response.status === 409 && response.headers.get("x-relay-rotate") === "1"
   // The address goes into the avoid list that every relay receives, so it
-  // only counts when it looks like an address.
+  // only counts when it looks like an address. The other two are drawn in
+  // the exit's page and persisted with the record: they are the exit's own
+  // report, so they are bounded and stripped before they are kept.
   const egress = egressAddress(response.headers.get("x-relay-egress") ?? undefined)
-  const instance = response.headers.get("x-relay-instance") ?? undefined
-  const runtime = response.headers.get("x-relay-runtime") ?? undefined
+  const instance = exitReportedText(response.headers.get("x-relay-instance") ?? undefined)
+  const runtime = exitReportedText(response.headers.get("x-relay-runtime") ?? undefined)
   const reachedExit = instance !== undefined || runtime !== undefined || egress !== undefined
   return {
     rotate,

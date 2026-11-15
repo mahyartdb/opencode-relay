@@ -623,6 +623,12 @@ describe("summarizePill", () => {
     // than staying quiet about a plugin that cannot work.
     expect(summarizePill(undefined, false)).toBe("relay · server not answering")
     expect(pillTone(undefined, false)).toBe("bad")
+
+    // With a snapshot, the menu can still open on the last known state, so
+    // the suffix carries.
+    expect(summarizePill(status({ enabled: false }), false)).toBe(
+      "relay · server not answering · /relay",
+    )
   })
 
   test("always says off once the plugin exists, exits or not", () => {

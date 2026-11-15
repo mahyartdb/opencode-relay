@@ -45,6 +45,22 @@ export function egressAddress(value: string | undefined): string | undefined {
   return trimmed
 }
 
+/**
+ * Text an exit reports about itself, safe to keep and to draw.
+ *
+ * The exit is the hostile party here: it controls the headers it answers
+ * with and the body of its errors, and the text drawn in the terminal must
+ * not be able to move the cursor or start an escape sequence. Control
+ * characters are stripped and the length is bounded, so the worst a hostile
+ * exit can put in its own page is a long sentence of visible text.
+ */
+export function exitReportedText(value: string | undefined, max = 64): string | undefined {
+  if (value === undefined) return undefined
+  const stripped = value.replace(/[\u0000-\u001f\u007f-\u009f\u001b]/g, "").trim()
+  if (stripped.length === 0) return undefined
+  return stripped.slice(0, max)
+}
+
 /** Where an exit says which address it is seen from. */
 export const UPSTREAM_TRACE = "https://opencode.ai/cdn-cgi/trace"
 

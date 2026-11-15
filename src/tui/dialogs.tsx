@@ -36,7 +36,7 @@ import {
   type ExitListAction,
   type MenuAction,
 } from "./present.ts"
-import { currentStatus, markReachable, publishStatus, type RelayModel, type RelayStatus } from "./state.ts"
+import { currentStatus, isReachable, markReachable, publishStatus, type RelayModel, type RelayStatus } from "./state.ts"
 
 /** The typed client for the relay contract, so both ends speak the same shapes. */
 export function relayClient(context: Context) {
@@ -183,7 +183,13 @@ export async function refreshStatus(
   const quiet = options.quiet === true && !refreshLoud
   const run = (async (): Promise<Refresh> => {
     try {
-      const status = await withDeadline((signal) => client.status({ signal }), STATUS_TIMEOUT_MS)
+      const status = await withDeadline(
+        // The signal is the second argument, the request options: passing it
+        // as input would quietly build an empty request, and the deadline
+        // would reject the caller without ever cancelling the call.
+        (signal) => client.status({}, { signal }),
+        STATUS_TIMEOUT_MS,
+      )
       // An answer that arrives after the plugin was deactivated must not
       // repaint the footer of the plugin that replaced it.
       if (generation === refreshGeneration) {
@@ -440,6 +446,11 @@ export async function openRelayMenu(context: Context, client: RelayClient): Prom
       // a click must always open something, even when the server is slow to
       // answer.
       const known = currentStatus()
+      // Whether the server answered the last time it was asked decides how
+      // every screen here is titled: a menu drawn from a snapshot the dead
+      // server left must not present it as current.
+      const stale = !isReachable()
+      const staleNote = " · last known state"
       if (known === undefined) {
         const refreshed = await refreshStatus(context, client)
         const status = refreshed.ok ? refreshed.status : currentStatus()
@@ -449,7 +460,7 @@ export async function openRelayMenu(context: Context, client: RelayClient): Prom
         }
         if (!refreshed.ok) reportRefresh(refreshed)
         const first = await context.ui.dialog.select<MenuAction>({
-          title: "Relay",
+          title: `Relay${stale ? staleNote : ""}`,
           options: menuOptions(status),
         })
         if (first === undefined || first === "close") return
@@ -460,7 +471,7 @@ export async function openRelayMenu(context: Context, client: RelayClient): Prom
         if (!refreshed.ok) reportRefresh(refreshed)
       })
       const choice = await context.ui.dialog.select<MenuAction>({
-        title: "Relay",
+        title: `Relay${stale ? staleNote : ""}`,
         options: menuOptions(known),
       })
       if (choice === undefined || choice === "close") return
@@ -551,7 +562,7 @@ async function openSettings(
       { title: "Back", value: "back" },
     ]
     const choice = await context.ui.dialog.select<SettingsAction>({
-      title: `Settings · ${describeSettings(status)}`,
+      title: `Settings${refreshed.ok ? "" : " · last known state"} · ${describeSettings(status)}`,
       options,
     })
     if (choice === undefined || choice === "back") return
@@ -757,7 +768,7 @@ async function chooseModels(
   // blocked network: the call has a deadline, and the work is shown while it
   // runs, so the menu never appears to have done nothing.
   const result = await withWorking(context, "Reading the model list", () =>
-    callRpc(context, "Relay", () => withDeadline((signal) => client.models({ signal }), STATUS_TIMEOUT_MS)),
+    callRpc(context, "Relay", () => withDeadline((signal) => client.models({}, { signal }), STATUS_TIMEOUT_MS)),
   )
   if (!result) return
   const models = result.models
@@ -784,7 +795,7 @@ async function chooseModels(
     const paid = models.length - free.length
     const current: "free" | "pick" = status.selection === "free" ? "free" : "pick"
     const choice = await context.ui.dialog.select<"free" | "pick" | "back">({
-      title: "Models",
+      title: `Models${refreshed.ok ? "" : " · last known state"}`,
       options: [
         {
           title: "Route every free model",
@@ -1119,7 +1130,7 @@ async function manageExits(
             deployed: active.kind === "relay" && isDeployedExit(active, status),
           }
     const choice = await context.ui.dialog.select<ExitListAction>({
-      title: "Exits",
+      title: `Exits${refreshed.ok ? "" : " · last known state"}`,
       options: exitsMenuOptions(status),
       ...(current !== undefined ? { current } : {}),
       actions: [testAction(context, client), updateAction(context, client)],
@@ -1243,7 +1254,9 @@ async function exitDetail(
     const choice = await context.ui.dialog.select<DetailAction>({
       // The server's own label knows about the reset time; the fallback only
       // fills the gap when the record did not say.
-      title: `${exit.name} - ${(exit.statusLabel ?? "").length > 0 ? exit.statusLabel : statusLabel(exit.status)}`,
+      title: `${exit.name}${refreshed.ok ? "" : " · last known state"} - ${
+        (exit.statusLabel ?? "").length > 0 ? exit.statusLabel : statusLabel(exit.status)
+      }`,
       options,
     })
     if (choice === undefined || choice === "back") return

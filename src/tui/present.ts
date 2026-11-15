@@ -157,9 +157,13 @@ function exitStatusWord(exit: ExitSummaryLike): string {
  * a blocked exit whose rest has expired serves again, and an untested one does
  * not serve at all. A status from an older server carries neither, so the old
  * status-based predicate is the best available fallback there.
+ *
+ * Routing off means no exit is used, whatever the picker would say: the server
+ * still computes the pick, but no request ever leaves through one.
  */
 export function isUsableExit(exit: ExitSummaryLike, status: StatusLike): boolean {
   if (!exit.enabled) return false
+  if (!status.enabled) return false
   // The picker names the one exit that would serve; every other exit, however
   // healthy its record looks, would not carry the next request.
   if (status.servingExitId !== undefined) return status.servingExitId === exit.id
@@ -207,6 +211,8 @@ function routingName(status: StatusLike): string {
 
 /** The exit the status says routing would use, when it can say. */
 function pickerChoice(status: StatusLike): string | undefined {
+  // Routing off means no exit serves, whatever the picker would compute.
+  if (!status.enabled) return undefined
   if (status.servingExitId !== undefined) return status.servingExitId
   // A new server with no serving exit is saying that nothing serves, so a
   // chosen exit that cannot serve must not be marked as if it would.
@@ -685,9 +691,11 @@ export function describeExitDetails(exit: ExitSummaryLike, status: StatusLike): 
   )
   // Whether the exit is in use is what the picker says, not what the switch
   // says: an enabled exit whose allowance is gone, or that is cooling, is
-  // enabled and not in use.
+  // enabled and not in use. With nothing routed, no exit is in use either,
+  // whatever the picker would compute for a request that cannot happen.
   if (!exit.enabled) lines.push("Paused: kept, but not used.")
-  else if (status.enabled && isUsableExit(exit, status)) lines.push("In use.")
+  else if (status.enabled && status.routedCount > 0 && pickerChoice(status) === exit.id)
+    lines.push("In use.")
   else lines.push("Not in use right now.")
   // The countdown is only its own line when the status word does not already
   // carry it: the server derives "used up until <time>" as the label, and
@@ -782,10 +790,12 @@ export function summarizePill(status: StatusLike | undefined, reachable = true):
   // The server did not answer, and there is no state to show: the plugin
   // cannot route anything, so the pill says so rather than staying silent.
   // The wording says the server, because "not answering" is what an exit
-  // that stopped answering is called too. The menu cannot open without a
-  // state, so the suffix is left off: it would promise a command that
-  // cannot do anything yet.
-  if (!reachable) return "relay · server not answering"
+  // that stopped answering is called too. With a snapshot the menu can still
+  // open on the last known state, so the suffix carries; without one, it
+  // would promise a command that cannot do anything yet.
+  if (!reachable) {
+    return status !== undefined ? "relay · server not answering · /relay" : "relay · server not answering"
+  }
   if (!status) return undefined
   // A background test is the most current fact, so it comes first: it keeps
   // showing while routing is off and before the first exit exists. The

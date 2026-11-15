@@ -1116,7 +1116,10 @@ export class RelayState {
 
   /** Why an address was marked as spent, when the provider said. */
   noteSpendReason(egress: string, body: string): void {
-    this.spendReasons.set(egress, this.scrub(body.replace(/\s+/g, " ").slice(0, 200)))
+    // The body came back through the exit, which controls it: it is drawn on
+    // the exit's page, so an escape sequence in it must not survive.
+    const cleaned = body.replace(/[\u0000-\u001f\u007f-\u009f\u001b]/g, " ")
+    this.spendReasons.set(egress, this.scrub(cleaned.replace(/\s+/g, " ").slice(0, 200)))
     while (this.spendReasons.size > 64) {
       const first = this.spendReasons.keys().next().value
       if (first === undefined) break
