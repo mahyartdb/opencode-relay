@@ -462,13 +462,19 @@ export function exitsMenuOptions(status: StatusLike): DialogSelectOption<ExitLis
       value: { kind: "test-all" },
       description: `${count} exit${count === 1 ? "" : "s"} - checks OpenCode through each`,
     })
-    options.push({
-      title: "Deep test all exits",
-      value: { kind: "test-all-deep" },
-      // The scan sends the session token to every exit that is not paused:
-      // "in use" would name a narrower set than the one it touches.
-      description: "Real request through each unpaused exit",
-    })
+    // The deep test sends the session token to every exit that is not
+    // paused, so it is offered only when there is one to send it to: a
+    // row that always ends in "nothing to send it through" would spend the
+    // user's confirmation on a no-op.
+    if (status.exits.some((exit) => exit.enabled)) {
+      options.push({
+        title: "Deep test all exits",
+        value: { kind: "test-all-deep" },
+        // The scan sends the session token to every exit that is not paused:
+        // "in use" would name a narrower set than the one it touches.
+        description: "Real request through each unpaused exit",
+      })
+    }
   }
   // Only relays that can still be redeployed are offered: a relay whose
   // Vercel account is gone cannot be updated, so offering the row would

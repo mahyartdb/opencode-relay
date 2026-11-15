@@ -452,6 +452,9 @@ export async function openRelayMenu(context: Context, client: RelayClient): Prom
       const stale = !isReachable()
       const staleNote = " · last known state"
       if (known === undefined) {
+        // This branch fetches before it draws, so the note comes from what
+        // the fetch did: a refresh that succeeded has produced a current
+        // snapshot, and calling it stale would be the wrong label.
         const refreshed = await refreshStatus(context, client)
         const status = refreshed.ok ? refreshed.status : currentStatus()
         if (!status) {
@@ -460,7 +463,7 @@ export async function openRelayMenu(context: Context, client: RelayClient): Prom
         }
         if (!refreshed.ok) reportRefresh(refreshed)
         const first = await context.ui.dialog.select<MenuAction>({
-          title: `Relay${stale ? staleNote : ""}`,
+          title: `Relay${refreshed.ok ? "" : staleNote}`,
           options: menuOptions(status),
         })
         if (first === undefined || first === "close") return

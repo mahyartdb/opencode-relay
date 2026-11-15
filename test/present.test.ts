@@ -356,6 +356,24 @@ describe("exitsMenuOptions", () => {
     expect(orphaned.some((option) => option.value.kind === "update-all")).toBe(false)
   })
 
+  test("deep test needs an unpaused exit to send the token to", () => {
+    // The deep test sends the session token to every exit that is not
+    // paused, so it is offered only when there is one: a row that always
+    // ends in "nothing to send it through" would spend the confirmation on
+    // a no-op.
+    const allPaused = exitsMenuOptions(
+      status({ exits: [exit({ id: "fra", enabled: false }), exit({ id: "p1", kind: "proxy", enabled: false })] }),
+    )
+    expect(allPaused.some((option) => option.value.kind === "test-all-deep")).toBe(false)
+    // The api check really does test paused exits too, so it stays.
+    expect(allPaused.some((option) => option.value.kind === "test-all")).toBe(true)
+
+    const oneLive = exitsMenuOptions(
+      status({ exits: [exit({ id: "fra", enabled: false }), exit({ id: "p1", kind: "proxy" })] }),
+    )
+    expect(oneLive.some((option) => option.value.kind === "test-all-deep")).toBe(true)
+  })
+
   test("restore only when an exit is used up, and says how many", () => {
     const one = exitsMenuOptions(status({ exits: [exit({ id: "a" }), exit({ id: "spent" })], exhausted: ["spent"] }))
     const none = exitsMenuOptions(status({ exits: [exit({ id: "a" })] }))
