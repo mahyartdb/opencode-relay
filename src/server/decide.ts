@@ -181,8 +181,12 @@ export async function decideModel(
         }
       }
     }
+    // No exit without the bridge can serve either: the answer reports every
+    // proxy with the bridge reason, so the two preview shapes agree about
+    // why each exit was left out.
     return {
       ...withModel,
+      skipped: [...withoutProxies.skipped],
       kind: "bridge",
       routed: false,
       reason: `The local proxy bridge is not running, so ${pick.exit.name} cannot carry the request.`,

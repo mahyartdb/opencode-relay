@@ -884,6 +884,50 @@ describe("the response and retry hooks on a 409", () => {
     expect(state.settings().activeExitId).toBe("relay-b")
   })
 
+  test("bring used-up exits back forgives their addresses", async () => {
+    const { state, hooks } = await makeHooks()
+    await state.addRelay(relay("relay-1"))
+    await state.setHealth("relay-1", { status: "ready" })
+    state.noteRelayed("session-restore", "iceman-free", "relay-1")
+
+    // The exit is used up, and its address is remembered as spent: a restore
+    // that left the address alone would be refused again at once by the
+    // relay's own avoid echo.
+    const until = Date.now() + 60 * 60_000
+    await state.setHealth("relay-1", { status: "exhausted", exhaustedUntil: until })
+    state.markSpent("203.0.113.20", until)
+    state.noteEgress("relay-1", "203.0.113.20")
+
+    const { restored } = await state.restoreExhausted(() => true)
+
+    expect(restored).toEqual(["relay-1"])
+    expect(state.exit("relay-1")?.status).toBe("reachable")
+    // The address is forgiven: it is no longer in the avoid list, so the
+    // relay's own echo cannot retire the exit again at once.
+    expect(state.isSpent("203.0.113.20")).toBe(false)
+  })
+
+  test("bring used-up exits back leaves a live window alone when not forgiven", async () => {
+    const { state } = await makeHooks()
+    await state.addRelay(relay("relay-1"))
+    await state.setHealth("relay-1", { status: "ready" })
+
+    const until = Date.now() + 60 * 60_000
+    await state.setHealth("relay-1", { status: "exhausted", exhaustedUntil: until })
+    state.noteEgress("relay-1", "203.0.113.21")
+    state.markSpent("203.0.113.21", until)
+
+    // Without the forgiveness decision, a restore cannot make the exit
+    // serve: the provider's window is live, and the exit would be refused
+    // again on its first request.
+    const { restored, stillUsedUp } = await state.restoreExhausted()
+
+    expect(restored).toEqual([])
+    expect(stillUsedUp).toEqual(["relay-1"])
+    expect(state.exit("relay-1")?.status).toBe("exhausted")
+    expect(state.isSpent("203.0.113.21")).toBe(true)
+  })
+
   test("a rotate 409 with a spent address retires the exit, and asks for another attempt", async () => {
     const { state, hooks } = await makeHooks()
     await state.addRelay(relay("relay-1"))

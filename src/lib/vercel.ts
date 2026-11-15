@@ -353,6 +353,32 @@ export async function deleteVercelProject(account: VercelAccount, project: strin
   await expectOk(res, "Failed to delete Vercel project", account.token)
 }
 
+/**
+ * Ask a relay to end its instance, so the next request starts a new one.
+ *
+ * The relay answers the recycle control and then leaves: its next request
+ * runs on a fresh instance, with a fresh address. This is the only way a
+ * relay whose address is known to be used up can serve again before the
+ * provider's window ends.
+ */
+export async function recycleRelay(url: string, access: string): Promise<boolean> {
+  if (!isSafeRelayUrl(url)) return false
+  try {
+    const res = await fetch(url, {
+      method: "GET",
+      headers: {
+        "x-relay-key": access,
+        "x-relay-control": "recycle",
+      },
+      redirect: "manual",
+      signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
+    })
+    return res.ok
+  } catch {
+    return false
+  }
+}
+
 export async function probeRelay(url: string, access: string): Promise<RelayProbe> {
   const started = performance.now()
   const elapsed = () => Math.max(0, Math.round(performance.now() - started))

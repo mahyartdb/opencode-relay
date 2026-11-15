@@ -1086,6 +1086,11 @@ export class RelayState {
    * a mixture of the old settings and the new ones.
    */
   async applySettings(update: Partial<Settings>): Promise<void> {
+    // The rotation moves with the strategy, and goes back when the write
+    // does not land, exactly as setStrategy's does.
+    const previousStart = this.rotationStartId
+    const previousServed = this.lastServedId
+    const previousCursor = this.cursor
     if (update.strategy !== undefined) {
       // Round robin starts at the exit the user chose, so switching to it does
       // not silently move the first request somewhere else.
@@ -1095,7 +1100,14 @@ export class RelayState {
     }
     // The stored position goes with the strategy: a restart would otherwise
     // resume the rotation where it was.
-    await this.writeRules(() => ({ ...this.rules, ...update, rotationId: undefined }))
+    try {
+      await this.writeRules(() => ({ ...this.rules, ...update, rotationId: undefined }))
+    } catch (error) {
+      this.rotationStartId = previousStart
+      this.lastServedId = previousServed
+      this.cursor = previousCursor
+      throw error
+    }
   }
 
   /**
@@ -1643,13 +1655,41 @@ export class RelayState {
    * about the address, not about the relay, and a relay that comes back can
    * still be asked to recycle to another one.
    */
-  async restoreExhausted(): Promise<string[]> {
+  /**
+   * Bring the used-up exits back into use now, and say what could not be.
+   *
+   * The addresses that were marked as spent are left alone by default: they
+   * are a fact about the address, not about the relay, and a relay that
+   * comes back to a spent address is refused again at once. `recycle` names
+   * the addresses the caller has decided to forgive — an explicit restore is
+   * that decision — and those are cleared, so the relay can be asked to move
+   * to a fresh one.
+   *
+   * Returns the exits that were restored and, separately, the ones left out
+   * because the window the provider gave is still live and the caller chose
+   * not to forgive them.
+   */
+  async restoreExhausted(recycle?: (egress: string) => boolean): Promise<{
+    readonly restored: readonly string[]
+    readonly stillUsedUp: readonly string[]
+  }> {
     const restored: string[] = []
+    const stillUsedUp: string[] = []
     const restoredRelays = new Set<string>()
     const restoredProxies = new Set<string>()
-    this.relayList = this.relayList.map((relay) => {      if (relay.status !== "exhausted") return relay
+    const forgive = (egress: string | undefined): boolean =>
+      egress !== undefined && recycle !== undefined && recycle(egress)
+    this.relayList = this.relayList.map((relay) => {
+      if (relay.status !== "exhausted") return relay
+      // An exit that leaves from an address whose window is still live goes
+      // back to the same refusal unless its address is forgiven here.
+      if (!forgive(relay.egress) && (relay.exhaustedUntil ?? 0) > Date.now()) {
+        stillUsedUp.push(relay.id)
+        return relay
+      }
       restored.push(relay.id)
       restoredRelays.add(relay.id)
+      if (relay.egress !== undefined && forgive(relay.egress)) this.spent.delete(relay.egress)
       this.cooling.delete(relay.id)
       // A restore is live evidence too: a check that began before it must
       // not re-mark the exit used up with an answer of its own.
@@ -1659,15 +1699,20 @@ export class RelayState {
     })
     this.proxyList = this.proxyList.map((proxy) => {
       if (proxy.status !== "exhausted") return proxy
+      if (!forgive(proxy.egress) && (proxy.exhaustedUntil ?? 0) > Date.now()) {
+        stillUsedUp.push(proxy.id)
+        return proxy
+      }
       restored.push(proxy.id)
       restoredProxies.add(proxy.id)
+      if (proxy.egress !== undefined && forgive(proxy.egress)) this.spent.delete(proxy.egress)
       this.cooling.delete(proxy.id)
       this.bumpHealthEpoch(proxy.id)
       const { exhaustedUntil: _until, coolingUntil: _cooling, failures: _failures, ...rest } = proxy
       return { ...rest, status: "reachable" as Status }
     })
     this.cursor = 0
-    if (restored.length === 0) return restored
+    if (restored.length === 0) return { restored, stillUsedUp }
     try {
       await this.enqueueWrite(RELAYS_KEY, () => writeRelays(this.storage, this.relayList))
     } catch (error) {
@@ -1692,7 +1737,7 @@ export class RelayState {
         `${error instanceof Error ? error.message : String(error)} The relays were brought back.`,
       )
     }
-    return restored
+    return { restored, stillUsedUp }
   }
 
   /** Remember an address whose free allowance is gone, so exits avoid it. */

@@ -38,6 +38,7 @@ import {
   deployRelay as deployToVercel,
   inspectVercel,
   probeRelay,
+  recycleRelay,
   VercelError,
 } from "../lib/vercel.ts"
 import { projectName, relaySource } from "../lib/relay-source.ts"
@@ -1158,9 +1159,22 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
 
     /** Bring the exits whose allowance is gone back into use. */
     resetExhausted: async () => {
-      const restored = await state.restoreExhausted()
+      // An explicit restore forgives the addresses the exits leave from: the
+      // provider's window may still be live, but the user has decided to try
+      // again now, and a relay can be asked to move to a fresh instance.
+      const result = await state.restoreExhausted((egress) => {
+        state.markSpent(egress, 0)
+        return true
+      })
+      // A relay whose address is forgiven is asked to recycle, so it lands on
+      // a fresh one instead of the spent one it was leaving from.
+      for (const id of result.restored) {
+        const relay = state.relay(id)
+        if (relay === undefined) continue
+        void recycleRelay(relay.url, relay.access)
+      }
       announceChanged(announce, "exhausted exits restored")
-      return { restored }
+      return { restored: [...result.restored], stillUsedUp: [...result.stillUsedUp] }
     },
 
     /** Show where the next request would go, without sending or advancing anything. */

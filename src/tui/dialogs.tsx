@@ -729,14 +729,26 @@ async function restoreExhausted(context: Context, client: RelayClient): Promise<
   const result = await callRpc(context, "Relay", () => client.resetExhausted({}))
   if (!result) return
   const restored = result.restored.length
+  const left = (result.stillUsedUp ?? []).length
+  const parts: string[] = []
+  if (restored > 0) {
+    parts.push(
+      `${restored} exit${restored === 1 ? " is" : "s are"} back in use, and a relay is asked to move to a fresh address.`,
+    )
+  }
+  if (left > 0) {
+    // The user asked for these to come back and they did not: saying so is
+    // the difference between an answer and a silent refusal.
+    parts.push(
+      `${left} exit${left === 1 ? " is" : "s are"} still out of use: the provider's reset window is live, so there is nothing to come back from yet.`,
+    )
+  }
   context.ui.toast.show({
     title: "Relay",
-    message:
-      restored === 0
-        ? "No exit was out of use."
-        : `${restored} exit${restored === 1 ? " is" : "s are"} back in use.`,
+    message: parts.length > 0 ? parts.join(" ") : "No exit was out of use.",
     // Nothing happened is not a success: the reader must not read it as one.
-    variant: restored === 0 ? "info" : "success",
+    variant: restored > 0 ? "success" : "info",
+    duration: parts.length > 1 ? 9000 : 7000,
   })
   // The Exits list refreshes as soon as this returns, so a refresh here would
   // only ask the server the same question twice.

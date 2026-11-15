@@ -559,7 +559,14 @@ export const Relay = Rpc.define({
     resetExhausted: {
       input: Schema.toStandardSchemaV1(Schema.Struct({})),
       output: Schema.toStandardSchemaV1(
-        Schema.Struct({ restored: Schema.Array(Schema.String) }),
+        Schema.Struct({
+          restored: Schema.Array(Schema.String),
+          /**
+           * Exits left out because the provider's window is still live, even
+           * though the user asked to bring them back.
+           */
+          stillUsedUp: Schema.Array(Schema.String),
+        }),
       ),
       errors: {
         storage_failed: StorageFailed,
