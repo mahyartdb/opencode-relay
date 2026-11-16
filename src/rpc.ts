@@ -153,6 +153,14 @@ const Status = Schema.Struct({
   routedCount: Schema.Number,
   /** How many OpenCode models are known, free or not. */
   modelCount: Schema.Number,
+  /**
+   * Whether a routed request has been captured in the last 30 minutes.
+   *
+   * The deep test replays the captured headers, and the session token is
+   * among them: without a capture there is nothing to send, and the check
+   * would be refused on credentials that were never carried.
+   */
+  hasRequestSample: Schema.optional(Schema.Boolean),
 })
 
 /** What a routing preview says, without sending or advancing anything. */
@@ -184,6 +192,14 @@ const DeployedRelay = Schema.Struct({
   region: Schema.String,
   regionLabel: Schema.String,
   reachable: Schema.Boolean,
+  /**
+   * The HTTP status the relay answered with, or 0 when it did not answer.
+   *
+   * A relay that answers with a status has a problem of its own - a wrong
+   * access token, most of all - and telling the user that it did not answer
+   * sends them looking in the wrong place.
+   */
+  status: Schema.optional(Schema.Number),
 })
 
 export const Relay = Rpc.define({
@@ -351,7 +367,16 @@ export const Relay = Rpc.define({
     updateRelay: {
       input: Schema.toStandardSchemaV1(Schema.Struct({ id: Schema.String })),
       output: Schema.toStandardSchemaV1(
-        Schema.Struct({ id: Schema.String, reachable: Schema.Boolean }),
+        Schema.Struct({
+          id: Schema.String,
+          reachable: Schema.Boolean,
+          /**
+           * The HTTP status the relay answered with, or 0 when it did not
+           * answer. A relay that answers with a status has a problem of its
+           * own, and the user has to be told which.
+           */
+          status: Schema.optional(Schema.Number),
+        }),
       ),
       errors: {
         update_failed: Schema.toStandardSchemaV1(
@@ -517,6 +542,13 @@ export const Relay = Rpc.define({
           customModels: Schema.Array(Schema.String),
           /** Ids that were left out because they are not free. */
           dropped: Schema.Array(Schema.String),
+          /**
+           * Whether the chosen ids were checked against the price list.
+           *
+           * The list could not be read, so the ids are kept unverified: the
+           * answer says so, and the caller does not call them free.
+           */
+          verified: Schema.optional(Schema.Boolean),
         }),
       ),
       errors: {
@@ -566,6 +598,11 @@ export const Relay = Rpc.define({
            * though the user asked to bring them back.
            */
           stillUsedUp: Schema.Array(Schema.String),
+          /**
+           * Why the restore stopped partway, when it did. The exits that were
+           * restored are in force either way, so the answer carries both.
+           */
+          error: Schema.optional(Schema.String),
         }),
       ),
       errors: {

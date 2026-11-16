@@ -232,12 +232,13 @@ dressed up as traffic:
 - routing off: `relay off · /relay`, or `relay off · testing 3/8 · /relay`
   while a background check runs
 - routing on with no exits: `relay on · no exits · /relay`
-- while a background check runs: `relay on · testing 3/8`
-- a custom selection with nothing free to route: `relay on · nothing routed`
-- no usable exit: `relay on · no exit can serve · direct` or `· fail`
+- while a background check runs: `relay on · testing 3/8 · <the worst state>`
+- a custom selection with nothing free to route: `relay on · nothing routed · /relay`
+- no usable exit: `relay on · no exit can serve · direct · /relay` or `· fail · /relay`
 - healthy: `relay · Frankfurt · 3 req`, `relay · round robin · 0 req`, with
-  `· N used up` appended when exits are used up. Healthy states carry no
-  `/relay` suffix.
+  `· N used up` and `· N failing` appended when exits are used up or failing.
+  Every state that is not healthy carries the `/relay` suffix, and so does a
+  healthy-looking line with a used-up or failing exit on it.
 
 The color follows the same state: muted when off, blue while testing, amber
 when there is something to look at, red when requests would fail, and the

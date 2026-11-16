@@ -8,6 +8,8 @@
 import { Plugin } from "@opencode/plugin/tui"
 import type { ColorInput } from "@opentui/core"
 import {
+  beginActivation,
+  endActivation,
   openRelayMenu,
   refreshErrorToaster,
   refreshStatus,
@@ -74,9 +76,25 @@ export default Plugin.define({
   id: "opencode-relay-tui",
   setup(context) {
     const client = relayClient(context)
+    // The token that names this activation. The menu keeps it, so a reload
+    // in the middle of a menu flow stops that flow from drawing over the
+    // plugin that replaced it.
+    const token = beginActivation()
+
+    /**
+     * Whether this activation is still the one on screen.
+     *
+     * A refresh that was already in flight when the plugin was deactivated
+     * must not toast for a plugin that is gone.
+     */
+    let alive = true
 
     const openMenu = () => {
-      void openRelayMenu(context, client).catch((error: unknown) => {
+      // A pill click queued before the plugin was replaced must not open a
+      // menu under the plugin that took its place.
+      if (!alive) return
+      void openRelayMenu(context, client, token).catch((error: unknown) => {
+        if (!alive) return
         reportError(context, "Relay", error)
       })
     }
@@ -105,23 +123,6 @@ export default Plugin.define({
         },
       ],
     }))
-
-    /**
-     * A refresh that failed is a fact the user needs, once.
-     *
-     * The event path has no dialog to show a toast in, so without this a
-     * dead server would leave the pill frozen on a healthy-looking line and
-     * the user with no idea why nothing routes. The memory is shared with
-     * the menu's own toaster: the same dead server is reported once,
-     * whoever saw it first.
-     */
-    /**
-     * Whether this activation is still the one on screen.
-     *
-     * A refresh that was already in flight when the plugin was deactivated
-     * must not toast for a plugin that is gone.
-     */
-    let alive = true
 
     const reportRefresh = refreshErrorToaster(context)
 
@@ -174,10 +175,15 @@ export default Plugin.define({
     // plugin that is merely starting would be a wrong word.
     const firstPaint = async (): Promise<void> => {
       for (const wait of [250, 500, 1000, 2000, 4000]) {
+        // A dead activation must not keep asking: the retries stop the
+        // moment the plugin is gone, so a reload cannot leave a minute of
+        // background calls running against the replacement.
+        if (!alive) return
         const result = await refreshStatus(context, client, { quiet: true })
         if (result.ok) return
         await new Promise((resolve) => setTimeout(resolve, wait))
       }
+      if (!alive) return
       // The server is still not there: the pill says so, and the heartbeat
       // keeps asking, so the pill recovers by itself.
       await refreshStatus(context, client)
@@ -198,8 +204,12 @@ export default Plugin.define({
       // plugin that is reloaded with its menu open would otherwise stay
       // locked out of its own menu. The refresh latch lives in the same kind
       // of module, and a new activation must not join the old promise.
-      releaseRelayMenu()
+      releaseRelayMenu(token)
       resetRefresh()
+      // The activation is over, so anything it started stops drawing: a menu
+      // that is still running must not toast into, or close, the dialogs of
+      // the plugin that replaced it.
+      endActivation(token)
     }
   },
 })

@@ -341,6 +341,22 @@ function proxyAuthorization(lines: readonly string[]): string | undefined {
   return undefined
 }
 
+/**
+ * Whether the given secret is the bridge's own, in constant time.
+ *
+ * The bridge listens on loopback, but an unprivileged local process can
+ * still try to guess the secret, so a comparison that returns at the first
+ * differing byte would leak how much of it they had right.
+ */
+function sameSecret(given: string | null | undefined, required: string): boolean {
+  if (given === null || given === undefined || given.length !== required.length) return false
+  let diff = 0
+  for (let index = 0; index < required.length; index++) {
+    diff |= given.charCodeAt(index) ^ required.charCodeAt(index)
+  }
+  return diff === 0
+}
+
 /** Handle one HTTP-proxy connection: CONNECT or an absolute-form request. */
 function handle(client: net.Socket, up: SocksUpstream, auth: string): void {
   client.setNoDelay(true)
@@ -386,7 +402,10 @@ function handle(client: net.Socket, up: SocksUpstream, auth: string): void {
     // The bridge is a local proxy that carries the user's SOCKS credentials,
     // so only a client that knows the bridge's own secret may use it. Without
     // this, any process on this machine could spend the user's proxy.
-    if (proxyAuthorization(lines) !== auth) {
+    // The secret is compared in constant time, like every other secret in
+    // this plugin: the bridge listens on loopback, but an unprivileged local
+    // process can still try to guess it.
+    if (!sameSecret(proxyAuthorization(lines), auth)) {
       refuse("407 Proxy Authentication Required")
       return
     }

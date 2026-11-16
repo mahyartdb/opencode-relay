@@ -393,6 +393,7 @@ async function deployOne(options: {
     region: relay.region,
     regionLabel: regionLabel(relay.region),
     reachable: probe.reachable,
+    status: probe.status,
   }
 }
 
@@ -536,6 +537,7 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
         }),
         routedCount: routed,
         modelCount: list.length,
+        hasRequestSample: state.hasRequestSample(),
       }
     },
 
@@ -655,6 +657,7 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
       // same, and the exits list would be a list of twins. The region makes
       // each entry readable; a single-region deploy keeps the plain label.
       const shared = input.name !== undefined && input.regions.length > 1
+      const baseName = input.name !== undefined ? safeName(input.name) : undefined
       for (const region of input.regions) {
         try {
           deployed.push(
@@ -662,7 +665,7 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
               state,
               account,
               region,
-              name: shared ? `${input.name} (${regionLabel(region)})` : input.name,
+              name: shared && baseName !== undefined ? `${baseName} (${regionLabel(region)})` : baseName,
               runtime: input.runtime,
             }),
           )
@@ -747,6 +750,7 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
         region: relay.region,
         regionLabel: regionLabel(relay.region),
         reachable: probe.reachable,
+        status: probe.status,
       }
     },
 
@@ -850,7 +854,7 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
       const probe = await probeRelay(relay.url, relay.access)
       await recordProbe(state, relay.id, probe, checkedAt, healthEpoch)
       announceChanged(announce, "relay updated")
-      return { id: relay.id, reachable: probe.reachable }
+      return { id: relay.id, reachable: probe.reachable, status: probe.status }
     },
 
     /** Redeploy every relay this plugin deployed, with the current code. */
@@ -917,6 +921,9 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
 
     /** Test one exit: an OpenCode request, or a tiny real model request. */
     testExit: async (input) => {
+      // The user asked for this exit by name, so an imported one is now
+      // theirs: it may enter service.
+      await state.markTested(input.id)
       const result = await tester.test(input.id, input.deep ? "deep" : "api")
       announceChanged(announce, "exit tested")
       return {
@@ -971,18 +978,31 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
         })
       }
       const changed = await state.setExitEnabled(input.id, input.enabled)
-      if (changed) await announce(input.enabled ? "exit resumed" : "exit paused")
+      if (changed) announceChanged(announce, input.enabled ? "exit resumed" : "exit paused")
       // The answer says what the exit actually is now, not what was asked
       // for: an exit that was already paused stays paused, and saying
-      // otherwise would be a small lie the next list would contradict.
-      return { id: input.id, enabled: changed ? input.enabled : current.enabled }
+      // otherwise would be a small lie the next list would contradict. It is
+      // read from the state rather than from what was asked, so a change that
+      // did not land is never reported as one that did.
+      const live = state.exit(input.id)
+      return { id: input.id, enabled: live?.enabled ?? current.enabled }
     },
 
     /** Bring every paused exit back into use. */
     resumeAllExits: async () => {
-      const resumed = await state.resumeAll()
-      if (resumed.length > 0) announceChanged(announce, "exits resumed")
-      return { resumed }
+      try {
+        const resumed = await state.resumeAll()
+        if (resumed.length > 0) announceChanged(announce, "exits resumed")
+        return { resumed }
+      } catch (error) {
+        // The relays were resumed and the proxies were not: half the change
+        // is in force, so it is announced even though the call failed. The
+        // other way round nothing landed, and nothing is announced.
+        if (error instanceof StorageError && error.key === "proxies") {
+          announceChanged(announce, "exits resumed")
+        }
+        throw error
+      }
     },
 
     /** Add every proxy that can be read from a pasted list. */
@@ -1077,18 +1097,26 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
       }
       // A name is cleaned like every other name: it comes from the terminal,
       // and a name that carries an escape sequence would be drawn in the
-      // menu, in a toast and on a page. A name that cleans to nothing is not
-      // a name.
+      // menu, in a toast and on a page. A name that cleans to nothing is
+      // refused, not ignored: the caller has to know their name was not used.
+      // The whole call is refused, so the answer says that nothing changed.
       const cleaned = input.name !== undefined ? safeName(input.name) : undefined
-      const name =
-        cleaned !== undefined && cleaned.length > 0 && cleaned !== current.name
-          ? cleaned
-          : undefined
+      if (cleaned !== undefined && cleaned.length === 0) {
+        return {
+          updated: false,
+          reason:
+            "That name is not usable: it has to be text that can be shown in the menu. Nothing was changed.",
+        }
+      }
+      const name = cleaned !== undefined && cleaned !== current.name ? cleaned : undefined
       // Nothing changed: there is nothing to write and nothing to announce.
-      // The answer carries no reason: a reason means the change was refused,
-      // and this one was simply not a change.
+      // A name that only repeats the current one is a refusal with a reason:
+      // the caller has to know their input was not used.
       if (name === undefined && url === undefined) {
-        return { updated: false }
+        return {
+          updated: false,
+          ...(cleaned !== undefined ? { reason: "That name is the one it already has." } : {}),
+        }
       }
       const next = await state.updateProxy(input.id, {
         ...(name !== undefined ? { name } : {}),
@@ -1099,7 +1127,7 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
       if (url !== undefined) {
         void tester
           .test(next.id, "api")
-          .then(() => announce("exit tested"))
+          .then(() => announceChanged(announce, "exit tested"))
           .catch((error: unknown) => {
             state.noteFailure(`The new address could not be checked: ${describe(error)}`)
           })
@@ -1110,7 +1138,7 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
     /** Turn routing on or off. */
     setEnabled: async (input) => {
       await state.setEnabled(input.enabled)
-      await announce(input.enabled ? "routing enabled" : "routing disabled")
+      announceChanged(announce, input.enabled ? "routing enabled" : "routing disabled")
       return { enabled: input.enabled }
     },
 
@@ -1133,6 +1161,9 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
         selection: settings.selection,
         customModels: [...settings.customModels],
         dropped,
+        // The free selection has nothing to verify, and the chosen ids were
+        // checked whenever the price list could be read.
+        verified: models === undefined || list.length > 0,
       }
     },
 
@@ -1167,14 +1198,20 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
         return true
       })
       // A relay whose address is forgiven is asked to recycle, so it lands on
-      // a fresh one instead of the spent one it was leaving from.
+      // a fresh one instead of the spent one it was leaving from. This runs
+      // even when the proxies could not be written: the relays were restored,
+      // and a relay left on a spent address would be picked again.
       for (const id of result.restored) {
         const relay = state.relay(id)
         if (relay === undefined) continue
         void recycleRelay(relay.url, relay.access)
       }
       announceChanged(announce, "exhausted exits restored")
-      return { restored: [...result.restored], stillUsedUp: [...result.stillUsedUp] }
+      return {
+        restored: [...result.restored],
+        stillUsedUp: [...result.stillUsedUp],
+        ...(result.failed !== undefined ? { error: result.failed.message } : {}),
+      }
     },
 
     /** Show where the next request would go, without sending or advancing anything. */
@@ -1199,7 +1236,9 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
         const exit = decided === undefined ? undefined : state.summaryOf(decided.id)
         // "Routing is off" is appended only when it is not already the whole
         // answer: for an opencode model decideModel says it itself, and
-        // saying it twice would be noise.
+        // saying it twice would be noise. A model of another provider is
+        // another matter: the switch is what would have to change for it to
+        // matter at all, and the user has to be told that.
         //
         // A model list that could not be read is the one case where the
         // request does not merely go direct: with direct forbidden, it is
@@ -1215,7 +1254,7 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
               ? `${decision.reason} Direct routing is not allowed.`
               : decision.kind === "off" || settings.enabled
                 ? decision.reason
-                : `${decision.reason} Routing is off, so the request goes straight to OpenCode.`
+                : `${decision.reason} Routing is off, so the request goes straight to the provider it was addressed to.`
         return {
           modelId: input.modelId,
           ...(input.providerID !== undefined ? { providerID: input.providerID } : {}),
@@ -1244,20 +1283,32 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
       // outside the chosen list and every other provider still go direct.
       // The routed count is checked here too, so the page agrees with the
       // pill when nothing survives the free-model filter.
-      const list = selectModels(await catalog.list(), settings.selection, settings.customModels)
+      const models = await catalog.list()
+      const list = selectModels(models, settings.selection, settings.customModels)
       const routedCount = list.filter((model) => model.routed).length
       if (routedCount === 0) {
         const pick = state.pickExit({ advance: false })
+        // An empty model list is not the same as a list with nothing free in
+        // it: with no model known at all the plugin cannot tell which are
+        // free, and with direct forbidden the request is refused rather than
+        // sent straight to OpenCode. The named branch says the same, and the
+        // two must not disagree.
+        const unknown = models.length === 0
         const why =
           catalog.lastFailure() !== undefined
             ? "the model list could not be read"
-            : settings.selection === "custom"
-              ? "no chosen model is free"
-              : "the provider lists no free model"
+            : unknown
+              ? "the provider lists no model right now"
+              : settings.selection === "custom"
+                ? "no chosen model is free"
+                : "the provider lists no free model"
+        const refused = unknown && settings.direct === "never"
         return {
           ...(input.providerID !== undefined ? { providerID: input.providerID } : {}),
           routed: false,
-          reason: `Nothing is routed right now (${why}), so the request goes straight to OpenCode.`,
+          reason: refused
+            ? `Nothing is routed right now (${why}). The plugin is set to never go direct, so the request fails.`
+            : `Nothing is routed right now (${why}), so the request goes straight to OpenCode.`,
           direct: settings.direct,
           skipped: [...pick.skipped],
         }
@@ -1403,6 +1454,14 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
           invalid += 1
           continue
         }
+        // A name that is only control characters is not a name, and the
+        // interactive path refuses it: an import that accepted what the
+        // menu would not would leave an exit the user cannot label.
+        const cleanName = safeName(name)
+        if (cleanName.length === 0) {
+          invalid += 1
+          continue
+        }
         const normalized = normalizeRelayUrl(url.trim())
         if (!isSafeRelayUrl(normalized)) {
           invalid += 1
@@ -1433,17 +1492,22 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
         importedRelays.push({
           kind: "relay",
           id: randomUUID(),
-          name: safeName(name),
+          name: cleanName,
           // An imported relay is tracked only: accounts are never imported, so
           // the exported project name has no account behind it here. Keeping
           // it would offer Update and Delete-project actions that always fail.
           project: "",
-          region: typeof relay["region"] === "string" ? relay["region"] : "",
+          // The region is drawn on the exit's page, and it comes from a
+          // shared file: it is cleaned like the name is.
+          region: typeof relay["region"] === "string" ? safeName(relay["region"]) : "",
           url: stored,
           access,
           accountId: "",
           enabled: true,
           status: "untested",
+          // The address came from a shared file, so no automatic check may
+          // put it into service: the user tests it themselves.
+          imported: true,
           createdAt: Date.now(),
         })
         relays += 1
@@ -1467,6 +1531,20 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
           invalid += 1
           continue
         }
+        const wanted =
+          entry && typeof entry === "object"
+            ? (entry as Record<string, unknown>)["name"]
+            : undefined
+        const wantedName =
+          typeof wanted === "string" && wanted.length > 0 ? safeName(wanted) : ""
+        // A name that cleans to nothing is not a name, and the interactive
+        // path refuses it: an import that accepted what the menu would not
+        // would leave an exit the user cannot label.
+        const cleanName = wantedName.length > 0 ? wantedName : safeName(`${proxy.host}:${proxy.port}`)
+        if (cleanName.length === 0) {
+          invalid += 1
+          continue
+        }
         // The cap is applied to entries that have passed every check, and
         // after the duplicate check: only a valid entry is counted as left
         // out, so "invalid" stays what it says.
@@ -1480,23 +1558,30 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
           continue
         }
         seenProxies.add(key)
-        const wanted =
-          entry && typeof entry === "object"
-            ? (entry as Record<string, unknown>)["name"]
-            : undefined
         imported.push({
           kind: "proxy",
           id: randomUUID(),
-          name: safeName(typeof wanted === "string" && wanted.length > 0 ? wanted : `${proxy.host}:${proxy.port}`),
+          name: cleanName,
           url: proxy.url,
           enabled: true,
           status: "untested",
+          // The address came from a shared file, so no automatic check may
+          // put it into service: the user tests it themselves.
+          imported: true,
           createdAt: Date.now(),
         })
         proxies += 1
       }
       const relaysBefore = state.relays().length
       const proxiesBefore = state.proxies().length
+      // The counts are worked out before the write, so the answer that says
+      // the import stopped partway carries the same numbers as the answer
+      // that says it went in: without them the user cannot tell whether the
+      // entries that are missing were duplicates or lost.
+      const leftOut =
+        overflow > 0
+          ? `${overflow} more entr${overflow === 1 ? "y was" : "ies were"} left out: an import may add at most ${IMPORT_RELAY_LIMIT} relays and ${IMPORT_PROXY_LIMIT} proxies at a time.`
+          : undefined
       try {
         await state.addRelayList(importedRelays)
         await state.addProxyList(imported)
@@ -1536,11 +1621,19 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
         // whole file had gone in.
         const reason = `The import stopped partway: ${error.message}`
         state.noteFailure(reason)
+        const landed =
+          state.relays().length - relaysBefore + (state.proxies().length - proxiesBefore)
+        // The exits that did land are in force, so the change is announced
+        // even though the import did not finish: a listener that never hears
+        // about it would keep showing the old list.
+        if (landed > 0) announceChanged(announce, "configuration imported")
         return {
           relays: state.relays().length - relaysBefore,
           proxies: state.proxies().length - proxiesBefore,
           invalid,
           error: reason,
+          ...(leftOut !== undefined ? { leftOut } : {}),
+          ...(duplicates > 0 ? { duplicates } : {}),
         }
       }
       announceChanged(announce, "configuration imported")
@@ -1550,10 +1643,6 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
       // The user tests an imported exit explicitly. The duplicate count is
       // only reported when there was one, so a plain import answer stays
       // exactly what it always was.
-      const leftOut =
-        overflow > 0
-          ? `${overflow} more entr${overflow === 1 ? "y was" : "ies were"} left out: an import may add at most ${IMPORT_RELAY_LIMIT} relays and ${IMPORT_PROXY_LIMIT} proxies at a time.`
-          : undefined
       return {
         relays,
         proxies,

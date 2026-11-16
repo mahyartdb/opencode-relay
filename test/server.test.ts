@@ -5,6 +5,7 @@ import { ROTATE_DELAY_MS } from "../src/server/hooks.ts"
 import { relayRequest } from "../src/lib/routing.ts"
 import { createHandlers } from "../src/server/handlers.ts"
 import { RelayState } from "../src/server/state.ts"
+import { Tester } from "../src/server/tester.ts"
 import plugin from "../src/server/index.ts"
 
 /**
@@ -1420,6 +1421,79 @@ describe("the server half", () => {
       await app.dispose()
       fake.closeAllConnections()
       await new Promise<void>((resolve) => fake.close(() => resolve()))
+    }
+  })
+
+  test("a scan leaves imported exits untested until the user tests one", async () => {
+    const store = new Map<string, unknown>()
+    const storage = {
+      get: async (key: string) => store.get(key),
+      set: async (key: string, value: unknown) => {
+        store.set(key, value)
+      },
+      remove: async (key: string) => {
+        store.delete(key)
+      },
+      scan: async () => ({ entries: [] }),
+    }
+    const state = new RelayState(storage as never)
+    await state.load()
+    const tester = new Tester({ state, announce: async () => {} })
+    const handlers = createHandlers({
+      state,
+      catalog: {} as never,
+      bridge: {} as never,
+      tester,
+      announce: async () => {},
+    })
+    await handlers.setEnabled({ enabled: true }, {} as never)
+
+    const imported = (await handlers.importConfig(
+      {
+        json: JSON.stringify({
+          version: 1,
+          relays: [{ name: "imported relay", url: "http://127.0.0.1:9", access: ACCESS }],
+          proxies: ["http://127.0.0.1:1"],
+          settings: { healthChecks: true },
+        }),
+      },
+      {} as never,
+    )) as { relays: number; proxies: number; invalid: number }
+    expect(imported).toEqual({ relays: 1, proxies: 1, invalid: 0 })
+    const relayExit = state.relays()[0]!
+    const proxyExit = state.proxies()[0]!
+    expect(relayExit.imported).toBe(true)
+    expect(proxyExit.imported).toBe(true)
+    expect(state.settings().enabled).toBe(true)
+    expect(state.settings().healthChecks).toBe(true)
+
+    // A check this stub answers would promote any exit it asked: the answer is
+    // a model list through a relay that says it reached the upstream, which is
+    // exactly what a sweep must not do to an imported address.
+    const original = globalThis.fetch
+    globalThis.fetch = (async () =>
+      new Response(JSON.stringify({ data: [{ id: "iceman-free" }] }), {
+        status: 200,
+        headers: { "content-type": "application/json", "x-relay-egress": "203.0.113.40" },
+      })) as unknown as typeof fetch
+    try {
+      await tester.scan("api")
+
+      expect(state.exit(relayExit.id)?.status).toBe("untested")
+      expect(state.exit(proxyExit.id)?.status).toBe("untested")
+      const swept = state.pickExit({ advance: false })
+      expect(swept.exit).toBeUndefined()
+      expect(swept.skipped.map((entry) => entry.id).sort()).toEqual([relayExit.id, proxyExit.id].sort())
+      expect(swept.skipped.every((entry) => entry.reason === "not tested yet")).toBe(true)
+
+      // The user's own test clears the import mark, and a check run after it
+      // can promote the exit; without that, the sweep never would.
+      await state.markTested(relayExit.id)
+      const result = await tester.test(relayExit.id, "api")
+      expect(result.status).toBe("reachable")
+      expect(state.pickExit({ advance: false }).exit?.id).toBe(relayExit.id)
+    } finally {
+      globalThis.fetch = original
     }
   })
 

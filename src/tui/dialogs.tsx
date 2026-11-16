@@ -13,9 +13,15 @@
 import { createSignal, onCleanup } from "solid-js"
 import type {
   Context,
+  DialogAlertOptions,
+  DialogConfirmOptions,
+  DialogOptions,
+  DialogPromptOptions,
   DialogSelectAction,
   DialogSelectOption,
+  DialogSelectOptions,
   DialogSize,
+  ToastOptions,
 } from "@opencode/plugin/tui/context"
 import type { TextareaRenderable } from "@opentui/core"
 import { Relay } from "../rpc.ts"
@@ -29,6 +35,7 @@ import {
   describeStrategy,
   exitsMenuOptions,
   isDeployedExit,
+  isUsableExit,
   menuOptions,
   statusLabel,
   toggleModel,
@@ -133,6 +140,14 @@ export function resetRefresh(): void {
 const STATUS_TIMEOUT_MS = 12_000
 
 /**
+ * How long a slow thing may take before the dialog says so.
+ *
+ * The dialog that names the work appears only after this: most calls answer
+ * in a moment, and a dialog that flashes for one frame is noise.
+ */
+const WORKING_DELAY_MS = 250
+
+/**
  * Give up on a call that does not answer.
  *
  * The answer that arrives after the deadline is ignored: it is too late to
@@ -146,7 +161,18 @@ function withDeadline<T>(work: (signal: AbortSignal) => Promise<T>, ms: number):
       controller.abort()
       reject(new Error(`The relay plugin's server half did not answer within ${ms / 1000} seconds.`))
     }, ms)
-    work(controller.signal).then(
+    // A work that throws before it returns a promise must not leave the timer
+    // armed: the call is already decided, and the timer would keep the
+    // process alive for no reason.
+    let started: Promise<T>
+    try {
+      started = work(controller.signal)
+    } catch (error) {
+      clearTimeout(timer)
+      reject(error)
+      return
+    }
+    started.then(
       (value) => {
         clearTimeout(timer)
         resolve(value)
@@ -254,21 +280,30 @@ function Working(props: { readonly message: string }) {
  * Esc closes the dialog but not the work: a deployment that is already under
  * way goes on by itself. The work then finishes into a toast, so the user is
  * told the outcome either way.
+ *
+ * The dialog waits a moment before it appears: most of these calls answer
+ * immediately, and a dialog that flashes for one frame is worse than no
+ * dialog at all.
  */
 async function withWorking<T>(context: Context, message: string, run: () => Promise<T>): Promise<T> {
   let closed = false
-  context.ui.dialog.show(
-    () => <Working message={message} />,
-    () => {
-      closed = true
-    },
-  )
+  let shown = false
+  const timer = setTimeout(() => {
+    shown = true
+    context.ui.dialog.show(
+      () => <Working message={message} />,
+      () => {
+        closed = true
+      },
+    )
+  }, WORKING_DELAY_MS)
   try {
     return await run()
   } finally {
+    clearTimeout(timer)
     // The dialog may already be gone: the user closed it, or another dialog
     // took its place, and closing that one by mistake would be worse.
-    if (!closed) context.ui.dialog.clear()
+    if (shown && !closed) context.ui.dialog.clear()
   }
 }
 
@@ -313,6 +348,9 @@ function askMultiline(
     readonly initial?: string
   },
 ): Promise<string | undefined> {
+  // The plugin may have been reloaded: the dialog would never open, and a
+  // flow that waits for an answer that cannot come never ends.
+  if (activationGone(context)) return Promise.resolve(undefined)
   return new Promise((resolve) => {
     let finished = false
     const finish = (value: string | undefined): void => {
@@ -345,6 +383,9 @@ function showText(
   text: string,
   size: DialogSize = "medium",
 ): Promise<void> {
+  // The plugin may have been reloaded: the dialog would never open, and the
+  // flow would wait for a close that cannot come.
+  if (activationGone(context)) return Promise.resolve()
   return new Promise((resolve) => {
     let finished = false
     const finish = (): void => {
@@ -422,66 +463,207 @@ export function refreshErrorToaster(context: Context): (refresh: Refresh) => voi
  * deactivated while its menu is open would otherwise leave the flag set, and
  * every later /relay would answer "the menu is already open" forever.
  */
-let menuOpen = false
+let menuOwner: number | undefined
 
 /** Release the menu guard, so a re-activated plugin is not locked out. */
-export function releaseRelayMenu(): void {
-  menuOpen = false
+export function releaseRelayMenu(token: number): void {
+  if (menuOwner === token) menuOwner = undefined
 }
 
-export async function openRelayMenu(context: Context, client: RelayClient): Promise<void> {
+/**
+ * The activation the plugin is currently in.
+ *
+ * The plugin can be reloaded while its menu is open. The old menu keeps
+ * running: its calls still answer, and it would toast into the terminal of
+ * the plugin that replaced it, replace the dialog that one has open, and
+ * clear it when it finishes. Every screen operation the old menu makes goes
+ * through a context that asks whether the activation is still the one on
+ * screen.
+ */
+let activation = 0
+
+/**
+ * The activation is gone: the flow has to unwind.
+ *
+ * The guarded context does not open a dialog that belongs to a plugin that is
+ * no longer on screen: it would draw over the one that replaced it. A flow
+ * waiting for an answer therefore has to be told, or it waits for a dialog
+ * that will never open - and a loop that asks again on every empty answer
+ * never ends.
+ */
+class ActivationGone extends Error {
+  constructor() {
+    super("The relay plugin was reloaded.")
+    this.name = "ActivationGone"
+  }
+}
+
+/** Marks a context whose activation is gone, so a flow can stop waiting. */
+const ACTIVATION_GONE = Symbol("relay-activation-gone")
+
+/** Start an activation, and return the token that names it. */
+export function beginActivation(): number {
+  activation += 1
+  // A new activation starts a new generation: an answer that was already on
+  // its way belongs to the plugin that is gone, and must not paint the
+  // footer of the one that replaced it.
+  resetRefresh()
+  return activation
+}
+
+/** End an activation: everything it started stops touching the screen. */
+export function endActivation(token: number): void {
+  if (token === activation) activation += 1
+}
+
+/**
+ * A copy of an object that keeps its prototype.
+ *
+ * The host's objects may carry their methods on the prototype, and a plain
+ * spread would drop them.
+ */
+function withPrototype<T extends object>(source: T, overrides: Partial<T>): T {
+  return Object.assign(Object.create(Object.getPrototypeOf(source)), source, overrides) as T
+}
+
+/**
+ * A context whose screen operations do nothing once the activation is gone.
+ *
+ * The context is copied rather than changed, so the plugin that replaced
+ * this one keeps the one the host handed it.
+ */
+function guardContext(context: Context, token: number): Context {
+  const alive = (): boolean => token === activation
+  const ui = context.ui
+  const guardedUi = withPrototype(ui, {
+    toast: withPrototype(ui.toast, {
+      show: (options: ToastOptions): void => {
+        if (!alive()) return
+        ui.toast.show(options)
+      },
+    }),
+    dialog: withPrototype(ui.dialog, {
+      show: (...args: Parameters<typeof ui.dialog.show>): void => {
+        if (!alive()) return
+        ui.dialog.show(...args)
+      },
+      set: (options: DialogOptions): void => {
+        if (!alive()) return
+        ui.dialog.set(options)
+      },
+      clear: (): void => {
+        if (!alive()) return
+        ui.dialog.clear()
+      },
+      alert: async (options: DialogAlertOptions): Promise<void> => {
+        if (!alive()) throw new ActivationGone()
+        await ui.dialog.alert(options)
+        if (!alive()) throw new ActivationGone()
+      },
+      confirm: async (options: DialogConfirmOptions): Promise<boolean | undefined> => {
+        if (!alive()) throw new ActivationGone()
+        const answer = await ui.dialog.confirm(options)
+        // The answer may arrive after the plugin was reloaded: the flow it
+        // belongs to is gone, and what it would do with the answer is not
+        // the plugin's business any more.
+        if (!alive()) throw new ActivationGone()
+        return answer
+      },
+      prompt: async (options: DialogPromptOptions): Promise<string | undefined> => {
+        if (!alive()) throw new ActivationGone()
+        const answer = await ui.dialog.prompt(options)
+        if (!alive()) throw new ActivationGone()
+        return answer
+      },
+      select: async <Value,>(
+        options: DialogSelectOptions<Value>,
+      ): Promise<Value | undefined> => {
+        if (!alive()) throw new ActivationGone()
+        const choice = await ui.dialog.select<Value>(options)
+        if (!alive()) throw new ActivationGone()
+        return choice
+      },
+    }),
+  })
+  const guarded = withPrototype(context, { ui: guardedUi })
+  // The flows that wait for a dialog of their own ask this before they
+  // start: a dialog that never opens would leave them waiting forever.
+  Object.defineProperty(guarded, ACTIVATION_GONE, { value: () => !alive() })
+  return guarded
+}
+
+/** Whether the activation behind this context is still on screen. */
+function activationGone(context: Context): boolean {
+  const check = (context as Context & { readonly [ACTIVATION_GONE]?: () => boolean })[
+    ACTIVATION_GONE
+  ]
+  return check !== undefined && check()
+}
+
+export async function openRelayMenu(
+  context: Context,
+  client: RelayClient,
+  token: number,
+): Promise<void> {
+  // Everything this menu shows goes through the guarded context, so a reload
+  // in the middle of a flow cannot leave the old flow drawing over the new
+  // one.
+  const screen = guardContext(context, token)
   // A second click on the pill, or a second /relay while the menu is up, must
   // not stack menus on top of each other.
-  if (menuOpen) {
-    context.ui.toast.show({ title: "Relay", message: "The relay menu is already open.", variant: "info" })
+  if (menuOwner !== undefined) {
+    screen.ui.toast.show({ title: "Relay", message: "The relay menu is already open.", variant: "info" })
     return
   }
-  menuOpen = true
+  menuOwner = token
   try {
     // One toaster for the whole menu, so a dead server is reported once and
     // not again by every submenu the user walks into.
-    const reportRefresh = refreshErrorToaster(context)
+    const reportRefresh = refreshErrorToaster(screen)
+    const staleNote = " · last known state"
     for (;;) {
-      // The menu is drawn from what is known, and the refresh runs behind it:
-      // a click must always open something, even when the server is slow to
-      // answer.
-      const known = currentStatus()
-      // Whether the server answered the last time it was asked decides how
-      // every screen here is titled: a menu drawn from a snapshot the dead
-      // server left must not present it as current.
-      const stale = !isReachable()
-      const staleNote = " · last known state"
-      if (known === undefined) {
-        // This branch fetches before it draws, so the note comes from what
-        // the fetch did: a refresh that succeeded has produced a current
-        // snapshot, and calling it stale would be the wrong label.
-        const refreshed = await refreshStatus(context, client)
-        const status = refreshed.ok ? refreshed.status : currentStatus()
-        if (!status) {
-          if (!refreshed.ok) reportError(context, "Relay", refreshed.error)
+      // The menu is drawn from a fresh snapshot, so the title's claim about
+      // freshness matches the options it labels. A server that was not
+      // answering has nothing to add, so the menu opens at once with the
+      // snapshot it has, labelled as the last thing known.
+      const answering = isReachable()
+      const refreshed = answering
+        ? await withWorking(screen, "Reading the relay", () => refreshStatus(screen, client))
+        : undefined
+      if (refreshed !== undefined && !refreshed.ok) reportRefresh(refreshed)
+      let status = refreshed?.ok === true ? refreshed.status : currentStatus()
+      // Whether the state on screen is the state now: only a fresh answer
+      // says so, and a snapshot from a server that is not answering is the
+      // last thing known.
+      let current = refreshed?.ok === true
+      if (status === undefined) {
+        // There is no snapshot at all, so the server has to answer before
+        // there is anything to draw.
+        const first = await withWorking(screen, "Reading the relay", () =>
+          refreshStatus(screen, client),
+        )
+        if (!first.ok) {
+          reportError(screen, "Relay", first.error)
           return
         }
-        if (!refreshed.ok) reportRefresh(refreshed)
-        const first = await context.ui.dialog.select<MenuAction>({
-          title: `Relay${refreshed.ok ? "" : staleNote}`,
-          options: menuOptions(status),
-        })
-        if (first === undefined || first === "close") return
-        await runAction(context, client, first, reportRefresh)
-        continue
+        status = first.status
+        current = true
       }
-      void refreshStatus(context, client).then((refreshed) => {
-        if (!refreshed.ok) reportRefresh(refreshed)
-      })
-      const choice = await context.ui.dialog.select<MenuAction>({
-        title: `Relay${stale ? staleNote : ""}`,
-        options: menuOptions(known),
+      const choice = await screen.ui.dialog.select<MenuAction>({
+        title: `Relay${current ? "" : staleNote}`,
+        options: menuOptions(status),
       })
       if (choice === undefined || choice === "close") return
-      await runAction(context, client, choice, reportRefresh)
+      await runAction(screen, client, choice, reportRefresh)
     }
+  } catch (error) {
+    // The plugin was reloaded while the menu was open: the flow has nothing
+    // left to show, and the plugin that replaced it owns the screen now.
+    if (!(error instanceof ActivationGone)) throw error
   } finally {
-    menuOpen = false
+    // Only the menu that owns the guard releases it: a menu that was
+    // replaced by a newer one must not unlock the newer one's guard.
+    if (menuOwner === token) menuOwner = undefined
   }
 }
 
@@ -497,7 +679,9 @@ async function runAction(
       return showStatus(context, client)
     case "toggle": {
       // Toggle needs the state it acts on; the rest is in the submenu.
-      const refreshed = await refreshStatus(context, client)
+      const refreshed = await withWorking(context, "Reading the relay", () =>
+        refreshStatus(context, client),
+      )
       if (refreshed.ok) return toggleRouting(context, client, refreshed.status)
       const fallback = currentStatus()
       if (fallback) return toggleRouting(context, client, fallback)
@@ -531,7 +715,9 @@ async function openSettings(
   reportRefresh: (refresh: Refresh) => void,
 ): Promise<void> {
   for (;;) {
-    const refreshed = await refreshStatus(context, client)
+    const refreshed = await withWorking(context, "Reading the relay", () =>
+      refreshStatus(context, client),
+    )
     const status = refreshed.ok ? refreshed.status : currentStatus()
     if (!status) return
     if (!refreshed.ok) reportRefresh(refreshed)
@@ -594,7 +780,9 @@ async function openSettings(
 
 /** The read-only page about everything the plugin knows right now. */
 async function showStatus(context: Context, client: RelayClient): Promise<void> {
-  const refreshed = await refreshStatus(context, client)
+  const refreshed = await withWorking(context, "Reading the relay", () =>
+    refreshStatus(context, client),
+  )
   const status = refreshed.ok ? refreshed.status : currentStatus()
   if (!status) {
     if (!refreshed.ok) reportError(context, "Relay", refreshed.error)
@@ -617,9 +805,26 @@ async function toggleRouting(context: Context, client: RelayClient, status: Rela
   const refreshed = await refreshStatus(context, client)
   const note = refreshed.ok ? refreshed.status.note : undefined
   const summary = enabled ? "Routing is on." : "Routing is off."
+  // The server's own note begins with the same words the summary uses, so
+  // printing both said the same thing twice. When the note stands on its
+  // own it is the whole message.
+  const stem = summary.replace(/\.$/, "")
+  const head = note?.trimStart().toLowerCase() ?? ""
+  // The server's own note begins with the same words the summary uses, so
+  // printing both said the same thing twice. When the note stands on its
+  // own it is the whole message. The healthy note names the models instead
+  // of repeating the summary - it starts with "Routing " and continues the
+  // same sentence - so it counts as a continuation too.
+  const continues = enabled && head.startsWith("routing ")
+  const message =
+    note === undefined
+      ? summary
+      : head.startsWith(stem.toLowerCase()) || continues
+        ? note
+        : `${summary} ${note}`
   context.ui.toast.show({
     title: "Relay",
-    message: note ? `${summary} ${note}` : summary,
+    message,
     variant: "success",
     ...(enabled && note ? { duration: 8000 } : {}),
   })
@@ -687,9 +892,13 @@ async function chooseDirect(context: Context, client: RelayClient, status: Relay
   if (!result) return
   context.ui.toast.show({
     title: "Relay",
+    // The policy is dormant while routing is off: no request goes through an
+    // exit, so nothing fails yet, and saying it does would be a wrong word.
     message:
       choice === "never"
-        ? "Direct routing is off: a request with no usable exit now fails."
+        ? status.enabled
+          ? "Direct routing is off: a request with no usable exit now fails."
+          : "Direct routing is off: when routing is on, a request with no usable exit fails."
         : "Direct routing is allowed: requests fall back to OpenCode when no exit can serve.",
     variant: choice === "never" ? "warning" : "success",
   })
@@ -725,15 +934,21 @@ async function showPreview(context: Context, client: RelayClient): Promise<void>
 }
 
 /** Bring the exits whose allowance is gone back into use. */
-async function restoreExhausted(context: Context, client: RelayClient): Promise<void> {
+async function restoreExhausted(context: Context, client: RelayClient, status: RelayStatus): Promise<void> {
   const result = await callRpc(context, "Relay", () => client.resetExhausted({}))
   if (!result) return
   const restored = result.restored.length
   const left = (result.stillUsedUp ?? []).length
   const parts: string[] = []
   if (restored > 0) {
+    // Only a relay can be asked for a fresh address, and only a relay that
+    // was actually restored is asked: a proxy-only restore would claim a
+    // move that never happens.
+    const relayed = result.restored.some((id) =>
+      status.exits.some((exit) => exit.id === id && exit.kind === "relay"),
+    )
     parts.push(
-      `${restored} exit${restored === 1 ? " is" : "s are"} back in use, and a relay is asked to move to a fresh address.`,
+      `${restored} exit${restored === 1 ? " is" : "s are"} no longer counted as used up${relayed ? ", and a relay is asked to move to a fresh address" : ""}.`,
     )
   }
   if (left > 0) {
@@ -743,11 +958,17 @@ async function restoreExhausted(context: Context, client: RelayClient): Promise<
       `${left} exit${left === 1 ? " is" : "s are"} still out of use: the provider's reset window is live, so there is nothing to come back from yet.`,
     )
   }
+  if (result.error !== undefined) {
+    // The restore stopped partway: the exits that were restored are in force,
+    // and the ones that were not are still out of use. The toast says both.
+    parts.push(result.error)
+  }
   context.ui.toast.show({
     title: "Relay",
     message: parts.length > 0 ? parts.join(" ") : "No exit was out of use.",
     // Nothing happened is not a success: the reader must not read it as one.
-    variant: restored > 0 ? "success" : "info",
+    // A restore that stopped partway is not a success either.
+    variant: restored > 0 && result.error === undefined ? "success" : "warning",
     duration: parts.length > 1 ? 9000 : 7000,
   })
   // The Exits list refreshes as soon as this returns, so a refresh here would
@@ -801,7 +1022,9 @@ async function chooseModels(
   for (;;) {
     // The loop needs the current selection to describe the choices and to
     // pre-mark the right one; the initial fetch says what that is.
-    const refreshed = await refreshStatus(context, client)
+    const refreshed = await withWorking(context, "Reading the relay", () =>
+      refreshStatus(context, client),
+    )
     const status = refreshed.ok ? refreshed.status : currentStatus()
     if (!status) return
     // A refresh that failed leaves the loop on an old snapshot, so the
@@ -948,16 +1171,29 @@ async function setSelection(
   client: RelayClient,
   input: { readonly selection: "free" | "custom"; readonly models?: readonly string[] },
 ): Promise<void> {
-  const result = await callRpc(context, "Relay", () => client.setSelection(input))
+  // The server reads the provider's model list on this call, which can hang
+  // behind a blocked network: the call has a deadline and says what it is
+  // doing, so the menu never looks as if it did nothing.
+  const result = await withWorking(context, "Saving the selection", () =>
+    callRpc(context, "Relay", () =>
+      withDeadline((signal) => client.setSelection(input, { signal }), STATUS_TIMEOUT_MS),
+    ),
+  )
   if (!result) return
   const count = result.customModels.length
   const dropped = result.dropped.length
+  // The ids may not have been checked against the price list: the list could
+  // not be read, and calling them free then would be a claim the server
+  // cannot make.
+  const unverified = result.verified === false
   const message =
     result.selection === "free"
       ? `The free models are routed${dropped > 0 ? `; ${dropped} paid model${dropped === 1 ? " was" : "s were"} left out` : ""}.`
       : count === 0
         ? "No model is routed. Choose at least one."
-        : `${count} free model${count === 1 ? " is" : "s are"} routed.`
+        : unverified
+          ? `${count} model${count === 1 ? " is" : "s are"} routed, but the model list could not be read, so ${count === 1 ? "it is" : "they are"} not known to be free.`
+          : `${count} free model${count === 1 ? " is" : "s are"} routed${dropped > 0 ? `; ${dropped} could not be routed, because ${dropped === 1 ? "it is" : "they are"} not free` : ""}.`
   context.ui.toast.show({
     title: "Relay",
     message,
@@ -1049,9 +1285,14 @@ async function quickUpdate(context: Context, client: RelayClient, exit: ExitChoi
   if (!result) return
   context.ui.toast.show({
     title: "Relay",
+    // A relay that answered with a status has a problem of its own - a wrong
+    // access token, most of all - and "did not answer" would send the user
+    // looking in the wrong place.
     message: result.reachable
       ? `${exit.name} is redeployed and answered.`
-      : `${exit.name} is redeployed, but did not answer yet.`,
+      : result.status !== undefined && result.status > 0
+        ? `${exit.name} is redeployed, but it answered HTTP ${result.status}.`
+        : `${exit.name} is redeployed, but did not answer yet.`,
     variant: result.reachable ? "success" : "warning",
     duration: result.reachable ? 6000 : 9000,
   })
@@ -1076,12 +1317,13 @@ function updateAction(context: Context, client: RelayClient): DialogSelectAction
         })
         return
       }
-      // Only a relay this plugin deployed can be redeployed; a proxy or a
-      // tracked relay has no project to push code to.
+      // Only a deployed relay whose Vercel account is still stored can be
+      // redeployed: a proxy or a tracked relay has no project to push code
+      // to, and a deployed relay whose account is gone cannot be reached.
       if (value.deployed !== true) {
         context.ui.toast.show({
           title: "Relay",
-          message: "Only a relay this plugin deployed can be updated.",
+          message: "Only a deployed relay whose Vercel account is still stored can be updated.",
           variant: "warning",
         })
         return
@@ -1128,7 +1370,9 @@ async function manageExits(
   reportRefresh: (refresh: Refresh) => void,
 ): Promise<void> {
   for (;;) {
-    const refreshed = await refreshStatus(context, client)
+    const refreshed = await withWorking(context, "Reading the relay", () =>
+      refreshStatus(context, client),
+    )
     const status = refreshed.ok ? refreshed.status : currentStatus()
     if (!status) return
     if (!refreshed.ok) reportRefresh(refreshed)
@@ -1166,7 +1410,7 @@ async function manageExits(
           await updateAllRelays(context, client)
           continue
         case "restore":
-          await restoreExhausted(context, client)
+          await restoreExhausted(context, client, status)
           continue
         case "resume-all":
           await resumeAllPaused(context, client, status.paused ?? [])
@@ -1189,7 +1433,9 @@ async function exitDetail(
   reportRefresh: (refresh: Refresh) => void,
 ): Promise<void> {
   for (;;) {
-    const refreshed = await refreshStatus(context, client)
+    const refreshed = await withWorking(context, "Reading the relay", () =>
+      refreshStatus(context, client),
+    )
     const status = refreshed.ok ? refreshed.status : currentStatus()
     if (!status) return
     if (!refreshed.ok) reportRefresh(refreshed)
@@ -1203,6 +1449,7 @@ async function exitDetail(
     // A paused exit is kept but never used, so offering it as the exit to use
     // would toast a choice that routing is about to skip.
     const paused = !exit.enabled
+    const hasSample = status.hasRequestSample === true
     const isDeployedRelay = isDeployedExit(exit, status)
     const options: DialogSelectOption<DetailAction>[] = [
       {
@@ -1231,9 +1478,15 @@ async function exitDetail(
         title: "Deep test with a real model",
         value: "deep",
         // The check carries the session token, and a paused exit is out of
-        // use on purpose: the token has no business going there.
-        description: paused ? "Paused: resume it first" : "The only check with a real model request",
-        ...(paused ? { disabled: true } : {}),
+        // use on purpose: the token has no business going there. It also
+        // replays a captured request's headers, so without a capture there
+        // is nothing to send.
+        description: paused
+          ? "Paused: resume it first"
+          : hasSample
+            ? "The only check with a real model request"
+            : "Needs a routed request first",
+        ...(paused || !hasSample ? { disabled: true } : {}),
       },
       {
         title: exit.enabled ? "Pause this exit" : "Resume this exit",
@@ -1308,14 +1561,31 @@ async function exitDetail(
       }
       case "deep": {
         // A deep check carries the user's OpenCode session token, so it is
-        // said out loud before it happens, the same as the batch path.
+        // said out loud before it happens, the same as the batch path — and
+        // the token exists only when a routed request has been captured for
+        // it to replay.
         const sure = await context.ui.dialog.confirm({
           title: `Send a real request through ${exit.name}?`,
-          message:
-            "This sends your OpenCode session token through this exit. It is the only check that can tell an address that works from one whose allowance is gone.",
-          label: { confirm: "Send it", cancel: "Not now" },
+          message: hasSample
+            ? "This sends your OpenCode session token through this exit. It is the only check that can tell an address that works from one whose allowance is gone."
+            : "No routed request has been captured in the last 30 minutes, so there are no headers to send. Route one request through any exit first.",
+          label: hasSample
+            ? { confirm: "Send it", cancel: "Not now" }
+            : { confirm: "Got it", cancel: "Not now" },
         })
         if (!sure) break
+        // The capture may have aged out while the dialog was open: the check
+        // has no headers to send then, and a call that cannot work is not
+        // worth making after the user agreed to one.
+        if (currentStatus()?.hasRequestSample !== true) {
+          context.ui.toast.show({
+            title: "Relay",
+            message:
+              "No routed request has been captured in the last 30 minutes, so there are no headers to send.",
+            variant: "warning",
+          })
+          break
+        }
         const result = await withWorking(context, `Sending a real request through ${exit.name}`, () =>
           callRpc(context, "Relay", () => client.testExit({ id, deep: true })),
         )
@@ -1333,9 +1603,25 @@ async function exitDetail(
           client.setExitEnabled({ id, enabled: !exit.enabled }),
         )
         if (!result) break
+        // The picker answers whether the exit will serve now, and only a
+        // fresh answer can: a paused exit is skipped for being paused, and
+        // resuming it does not make it serve when its allowance is gone.
+        const refreshed = await withWorking(context, "Reading the relay", () =>
+          refreshStatus(context, client),
+        )
+        const live = refreshed.ok ? refreshed.status : status
+        const now = live.exits.find((item) => item.id === id)
+        const serves = now !== undefined && isUsableExit(now, live)
         context.ui.toast.show({
           title: "Relay",
-          message: exit.enabled ? `${exit.name} is paused.` : `${exit.name} is back in use.`,
+          // Resuming an exit does not make it serve: one whose allowance is
+          // gone, or that is resting, stays out of use. The toast says what
+          // changed, and what is still true.
+          message: exit.enabled
+            ? `${exit.name} is paused.`
+            : result.enabled
+              ? `${exit.name} is no longer paused.${serves ? "" : " It is not in use right now."}`
+              : `${exit.name} is still paused.`,
           variant: "success",
         })
         break
@@ -1369,9 +1655,13 @@ async function updateRelay(
   if (!result) return
   context.ui.toast.show({
     title: "Relay",
+    // A relay that answered with a status has a problem of its own, and
+    // "did not answer" would send the user looking in the wrong place.
     message: result.reachable
       ? `${name} is redeployed and answered.`
-      : `${name} is redeployed, but did not answer yet.`,
+      : result.status !== undefined && result.status > 0
+        ? `${name} is redeployed, but it answered HTTP ${result.status}.`
+        : `${name} is redeployed, but did not answer yet.`,
     variant: result.reachable ? "success" : "warning",
   })
   await refreshStatus(context, client)
@@ -1385,36 +1675,64 @@ async function editProxy(
   name: string,
   url: string,
 ): Promise<void> {
-  const nextName = await context.ui.dialog.prompt({
+  const askedName = await context.ui.dialog.prompt({
     title: "Name this proxy",
     description: "A name you will recognize later.",
     placeholder: name,
     value: name,
   })
-  if (nextName === undefined) return
+  if (askedName === undefined) return
+  let nextName = askedName
   let changed = false
   if (nextName.trim().length > 0 && nextName.trim() !== name) {
-    const updated = await callRpc(context, "Relay", () =>
-      client.updateProxy({ id, name: nextName.trim() }),
-    )
-    // A rejected call has already been reported with the server's own words;
-    // a second toast would only push the first one off the screen.
-    if (updated === undefined) return
-    if (updated.updated) {
-      changed = true
-    } else {
-      // `updated: false` without a rejection means the server found nothing
-      // to rename, which is a reason the reader can act on.
+    for (;;) {
+      const updated = await callRpc(context, "Relay", () =>
+        client.updateProxy({ id, name: nextName.trim() }),
+      )
+      if (updated === undefined) {
+        // The call itself failed. The name is the user's own word, and a
+        // retry that has to retype it is a retry they may not make, so it is
+        // offered again with what was typed already in the box.
+        const again = await context.ui.dialog.prompt({
+          title: "Name this proxy",
+          description: "A name you will recognize later.",
+          placeholder: name,
+          value: nextName,
+        })
+        if (again === undefined) return
+        nextName = again
+        if (nextName.trim().length === 0 || nextName.trim() === name) return
+        continue
+      }
+      if (updated.updated) {
+        changed = true
+        break
+      }
+      // The server refused the name and says why: its own words are the
+      // answer, and the name is offered again so it can be corrected.
       context.ui.toast.show({
         title: "Relay",
-        message: `${name} is not stored any more, so its name was not changed.`,
+        message: updated.reason ?? `${name} is not stored any more, so its name was not changed.`,
         variant: "warning",
       })
-      await refreshStatus(context, client)
-      return
+      const again = await context.ui.dialog.prompt({
+        title: "Name this proxy",
+        description: "A name you will recognize later.",
+        placeholder: name,
+        value: nextName,
+      })
+      if (again === undefined) {
+        await refreshStatus(context, client)
+        return
+      }
+      nextName = again
+      if (nextName.trim().length === 0 || nextName.trim() === name) {
+        await refreshStatus(context, client)
+        return
+      }
     }
   }
-  const nextUrl = await context.ui.dialog.prompt({
+  const askedUrl = await context.ui.dialog.prompt({
     title: "Proxy address",
     description: "host:port or a proxy URL with scheme, credentials included",
     // The address is shown with its credentials masked, so it must not be
@@ -1423,7 +1741,7 @@ async function editProxy(
     // is a placeholder, and an empty answer keeps it as it is.
     placeholder: url,
   })
-  if (nextUrl === undefined) {
+  if (askedUrl === undefined) {
     // The name was already saved, so the flow has to say so: a silent return
     // reads as a lost answer.
     if (changed) {
@@ -1436,38 +1754,78 @@ async function editProxy(
     }
     return
   }
+  let nextUrl = askedUrl
   if (nextUrl.trim().length > 0) {
-    const updated = await withWorking(context, "Testing the new address", () =>
-      callRpc(context, "Relay", () => client.updateProxy({ id, url: nextUrl.trim() })),
-    )
-    // The name may already have changed: the list must show it either way.
-    if (updated === undefined) {
-      if (changed) await refreshStatus(context, client)
-      return
-    }
-    if (!updated.updated) {
-      // A reason means the server refused the address; without one nothing
-      // changed, which is not an error.
+    for (;;) {
+      const updated = await withWorking(context, "Testing the new address", () =>
+        callRpc(context, "Relay", () => client.updateProxy({ id, url: nextUrl.trim() })),
+      )
+      // The name may already have changed: the list must show it either way.
+      if (updated === undefined) {
+        // The call itself failed. The address is the user's own text, and a
+        // retry that has to retype it is a retry they may not make, so it is
+        // offered again with what was typed already in the box.
+        const again = await context.ui.dialog.prompt({
+          title: "Proxy address",
+          description: "host:port or a proxy URL with scheme, credentials included",
+          placeholder: url,
+          value: nextUrl,
+        })
+        if (again === undefined) {
+          // The name was already saved, so the flow has to say so: a silent
+          // return reads as a lost answer.
+          if (changed) {
+            context.ui.toast.show({
+              title: "Relay",
+              message: `${name} was renamed; the address was left as it was.`,
+              variant: "success",
+            })
+            await refreshStatus(context, client)
+          }
+          return
+        }
+        nextUrl = again
+        if (nextUrl.trim().length === 0) {
+          if (changed) {
+            context.ui.toast.show({
+              title: "Relay",
+              message: `${name} was renamed; the address was left as it was.`,
+              variant: "success",
+            })
+            await refreshStatus(context, client)
+          }
+          return
+        }
+        continue
+      }
+      if (!updated.updated) {
+        // A reason means the server refused the address; without one nothing
+        // changed, which is not an error.
+        context.ui.toast.show({
+          title: "Relay",
+          // The rename may have landed before the address was refused: saying
+          // only "the address was left" would drop a change already stored.
+          message:
+            updated.reason !== undefined
+              ? changed
+                ? `${updated.reason} ${name} was renamed; the address was left as it was.`
+                : `${updated.reason} The address was left as it was.`
+              : changed
+                ? `${name} was renamed; the address was left as it was.`
+                : "That is the address it already had. Nothing changed.",
+          variant: updated.reason !== undefined ? "error" : changed ? "success" : "info",
+        })
+        if (changed) await refreshStatus(context, client)
+        return
+      }
       context.ui.toast.show({
         title: "Relay",
-        message:
-          updated.reason !== undefined
-            ? `${updated.reason} The address was left as it was.`
-            : changed
-              ? `${name} was renamed; the address was left as it was.`
-              : "That is the address it already had. Nothing changed.",
-        variant: updated.reason !== undefined ? "error" : changed ? "success" : "info",
+        message: "The address was changed and is being checked.",
+        variant: "success",
       })
-      if (changed) await refreshStatus(context, client)
+      await refreshStatus(context, client)
       return
     }
-    context.ui.toast.show({
-      title: "Relay",
-      message: "The address was changed and is being checked.",
-      variant: "success",
-    })
-    await refreshStatus(context, client)
-    return
   }
   // The name changed and the address was left as it was: say so, rather than
   // a bare refresh that reads like a lost answer.
@@ -1564,41 +1922,60 @@ async function addProxies(context: Context, client: RelayClient): Promise<void> 
     if (text.trim().length > 0) break
     context.ui.toast.show({ title: "Relay", message: "The list was empty.", variant: "warning" })
   }
-  const result = await withWorking(context, "Reading the list", () =>
-    callRpc(context, "Relay", () => client.addProxies({ text: text as string })),
-  )
-  if (!result) return
-  const added = result.added.length
-  // One toast says everything, so the summary is not replaced by a second
-  // message before it can be read.
-  const parts = [`${added} prox${added === 1 ? "y" : "ies"} added`]
-  if (result.duplicates > 0) parts.push(`${result.duplicates} already there`)
-  if (result.invalid.length > 0) parts.push(`${result.invalid.length} could not be read`)
-  // Valid entries that were left out because there were too many: they are
-  // not a read failure, and they are said in their own words.
-  if (result.leftOut !== undefined) parts.push(result.leftOut)
-  if (added > 0) parts.push("the new ones are checked in the background")
-  context.ui.toast.show({
-    title: "Relay",
-    message: parts.join(" - "),
-    variant: added > 0 ? "success" : "warning",
-    duration: 7000,
-  })
-  if (result.invalid.length > 0) {
-    const lines = result.invalid
-      .slice(0, 6)
-      .map((entry) => `${entry.value.length > 0 ? entry.value : "(empty)"}: ${entry.reason}`)
-    if (result.invalid.length > 6) lines.push(`...and ${result.invalid.length - 6} more`)
-    await context.ui.dialog.alert({
-      title: "Some entries were left out",
-      message: `The list had ${result.invalid.length} entr${result.invalid.length === 1 ? "y" : "ies"} that could not be read:\n\n${lines.join("\n")}`,
+  for (;;) {
+    const result = await withWorking(context, "Reading the list", () =>
+      callRpc(context, "Relay", () => client.addProxies({ text: text as string })),
+    )
+    if (!result) {
+      // The call itself failed. The pasted list is the expensive part, and
+      // the retry may be one word away from working, so it is asked for
+      // again with what was pasted already in the box.
+      const again = await askMultiline(context, {
+        title: "Paste your proxy list",
+        description: "One proxy per line, any URL form",
+        initial: text,
+      })
+      if (again === undefined) return
+      text = again
+      continue
+    }
+    const added = result.added.length
+    // One toast says everything, so the summary is not replaced by a second
+    // message before it can be read.
+    const parts = [`${added} prox${added === 1 ? "y" : "ies"} added`]
+    if (result.duplicates > 0) parts.push(`${result.duplicates} already there`)
+    if (result.invalid.length > 0) parts.push(`${result.invalid.length} could not be read`)
+    // Valid entries that were left out because there were too many: they are
+    // not a read failure, and they are said in their own words.
+    if (result.leftOut !== undefined) parts.push(result.leftOut)
+    if (added > 0) parts.push("the new ones are checked in the background")
+    context.ui.toast.show({
+      title: "Relay",
+      message: parts.join(" - "),
+      variant: added > 0 ? "success" : "warning",
+      duration: 7000,
     })
+    if (result.invalid.length > 0) {
+      const lines = result.invalid
+        .slice(0, 6)
+        .map((entry) => `${entry.value.length > 0 ? entry.value : "(empty)"}: ${entry.reason}`)
+      if (result.invalid.length > 6) lines.push(`...and ${result.invalid.length - 6} more`)
+      await context.ui.dialog.alert({
+        title: "Some entries were left out",
+        message: `The list had ${result.invalid.length} entr${result.invalid.length === 1 ? "y" : "ies"} that could not be read:\n\n${lines.join("\n")}`,
+      })
+    }
+    await refreshStatus(context, client)
+    return
   }
-  await refreshStatus(context, client)
 }
 
 /** Start checking every exit without blocking the menu. */
 async function startTestAll(context: Context, client: RelayClient, deep: boolean): Promise<void> {
+  // The deep test replays a captured request's headers, and the session
+  // token is among them: without a capture there is nothing to send.
+  const status = currentStatus()
+  const hasSample = deep && status?.hasRequestSample === true
   if (deep) {
     // A deep check carries the user's OpenCode session token, so the user is
     // told what it does before it does it to every exit at once. The scan
@@ -1606,11 +1983,15 @@ async function startTestAll(context: Context, client: RelayClient, deep: boolean
     // the token, so the set is named as it is.
     const sure = await context.ui.dialog.confirm({
       title: "Send a real request through every exit?",
-      message:
-        "This sends your OpenCode session token through every exit that is not paused, including ones that are used up, cooling down or not tested yet. It is the only check that can tell an address that works from one whose allowance is gone.",
-      label: { confirm: "Send them", cancel: "Not now" },
+      message: hasSample
+        ? "This sends your OpenCode session token through every exit that is not paused, including ones that are used up, cooling down or not tested yet. It is the only check that can tell an address that works from one whose allowance is gone."
+        : "No routed request has been captured in the last 30 minutes, so there are no headers to send. Route one request through any exit first, then run this check.",
+      label: hasSample
+        ? { confirm: "Send them", cancel: "Not now" }
+        : { confirm: "Got it", cancel: "Not now" },
     })
     if (!sure) return
+    if (!hasSample) return
   }
   const result = await callRpc(context, "Relay", () => client.testAll({ deep }))
   if (!result) return
@@ -1638,13 +2019,16 @@ async function resumeAllPaused(context: Context, client: RelayClient, paused: re
   }
   const result = await callRpc(context, "Relay", () => client.resumeAllExits({}))
   if (!result) return
-  await refreshStatus(context, client)
+  await withWorking(context, "Reading the relay", () => refreshStatus(context, client))
   context.ui.toast.show({
     title: "Relay",
+    // Resuming an exit does not make it serve: one whose allowance is gone,
+    // or that is resting, stays out of use. The toast says what changed,
+    // and not more.
     message:
       result.resumed.length === 0
         ? "No exit was paused after all."
-        : `${result.resumed.length} exit${result.resumed.length === 1 ? " is" : "s are"} back in use.`,
+        : `${result.resumed.length} exit${result.resumed.length === 1 ? " is" : "s are"} no longer paused.`,
     variant: result.resumed.length === 0 ? "info" : "success",
   })
 }
@@ -1769,15 +2153,22 @@ async function transferConfig(context: Context, client: RelayClient): Promise<vo
   // A relay deployed by this plugin arrives as a tracked relay: the Vercel
   // project and the account link do not travel, so its Update action does not
   // either.
-  parts.push(
-    "any rules in the file are now in force",
-    "relays deployed by this plugin arrive as tracked ones",
-  )
+  //
+  // The rules only went in with a file that went in whole: an import that
+  // stopped partway may have failed before they were applied, and saying
+  // they are in force then would be wrong.
+  if (result.error === undefined) parts.push("any rules in the file are now in force")
+  parts.push("relays deployed by this plugin arrive as tracked ones")
   context.ui.toast.show({
     title: "Relay",
     message: parts.join(" - "),
+    // An import that stopped partway is a warning, whatever landed: the
+    // checkmark would say the configuration went in, and it did not.
     variant:
-      result.invalid > 0 || result.leftOut !== undefined || result.relays + result.proxies === 0
+      result.invalid > 0 ||
+      result.leftOut !== undefined ||
+      result.error !== undefined ||
+      result.relays + result.proxies === 0
         ? "warning"
         : "success",
     duration: 8000,
@@ -1856,11 +2247,18 @@ async function deployRelay(context: Context, client: RelayClient): Promise<void>
     if (!deployed) return
     context.ui.toast.show({
       title: "Relay",
-      message: `${deployed.name} is deployed in ${deployed.regionLabel}: ${deployed.url}`,
-      variant: "success",
-      duration: 8000,
+      // A relay that answered with a status has a problem of its own - a
+      // wrong access token, most of all - and "did not answer" would send
+      // the user looking in the wrong place.
+      message: deployed.reachable
+        ? `${deployed.name} is deployed in ${deployed.regionLabel}: ${deployed.url}`
+        : deployed.status !== undefined && deployed.status > 0
+          ? `${deployed.name} is deployed in ${deployed.regionLabel}, but it answered HTTP ${deployed.status}: ${deployed.url}`
+          : `${deployed.name} is deployed in ${deployed.regionLabel}, but it did not answer yet: ${deployed.url}`,
+      variant: deployed.reachable ? "success" : "warning",
+      duration: deployed.reachable ? 8000 : 9000,
     })
-    await refreshStatus(context, client)
+    await withWorking(context, "Reading the relay", () => refreshStatus(context, client))
     return
   }
 
@@ -1874,24 +2272,43 @@ async function deployRelay(context: Context, client: RelayClient): Promise<void>
     ),
   )
   if (!deployed) return
-  if (deployed.failed.length === 0) {
+  // A relay that answered with a status has a problem of its own - a wrong
+  // access token, most of all - and "did not answer" would send the user
+  // looking in the wrong place.
+  const unreachable = deployed.deployed.filter((relay) => !relay.reachable)
+  const trouble = unreachable.map((relay) =>
+    relay.status !== undefined && relay.status > 0
+      ? `${relay.name} answered HTTP ${relay.status}`
+      : `${relay.name} did not answer yet`,
+  )
+  if (deployed.failed.length === 0 && trouble.length === 0) {
     context.ui.toast.show({
       title: "Relay",
       message: `${deployed.deployed.length} relays deployed.`,
       variant: "success",
       duration: 8000,
     })
-  } else {
+  } else if (deployed.failed.length > 0) {
     await context.ui.dialog.alert({
       title: "Some regions failed",
       message: [
         `${deployed.deployed.length} deployed, ${deployed.failed.length} failed.`,
         "",
         ...deployed.failed.map((entry) => `${entry.region}: ${entry.message}`),
+        ...(trouble.length > 0 ? ["", ...trouble.map((entry) => `${entry}.`)] : []),
       ].join("\n"),
     })
+  } else {
+    context.ui.toast.show({
+      title: "Relay",
+      // A deploy that reached the relay but not a working one is not a
+      // success, and the toast says what each relay answered.
+      message: `${deployed.deployed.length} relays deployed, but ${trouble.join("; ")}.`,
+      variant: "warning",
+      duration: 9000,
+    })
   }
-  await refreshStatus(context, client)
+  await withWorking(context, "Reading the relay", () => refreshStatus(context, client))
 }
 
 /** Pick one region, or several at once. */
@@ -1938,6 +2355,8 @@ async function askFor(
   emptyMessage: string,
 ): Promise<string | undefined> {
   for (;;) {
+    // The plugin may have been reloaded: the question would never be asked.
+    if (activationGone(context)) return undefined
     const answer = await context.ui.dialog.prompt(question)
     if (answer === undefined) return undefined
     if (answer.trim().length > 0) return answer.trim()
@@ -1962,7 +2381,7 @@ async function trackRelay(context: Context, client: RelayClient): Promise<void> 
     "Give the relay a name before tracking it.",
   )
   if (name === undefined) return
-  const url = await askFor(
+  const askedUrl = await askFor(
     context,
     {
       title: "Where does it answer?",
@@ -1971,7 +2390,8 @@ async function trackRelay(context: Context, client: RelayClient): Promise<void> 
     },
     "Enter the address the relay answers on.",
   )
-  if (url === undefined) return
+  if (askedUrl === undefined) return
+  let url = askedUrl
   const region = await context.ui.dialog.select<string>({
     title: "Where does it run?",
     options: [
@@ -1980,7 +2400,7 @@ async function trackRelay(context: Context, client: RelayClient): Promise<void> 
     ],
   })
   if (region === undefined) return
-  const access = await askFor(
+  const askedAccess = await askFor(
     context,
     {
       title: "Its access token",
@@ -1989,24 +2409,60 @@ async function trackRelay(context: Context, client: RelayClient): Promise<void> 
     },
     "Enter the relay's access token.",
   )
-  if (access === undefined) return
-  const added = await withWorking(context, `Checking ${name}`, () =>
-    callRpc(context, "Relay", () =>
-      client.addRelay({
-        name,
-        url,
-        access,
-        ...(region.length > 0 ? { region } : {}),
-      }),
-    ),
-  )
-  if (!added) return
-  context.ui.toast.show({
-    title: "Relay",
-    message: added.reachable ? `${added.name} is tracked.` : `${added.name} is tracked but did not answer.`,
-    variant: added.reachable ? "success" : "warning",
-  })
-  await refreshStatus(context, client)
+  if (askedAccess === undefined) return
+  let access = askedAccess
+  for (;;) {
+    const added = await withWorking(context, `Checking ${name}`, () =>
+      callRpc(context, "Relay", () =>
+        client.addRelay({
+          name,
+          url,
+          access,
+          ...(region.length > 0 ? { region } : {}),
+        }),
+      ),
+    )
+    if (added) {
+      context.ui.toast.show({
+        title: "Relay",
+        // A relay that answered with a status has a problem of its own - a
+        // wrong access token, most of all - and "did not answer" would send
+        // the user looking in the wrong place.
+        message: added.reachable
+          ? `${added.name} is tracked.`
+          : added.status !== undefined && added.status > 0
+            ? `${added.name} is tracked, but it answered HTTP ${added.status}.`
+            : `${added.name} is tracked but did not answer.`,
+        variant: added.reachable ? "success" : "warning",
+      })
+      await refreshStatus(context, client)
+      return
+    }
+    // The call was refused. The address is the user's own word, and the
+    // likeliest refusal is the address itself - an http:// one, or one that
+    // carries credentials - so it is asked for again with what was typed
+    // already in the box. The token is not shown again: it is a credential,
+    // and the relay that was refused it keeps it.
+    const nextUrl = await context.ui.dialog.prompt({
+      title: "Where does it answer?",
+      description: "The relay's https address",
+      placeholder: "https://my-relay.vercel.app",
+      value: url,
+    })
+    if (nextUrl === undefined) return
+    url = nextUrl.trim()
+    const nextAccess = await askFor(
+      context,
+      {
+        title: "Its access token",
+        description: "The relay's x-relay-key token",
+        placeholder: "access token",
+      },
+      "Enter the relay's access token.",
+    )
+    if (nextAccess === undefined) return
+    access = nextAccess
+  }
 }
 
 /** Add a Vercel account, so a relay can be deployed later. */

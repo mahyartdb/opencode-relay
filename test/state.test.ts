@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import { relayRequest } from "../src/lib/routing.ts"
-import type { RelayRecord } from "../src/lib/types.ts"
+import type { ProxyRecord, RelayRecord } from "../src/lib/types.ts"
 import { registerHooks, ROTATE_DELAY_MS } from "../src/server/hooks.ts"
 import { RelayState, StorageError, COOLDOWN_BASE_MS } from "../src/server/state.ts"
 
@@ -35,6 +35,32 @@ async function makeState(): Promise<RelayState> {
 }
 
 /**
+ * A storage whose writes to some keys fail, as a full disk would.
+ *
+ * The keys are named after the setup has been written: the exits have to be
+ * on the disk before the disk starts refusing them.
+ */
+function failingStorage() {
+  const store = new Map<string, unknown>()
+  const failing = new Set<string>()
+  return {
+    store,
+    fail: (...keys: string[]) => {
+      for (const key of keys) failing.add(key)
+    },
+    get: async (key: string) => store.get(key),
+    set: async (key: string, value: unknown) => {
+      if (failing.has(key)) throw new Error(`ENOSPC: no space left on device (${key})`)
+      store.set(key, value)
+    },
+    remove: async (key: string) => {
+      store.delete(key)
+    },
+    scan: async () => ({ entries: [] }),
+  }
+}
+
+/**
  * One storage, many states: every new instance only knows what the last one
  * wrote, so loading it is a real restart.
  */
@@ -66,6 +92,19 @@ function relay(id: string, name = id): RelayRecord {
     url: `https://${id}.example.com`,
     access: "test-access",
     accountId: "",
+    enabled: true,
+    status: "untested",
+    createdAt: Date.now(),
+  }
+}
+
+/** A proxy record that only needs its health and its switch to be interesting. */
+function proxy(id: string, name = id): ProxyRecord {
+  return {
+    kind: "proxy",
+    id,
+    name,
+    url: `http://${id}.example.com:8080`,
     enabled: true,
     status: "untested",
     createdAt: Date.now(),
@@ -111,6 +150,38 @@ async function makeHooks() {
     announceTraffic: () => {},
   })
   return { state, hooks: made.hooks }
+}
+
+/** The free model the routed-hook tests send, so the request hook has a way out. */
+const freeModel = { id: "iceman-free", name: "Iceman", cost: [{ input: 0, output: 0 }] }
+
+/** Register the real hooks over a catalog that can route, so a request leaves through an exit. */
+async function makeRoutedHooks() {
+  const state = await makeState()
+  await state.setEnabled(true)
+  const made = makeContext()
+  await registerHooks(made.context as never, {
+    state,
+    catalog: {
+      list: async () => [freeModel],
+      resolve: (models: readonly { id: string; name: string }[], id: string) =>
+        models.find((model) => model.id === id) ?? { id, name: id },
+    } as never,
+    bridge: { ready: true, origin: "http://127.0.0.1:1", key: "bridge-key" } as never,
+    tester: { canary: async () => "inconclusive" } as never,
+    announceTraffic: () => {},
+  })
+  return { state, hooks: made.hooks }
+}
+
+/** One request of a session, told apart by the kind OpenCode sends beside its agent loop. */
+function routedRequest(kind: "primary" | "title") {
+  return {
+    sessionID: "session-title",
+    model: { id: freeModel.id, providerID: "opencode" },
+    kind,
+    request: new Request("https://opencode.ai/inference/openai/v1/models"),
+  }
 }
 
 /** A request as the plugin would send it through one relay. */
@@ -700,7 +771,6 @@ describe("attribution", () => {
     state.noteRelayed("session-1", "iceman-free", "relay-1")
 
     expect(state.relayedBy("session-1", "iceman-free", now + 10 * 60_000)).toBe("relay-1")
-    expect(state.wasRelayed("session-1", "iceman-free")).toBe(true)
     // Half an hour later it is no longer this failure's exit.
     expect(state.relayedBy("session-1", "iceman-free", now + 31 * 60_000)).toBeUndefined()
   })
@@ -880,6 +950,9 @@ describe("the response and retry hooks on a 409", () => {
     await state.setStrategy("exhausted")
 
     state.markExhausted("relay-a", Date.now() + 60 * 60_000, "The allowance is gone.")
+    // The choice moves through the rules writer, so give the queued write the
+    // tick it needs before reading the rules back.
+    await Bun.sleep(0)
 
     expect(state.settings().activeExitId).toBe("relay-b")
   })
@@ -1000,3 +1073,235 @@ describe("the response and retry hooks on a 409", () => {
     expect(retry.decision).toEqual({ retry: true, delay: ROTATE_DELAY_MS })
   })
 })
+
+describe("a write that does not land", () => {
+  test("a pause that was not written leaves the exit in use", async () => {
+    const storage = failingStorage()
+    const state = new RelayState(storage as never)
+    await state.load()
+    await state.addRelay(relay("relay-1"))
+    await state.setHealth("relay-1", { status: "ready" })
+    storage.fail("relays")
+
+    await expect(state.setExitEnabled("relay-1", false)).rejects.toThrow(/relays/)
+
+    // The disk still has the exit enabled, so the memory must not call it
+    // paused: it would stop serving now and come back at the next restart.
+    expect(state.exit("relay-1")?.enabled).toBe(true)
+    expect(state.pickExit({ advance: false }).exit?.id).toBe("relay-1")
+  })
+
+  test("a verdict that was not written does not undo a live one", async () => {
+    const storage = failingStorage()
+    const state = new RelayState(storage as never)
+    await state.load()
+    await state.addRelay(relay("relay-1"))
+    await state.setHealth("relay-1", { status: "unreachable" })
+    const epochBefore = state.healthEpoch("relay-1")
+    // A live failure armed a rest before the failing verdict: it is the rest
+    // the rollback would put back over the success.
+    state.markFailure("relay-1", "The exit did not answer.", "unreachable")
+    await Bun.sleep(0)
+    storage.fail("relays")
+
+    // The failing verdict is in flight when a real request proves the exit
+    // works. The rollback must not put the stale record back over that answer,
+    // and must not rewind the epoch the answer bumped.
+    const failing = state.setHealth("relay-1", { status: "bad" })
+    state.markSuccess("relay-1", 120)
+    const epochAfterLive = state.healthEpoch("relay-1")
+    await expect(failing).rejects.toThrow(/relays/)
+
+    expect(state.exit("relay-1")?.status).toBe("ready")
+    expect(state.exit("relay-1")?.status).not.toBe("bad")
+    expect(state.healthEpoch("relay-1")).toBeGreaterThanOrEqual(epochBefore)
+    expect(state.healthEpoch("relay-1")).toBe(epochAfterLive)
+    // The rest the failure armed went with the success, and the rollback must
+    // not bring the older one back: it would bench an exit that just served.
+    expect(state.coolingExits()).not.toContain("relay-1")
+    expect(state.pickExit({ advance: false }).exit?.id).toBe("relay-1")
+  })
+
+  test("a pause that was not written leaves a live verdict alone", async () => {
+    const storage = failingStorage()
+    const state = new RelayState(storage as never)
+    await state.load()
+    await state.addRelay(relay("relay-1"))
+    await state.setHealth("relay-1", { status: "ready" })
+    storage.fail("relays")
+
+    // The pause is in flight when a real request fails through the exit. The
+    // rollback may take back the switch and nothing else: the live failure
+    // and the rest it armed are what the next request has to obey, and the
+    // old record would show a working exit whose rest only lives in memory.
+    const pausing = state.setExitEnabled("relay-1", false)
+    state.markFailure("relay-1", "The exit did not answer.", "unreachable")
+    await expect(pausing).rejects.toThrow(/relays/)
+
+    expect(state.exit("relay-1")?.enabled).toBe(true)
+    expect(state.exit("relay-1")?.status).toBe("unreachable")
+    expect(state.exit("relay-1")?.coolingUntil).toBeDefined()
+    expect(state.coolingExits()).toContain("relay-1")
+  })
+
+  test("a restore that was not written puts the provider's window back", async () => {
+    const storage = failingStorage()
+    const state = new RelayState(storage as never)
+    await state.load()
+    await state.addRelay(relay("relay-1"))
+    await state.setHealth("relay-1", { status: "ready" })
+    // Twenty hours, so a made-up one-hour window cannot pass for it.
+    const window = Date.now() + 20 * 60 * 60_000
+    state.noteEgress("relay-1", "203.0.113.7")
+    state.markSpent("203.0.113.7", window)
+    await state.setHealth("relay-1", { status: "exhausted", exhaustedUntil: window })
+    storage.fail("relays")
+
+    await expect(state.restoreExhausted(() => true)).rejects.toThrow(/relays/)
+
+    // The exit is used up again, and the address with it: a rollback that
+    // forgot the address would send the next request out from the allowance
+    // the provider already refused.
+    expect(state.exit("relay-1")?.status).toBe("exhausted")
+    expect(state.isSpent("203.0.113.7")).toBe(true)
+    // The window is the provider's, not one this plugin made up.
+    expect(state.spentUntil("203.0.113.7")).toBe(window)
+  })
+
+  test("a restore whose proxies could not be written reports only the relays", async () => {
+    const storage = failingStorage()
+    const state = new RelayState(storage as never)
+    await state.load()
+    await state.addRelay(relay("relay-1"))
+    await state.addProxy(proxy("proxy-1"))
+    await state.setHealth("relay-1", { status: "ready" })
+    await state.setHealth("proxy-1", { status: "ready" })
+    const window = Date.now() + 60 * 60_000
+    await state.setHealth("relay-1", {
+      status: "exhausted",
+      exhaustedUntil: window,
+      egress: "203.0.113.10",
+    })
+    await state.setHealth("proxy-1", {
+      status: "exhausted",
+      exhaustedUntil: window,
+      egress: "203.0.113.11",
+    })
+    state.markSpent("203.0.113.10", window)
+    state.markSpent("203.0.113.11", window)
+    // The relays are written; the proxies are not.
+    storage.fail("proxies")
+
+    const result = await state.restoreExhausted(() => true)
+
+    // The relay landed, so it is restored. The proxy was rolled back: it is
+    // not reported as restored, and is named with the exits still out of use
+    // instead — the caller must not toast a restore the next request cannot
+    // use.
+    expect(result.restored).toEqual(["relay-1"])
+    expect(result.stillUsedUp).toEqual(["proxy-1"])
+    expect(result.failed?.key).toBe("proxies")
+    expect(state.exit("relay-1")?.status).toBe("reachable")
+    expect(state.exit("proxy-1")?.status).toBe("exhausted")
+    // The proxy's address is spent again: the provider's window is live, and
+    // dropping it would send the next request out from the refused allowance.
+    expect(state.isSpent("203.0.113.11")).toBe(true)
+    expect(state.spentUntil("203.0.113.11")).toBe(window)
+    // The relay's write landed, so its address stays forgiven.
+    expect(state.isSpent("203.0.113.10")).toBe(false)
+  })
+
+  test("a resume that was not written leaves the proxies paused too", async () => {
+    const storage = failingStorage()
+    const state = new RelayState(storage as never)
+    await state.load()
+    await state.addRelay(relay("relay-1"))
+    await state.addProxy(proxy("proxy-1"))
+    await state.setExitEnabled("relay-1", false)
+    await state.setExitEnabled("proxy-1", false)
+    storage.fail("relays")
+
+    await expect(state.resumeAll()).rejects.toThrow(/relays/)
+
+    expect(state.exit("relay-1")?.enabled).toBe(false)
+    // The proxies were put back into use before the relays were written and
+    // never reached the disk: a proxy enabled in memory here would serve
+    // traffic the next restart takes away.
+    expect(state.exit("proxy-1")?.enabled).toBe(false)
+  })
+})
+
+describe("the picker's reasons", () => {
+  test("a used-up exit says so, not why the caller left it out", async () => {
+    const state = await readyState(["relay-1", "relay-2"])
+    await state.setHealth("relay-1", {
+      status: "exhausted",
+      exhaustedUntil: Date.now() + 60 * 60_000,
+    })
+    const exclusion = { id: "relay-1", reason: "the local proxy bridge is not running" }
+
+    const pick = state.pickExit({
+      advance: false,
+      exclude: [exclusion, { id: "relay-2", reason: exclusion.reason }],
+    })
+
+    const spent = pick.skipped.find((exit) => exit.id === "relay-1")
+    expect(spent?.reason).toContain("used up")
+    // The exclusion names a problem this exit does not have: its allowance is
+    // what is gone, and saying otherwise hides the reason behind a stranger's.
+    expect(spent?.reason).not.toBe(exclusion.reason)
+
+    // An exit that could serve but was left out still gets the caller's reason.
+    const excluded = pick.skipped.find((exit) => exit.id === "relay-2")
+    expect(excluded?.reason).toBe(exclusion.reason)
+  })
+})
+
+describe("a title request beside the agent loop", () => {
+  test("a transport failure blames the agent loop's exit, not the title's", async () => {
+    const { state, hooks } = await makeRoutedHooks()
+    await state.addRelay(relay("relay-a"))
+    await state.addRelay(relay("relay-b"))
+    await state.setHealth("relay-a", { status: "ready" })
+    await state.setHealth("relay-b", { status: "ready" })
+    // Round robin, so the two requests really leave through different exits.
+    await state.setStrategy("round-robin")
+
+    const primary = routedRequest("primary")
+    const title = routedRequest("title")
+    await hooks.get("http.request")?.(primary as never)
+    await hooks.get("http.request")?.(title as never)
+
+    expect(primary.request.headers.get("x-relay-id")).toBe("relay-a")
+    expect(title.request.headers.get("x-relay-id")).toBe("relay-b")
+
+    // The title's answer arrives before the retry does, so its started mark is
+    // cleared and the agent loop's request is the only one still waiting. A
+    // real answer through the relay carries the exit's own headers.
+    await hooks.get("http.response")?.({
+      ...responseInput("session-title", "relay-b", 200, {
+        "content-type": "application/json",
+        "x-relay-egress": "203.0.113.30",
+      }),
+      kind: "title",
+    } as never)
+
+    // The retry hook is not told which request failed, so the agent loop's
+    // note has to win: the title's newer note is a different request's, and
+    // blaming its exit would retire a healthy one.
+    const retry = {
+      sessionID: "session-title",
+      model: { id: freeModel.id, providerID: "opencode" },
+      error: { message: "The connection was refused." },
+      attempt: 1,
+      decision: { retry: false } as { retry: boolean; delay?: number },
+    }
+    await hooks.get("retry")?.(retry as never)
+
+    expect(state.exit("relay-a")?.status).toBe("unreachable")
+    expect(state.coolingExits()).toContain("relay-a")
+    expect(state.exit("relay-b")?.status).toBe("ready")
+    expect(state.coolingExits()).not.toContain("relay-b")
+  })
+})
+

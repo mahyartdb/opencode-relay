@@ -175,8 +175,13 @@ export class ProxyBridge {
       return new Response(response.body, { status: response.status, headers: out })
     } catch (error) {
       // The detail belongs in the plugin's note, not in a response that could
-      // be read by anything else on loopback.
-      console.error("[relay] proxy request failed", error)
+      // be read by anything else on loopback. The log is shared with the
+      // host, so it carries the message and nothing else: a fetch error may
+      // carry the proxy address, and the address carries the credentials.
+      console.error(
+        "[relay] proxy request failed",
+        error instanceof Error ? error.message : String(error),
+      )
       return bridgeError(502, { error: "The proxy could not carry the request" })
     }
   }

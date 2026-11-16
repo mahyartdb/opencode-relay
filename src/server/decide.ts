@@ -10,7 +10,7 @@
 import { PROVIDER_ID, type DirectPolicy, type ExitRecord, type SkippedExit } from "../lib/types.ts"
 import { isFree, isSelected, type RoutableModel } from "../lib/routing.ts"
 import type { ModelCatalog } from "./models.ts"
-import type { RelayState } from "./state.ts"
+import { proxyExclusions, type RelayState } from "./state.ts"
 
 /** What stopped a request from being routed, or that nothing did. */
 export type DecisionKind =
@@ -163,10 +163,7 @@ export async function decideModel(
     // The bridge stops the proxies, not the relays: another exit may still
     // carry the request, and going direct would spend the user's own
     // allowance on a request that had a way out.
-    const exclude = state
-      .exits()
-      .filter((exit) => exit.kind === "proxy")
-      .map((exit) => ({ id: exit.id, reason: "the local proxy bridge is not running" }))
+    const exclude = proxyExclusions(state)
     const withoutProxies = state.pickExit({ advance: false, exclude })
     if (withoutProxies.exit !== undefined) {
       const moved = input.advance ? state.pickExit({ advance: true, exclude }) : withoutProxies
@@ -194,11 +191,8 @@ export async function decideModel(
   }
 
   // The exit will actually carry the request, so this is the only place the
-  // rotation advances. The state is usually unchanged since the first pick,
-  // so the second call is deterministic and its answer is the committed
-  // truth -- but "usually" is not "always": an answer from an earlier request
-  // can retire the exit between the two picks. When the committed pick finds
-  // nothing, the stale first pick must not be sent anyway.
+  // rotation advances. The first pick did not move it, so this second one
+  // lands on the same exit and only moves the position for the next request.
   if (input.advance) {
     const moved = state.pickExit({ advance: true })
     if (moved.exit !== undefined) {

@@ -276,16 +276,6 @@ async function judge(response: Response, deep = false): Promise<Verdict> {
   return { status: "ready", ok: true, code }
 }
 
-/** The name a proxy gets when the user did not give one. */
-export function proxyName(url: string): string {
-  try {
-    const parsed = new URL(url)
-    return parsed.hostname
-  } catch {
-    return "proxy"
-  }
-}
-
 /** Everything the checks need from the world. */
 export interface TesterDeps {
   readonly state: RelayState
@@ -373,7 +363,11 @@ export class Tester {
       // read is capped like every other body this plugin reads.
       const text = (await readBody(response, 3000, 8000)) ?? ""
       const match = /^ip=(.+)$/m.exec(text)
-      const egress = match?.[1]?.trim()
+      // The address goes into the avoid list that every relay receives, so
+      // it has to be an address: anything else would travel to every relay
+      // as a header, and one that is too long would make their requests
+      // fail.
+      const egress = egressAddress(match?.[1])
       // A 2xx alone is not proof: the trace endpoint answers in `ip=` lines,
       // so a proxy that returns anything else is not answering the ping.
       const ok = response.ok && /^ip=.+/m.test(text)
@@ -448,6 +442,20 @@ export class Tester {
     let target = UPSTREAM_MODELS
     let init: RequestInit = { method: "GET", headers, signal }
     if (mode === "deep") {
+      // The deep check replays a routed request's headers, and the session
+      // token is among them. With no recent routed request there is nothing
+      // to replay: the request would go out credential-less, OpenCode would
+      // refuse it, and nothing would be learned. Saying so — and changing
+      // nothing — is the honest answer.
+      if (sample === undefined) {
+        return {
+          ok: false,
+          status: "unknown",
+          code: 0,
+          ms: elapsed(),
+          note: "No routed request has been captured in the last 30 minutes, so there are no headers to send. Route one request through any exit first, then run this check.",
+        }
+      }
       const model = sample?.modelID ?? (await this.pickModel(exit, signal))
       if (model === undefined) {
         // Nothing was learned about the exit: the test could not be built.
@@ -687,9 +695,13 @@ export class Tester {
     // A deep check carries the user's OpenCode session token, so it only goes
     // to the exits that are in use: a paused exit was put aside on purpose,
     // and the token has no business going there.
+    //
+    // An imported exit is left out of every sweep: its address came from a
+    // shared file, and a check that promotes it would put the user's session
+    // token on its way there. The user tests it themselves.
     const queue = this.deps.state
       .exits()
-      .filter((exit) => mode !== "deep" || exit.enabled)
+      .filter((exit) => (mode !== "deep" || exit.enabled) && exit.imported !== true)
     // An exit added while the scan runs (a paste finishing in the background,
     // a deploy landing mid-scan) must not sit untested because the queue was
     // copied once at the start: it is appended here, so the workers drain it
@@ -703,6 +715,10 @@ export class Tester {
         // A deep check carries the session token, so a paused exit is left
         // out of it as well.
         if (mode === "deep" && !exit.enabled) continue
+        // An imported exit is left out of every sweep: its address came from
+        // a shared file, and a check that promotes it would put the user's
+        // session token on its way there.
+        if (exit.imported === true) continue
         queue.push(exit)
         added += 1
       }

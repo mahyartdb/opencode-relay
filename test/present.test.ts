@@ -279,6 +279,7 @@ describe("exitsMenuOptions", () => {
           exit({ id: "p1", kind: "proxy" }),
         ],
         exhausted: ["p1"],
+        hasRequestSample: true,
       }),
     )
 
@@ -369,9 +370,19 @@ describe("exitsMenuOptions", () => {
     expect(allPaused.some((option) => option.value.kind === "test-all")).toBe(true)
 
     const oneLive = exitsMenuOptions(
-      status({ exits: [exit({ id: "fra", enabled: false }), exit({ id: "p1", kind: "proxy" })] }),
+      status({
+        exits: [exit({ id: "fra", enabled: false }), exit({ id: "p1", kind: "proxy" })],
+        hasRequestSample: true,
+      }),
     )
     expect(oneLive.some((option) => option.value.kind === "test-all-deep")).toBe(true)
+
+    // Without a recent request there is nothing to replay, so the row is
+    // absent even though an unpaused exit could take the token.
+    const noSample = exitsMenuOptions(
+      status({ exits: [exit({ id: "fra" }), exit({ id: "p1", kind: "proxy" })] }),
+    )
+    expect(noSample.some((option) => option.value.kind === "test-all-deep")).toBe(false)
   })
 
   test("restore only when an exit is used up, and says how many", () => {
@@ -743,7 +754,7 @@ describe("summarizePill", () => {
           exhausted: ["p1"],
         }),
       ),
-    ).toBe("relay · Frankfurt · 0 req · 1 used up")
+    ).toBe("relay · Frankfurt · 0 req · 1 used up · /relay")
   })
 
   test("does not present selected models as traffic", () => {
@@ -776,7 +787,7 @@ describe("summarizePill", () => {
       summarizePill(
         status({ ...chosen, exits: [exit({ id: "fra" }), exit({ id: "ams" })], exhausted: ["fra"] }),
       ),
-    ).toBe("relay · next exit · 0 req · 1 used up")
+    ).toBe("relay · next exit · 0 req · 1 used up · /relay")
 
     for (const broken of ["unreachable", "blocked", "bad"] as const) {
       expect(
@@ -787,8 +798,37 @@ describe("summarizePill", () => {
             skipped: ["fra"],
           }),
         ),
-      ).toBe("relay · next exit · 0 req")
+      ).toBe("relay · next exit · 0 req · 1 failing · /relay")
     }
+  })
+
+  test("says a failing exit is failing, and leaves a paused one out of the count", () => {
+    const failing = exit({ id: "ams", status: "unreachable", statusLabel: "not answering" })
+    const pausedBad = exit({ id: "old", status: "bad", statusLabel: "failing", enabled: false })
+    const skipped = ["ams", "old"]
+    const pill = summarizePill(
+      status({
+        exits: [exit({ id: "fra" }), failing, pausedBad],
+        skipped,
+        skippedExitIds: skipped,
+      }),
+    )
+
+    // A dead backup is a thing to look at before the exit in use runs out.
+    expect(pill).toBe("relay · next exit · 0 req · 1 failing · /relay")
+    expect(pill?.endsWith("· 1 failing · /relay")).toBe(true)
+
+    // The user paused this one on purpose: it is not a failure to report, so
+    // counting it would keep the pill warning about the user's own choice.
+    const pausedOnly = summarizePill(
+      status({
+        exits: [exit({ id: "fra" }), pausedBad],
+        skipped: ["old"],
+        skippedExitIds: ["old"],
+      }),
+    )
+    expect(pausedOnly).toBe("relay · next exit · 0 req")
+    expect(pausedOnly).not.toContain("failing")
   })
 })
 

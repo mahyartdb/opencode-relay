@@ -73,16 +73,35 @@ export function proxyKey(url: string): string {
   return `${prefix}${auth}${address.toLowerCase()}`
 }
 
-/** Remove credentials from an entry before it is shown in an error. */
+/**
+ * Remove credentials from an entry before it is shown in an error.
+ *
+ * The output is drawn in a dialog, so every control character is stripped:
+ * the entry comes from a paste, and an escape sequence in it would be drawn
+ * as one.
+ */
 export function redactProxyToken(value: string): string {
-  const at = value.lastIndexOf("@")
+  const clean = value.replace(/[\u0000-\u001f\u007f-\u009f\u001b]/g, "")
+  const at = clean.lastIndexOf("@")
   if (at >= 0) {
-    const after = value.slice(at + 1)
+    const after = clean.slice(at + 1)
     // Only the part after the @ may be shown when it really is an address:
     // the swapped host:port@user:pass shape would otherwise show the
-    // password where the host belongs.
+    // password where the host belongs. When both sides read as host:port
+    // the sides are ambiguous, so nothing after the @ is shown either. The
+    // scheme is stripped before the check: it is never part of the address,
+    // and it keeps the other side from parsing.
+    const scheme = /^([a-z][a-z0-9+.-]*):\/\//i.exec(clean)
+    const before = splitHostPort(
+      (scheme === null ? clean : clean.slice(scheme[0].length)).slice(0, at),
+    )
     const address = splitHostPort(after)
-    const shown = address !== undefined && address.port !== undefined ? after.slice(0, 100) : "***"
+    const shown =
+      address !== undefined &&
+      address.port !== undefined &&
+      !(before !== undefined && before.port !== undefined)
+        ? after.slice(0, 100)
+        : "***"
     return `***@${shown}`.slice(0, 120)
   }
   // The legacy host:port:user[:pass] shapes carry credentials after the
@@ -90,16 +109,16 @@ export function redactProxyToken(value: string): string {
   // number after the first colon is a port, so what follows it is a
   // credential. Anything else after the first colon is a credential itself,
   // so the password never reaches the screen.
-  const scheme = /^([a-z][a-z0-9+.-]*):\/\//i.exec(value)
+  const scheme = /^([a-z][a-z0-9+.-]*):\/\//i.exec(clean)
   const prefix = scheme ? scheme[0] : ""
-  const rest = scheme ? value.slice(prefix.length) : value
+  const rest = scheme ? clean.slice(prefix.length) : clean
   const bracket = rest.startsWith("[") ? rest.indexOf("]") : -1
   const first = rest.indexOf(":", bracket >= 0 ? bracket : 0)
-  if (first < 0) return value.slice(0, 120)
+  if (first < 0) return clean.slice(0, 120)
   const second = rest.indexOf(":", first + 1)
   const port = second < 0 ? rest.slice(first + 1) : rest.slice(first + 1, second)
   if (!/^\d+$/.test(port)) return `${prefix}${rest.slice(0, first)}:***`.slice(0, 120)
-  if (second < 0) return value.slice(0, 120)
+  if (second < 0) return clean.slice(0, 120)
   return `${prefix}${rest.slice(0, second)}:***`.slice(0, 120)
 }
 
@@ -259,11 +278,37 @@ function readToken(
   }
 
   // host:port@user:pass puts the credentials after the address. Detect it by
-  // noticing that the part after the @ is not a host:port at all.
+  // noticing that the part after the @ is not a host:port at all — but when
+  // BOTH sides read as host:port, the sides are ambiguous, and the address
+  // is the side that looks like a machine: an IP literal, localhost, or a
+  // dotted name. Taking the other side would store a password as a port and
+  // show it in the menu.
   if (auth !== undefined && splitHostPort(auth) !== undefined && splitHostPort(hostPart) === undefined) {
     const swap = auth
     auth = hostPart
     hostPart = swap
+  } else if (auth !== undefined && splitHostPort(auth) !== undefined && splitHostPort(hostPart) !== undefined) {
+    const looksLikeAddress = (side: string): boolean => {
+      const parsedSide = splitHostPort(side)
+      if (parsedSide === undefined || parsedSide.port === undefined) return false
+      const name = parsedSide.host.toLowerCase()
+      return net.isIP(name) !== 0 || name === "localhost" || /\.[a-z]/i.test(name)
+    }
+    if (!looksLikeAddress(hostPart) && looksLikeAddress(auth)) {
+      const swap = auth
+      auth = hostPart
+      hostPart = swap
+    } else if (!looksLikeAddress(hostPart) && !looksLikeAddress(auth)) {
+      // Neither side is a machine, so there is no way to tell the address
+      // from the credentials: `intranet:3128@bob:44731` could be either.
+      // Guessing would store a password as a port and show it in the menu,
+      // so the entry is refused and the user is told how to write it.
+      invalid(
+        redactProxyToken(value),
+        "that address is ambiguous: write it as scheme://user:pass@host:port",
+      )
+      return
+    }
   }
 
   const parsed = splitHostPort(hostPart)
@@ -353,30 +398,33 @@ function jsonEntry(item: unknown): string | { readonly reason: string } {
 /**
  * Show a failed JSON entry with its credentials removed.
  *
- * The address may sit under any key, at any depth, so every string in the
- * entry is run through the same masking: an entry whose password lives under
- * "proxies[0].url" must not show it either.
+ * The address may sit under any key, at any depth, and a credential may be
+ * a number or a list as easily as a string, so every value under a
+ * credential-named key is masked outright, and every string anywhere goes
+ * through the same masking as a pasted line: an entry whose password lives
+ * under "proxies[0].url" must not show it either.
  */
 function redactJsonEntry(item: unknown): string {
-  const walk = (value: unknown): unknown => {
-    if (Array.isArray(value)) return value.map(walk)
+  const walk = (value: unknown, key: string | undefined): unknown => {
+    // A field whose name says it holds a credential is masked whole,
+    // whatever its type: a numeric password or a list of tokens is one too.
+    if (
+      key !== undefined &&
+      /pass|pwd|secret|token|key|user|auth|credential|login|session|cookie/i.test(key)
+    ) {
+      return "***"
+    }
+    if (Array.isArray(value)) return value.map((inner) => walk(inner, undefined))
     if (value !== null && typeof value === "object") {
       const record: Record<string, unknown> = {}
-      for (const [key, inner] of Object.entries(value as Record<string, unknown>)) {
-        // A field whose name says it holds a credential is masked outright;
-        // the rest go through the same masking as a pasted line, because the
-        // address may sit under any key at all.
-        record[key] =
-          typeof inner === "string" &&
-          /pass|pwd|secret|token|key|user|auth|credential|login|session|cookie/i.test(key)
-            ? "***"
-            : walk(inner)
+      for (const [name, inner] of Object.entries(value as Record<string, unknown>)) {
+        record[name] = walk(inner, name)
       }
       return record
     }
     return typeof value === "string" ? redactProxyToken(value) : value
   }
-  return JSON.stringify(walk(item))
+  return JSON.stringify(walk(item, undefined))
 }
 
 /** An entry refused before it could become a token, with its reason. */

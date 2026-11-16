@@ -362,6 +362,11 @@ describe("the deep check", () => {
         choices: [{ index: 0, message: { role: "assistant", content: "ok" } }],
       }),
     )
+    made.state.noteSample({
+      modelID: "iceman-free",
+      path: "/inference/openai/v1/chat/completions",
+      headers: { authorization: "Bearer test-token" },
+    })
 
     const result = await made.tester.test(made.id, "deep")
 
@@ -379,6 +384,11 @@ describe("the deep check", () => {
           headers: { "content-type": "text/html" },
         }),
     )
+    made.state.noteSample({
+      modelID: "iceman-free",
+      path: "/inference/openai/v1/chat/completions",
+      headers: { authorization: "Bearer test-token" },
+    })
 
     const result = await made.tester.test(made.id, "deep")
 
@@ -390,6 +400,11 @@ describe("the deep check", () => {
 
   test("an empty 200 is not a model answer", async () => {
     const made = await modelServer(() => new Response("", { status: 200 }))
+    made.state.noteSample({
+      modelID: "iceman-free",
+      path: "/inference/openai/v1/chat/completions",
+      headers: { authorization: "Bearer test-token" },
+    })
 
     const result = await made.tester.test(made.id, "deep")
 
@@ -405,6 +420,11 @@ describe("the deep check", () => {
           headers: { location: "https://login.example.com/" },
         }),
     )
+    made.state.noteSample({
+      modelID: "iceman-free",
+      path: "/inference/openai/v1/chat/completions",
+      headers: { authorization: "Bearer test-token" },
+    })
 
     const result = await made.tester.test(made.id, "deep")
 
@@ -415,12 +435,33 @@ describe("the deep check", () => {
 
   test("a 204 answer is not a model answer", async () => {
     const made = await modelServer(() => new Response(null, { status: 204 }))
+    made.state.noteSample({
+      modelID: "iceman-free",
+      path: "/inference/openai/v1/chat/completions",
+      headers: { authorization: "Bearer test-token" },
+    })
 
     const result = await made.tester.test(made.id, "deep")
 
     expect(result.ok).toBe(false)
     expect(result.status).toBe("bad")
     expect(result.code).toBe(204)
+  })
+
+  test("a deep test with no captured request sends nothing and changes nothing", async () => {
+    let reached = false
+    const made = await setup(() => {
+      reached = true
+      return new Response("{}", { status: 200 })
+    })
+
+    const result = await made.tester.test(made.id, "deep")
+
+    expect(result.status).toBe("unknown")
+    expect(result.note).toContain("captured")
+    expect(reached).toBe(false)
+    // Nothing was learned, so the exit keeps the verdict it already had.
+    expect(made.state.exit(made.id)?.status).toBe("untested")
   })
 })
 

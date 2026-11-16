@@ -234,6 +234,15 @@ export interface ExitHealth {
   readonly coolingUntil?: number
   /** How many consecutive live failures armed the current rest. */
   readonly failures?: number
+  /**
+   * True while the exit came from an imported file and nobody has tested it.
+   *
+   * An imported address is one a shared file chose, and an automatic check
+   * must not put it into live routing: the first real request would carry
+   * the user's session token to it. Only a test the user asked for clears
+   * this.
+   */
+  readonly imported?: boolean
   readonly createdAt: number
 }
 
@@ -314,6 +323,14 @@ export interface DeployedRelay {
   readonly region: string
   readonly regionLabel: string
   readonly reachable: boolean
+  /**
+   * The HTTP status the relay answered with, or 0 when it did not answer.
+   *
+   * A relay that answers with a status has a problem of its own - a wrong
+   * access token, most of all - and telling the user that it did not answer
+   * sends them looking in the wrong place.
+   */
+  readonly status?: number
 }
 
 /** The credentials in a proxy URL are never shown, and never sent to the TUI. */

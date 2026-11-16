@@ -68,6 +68,33 @@ function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
+/**
+ * How long the response hook waits for a canary before it stops waiting.
+ *
+ * The canary's own budget is longer, because a check somebody asked for may
+ * take its time. A 429 cannot: the answer is held open while the canary runs,
+ * so an exit that has not answered by now has told the caller nothing, which
+ * is the same verdict as a canary that timed out.
+ */
+const INLINE_CANARY_MS = 10_000
+
+/** Settle with the fallback when the work has not answered in time. */
+function bounded<T>(work: Promise<T>, ms: number, fallback: T): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => resolve(fallback), ms)
+    work.then(
+      (value) => {
+        clearTimeout(timer)
+        resolve(value)
+      },
+      (error: unknown) => {
+        clearTimeout(timer)
+        reject(error)
+      },
+    )
+  })
+}
+
 /** The headers of a request, as a sample a test can replay. */
 function headerRecord(request: Request): Record<string, string> {
   const headers: Record<string, string> = {}
@@ -137,9 +164,13 @@ export async function registerHooks(
       if (input.model.providerID !== PROVIDER_ID) return
       const sessionID = input.sessionID ?? ""
       const modelId = input.model.id
+      // The kind of request this is: a session's title request runs beside
+      // its agent loop with the same model, and the two must not take each
+      // other's notes.
+      const kind = input.kind ?? "primary"
       // Every request starts with a clean slate: an answer from an earlier
       // request must never be blamed on an exit this one did not use.
-      state.forgetRelayed(sessionID, modelId)
+      state.forgetRelayed(sessionID, modelId, kind)
 
       // Before anything is routed, the request must actually be OpenCode's own
       // traffic. A provider named "opencode" with another baseURL carries that
@@ -213,16 +244,10 @@ export async function registerHooks(
         headers: headerRecord(input.request),
       })
 
-      // The traffic counter moved, and the footer counts requests that went
-      // through an exit. Saying so is what keeps the number on the pill true
-      // while traffic happens.
-      announceTraffic()
-
       // The exit is chosen here; the in-memory timing starts now. A request that
       // never reaches the exit still has a started mark, which the response
       // hook clears when the failure surfaces.
-      state.noteStarted(sessionID, modelId)
-      state.noteRequest(exit.id)
+      state.noteStarted(sessionID, modelId, exit.id, kind)
       try {
         if (exit.kind === "relay") {
           input.request = relayRequest(input.request, {
@@ -248,7 +273,13 @@ export async function registerHooks(
         if (settings.direct === "never") throw error
         return
       }
-      state.noteRelayed(sessionID, modelId, exit.id)
+      // The request count moved, and the footer counts requests that went
+      // through an exit. Saying so is what keeps the number on the pill true
+      // while traffic happens. A rewrite that threw never left the machine,
+      // so neither the count nor the announcement happens for it.
+      state.noteRequest(exit.id)
+      announceTraffic()
+      state.noteRelayed(sessionID, modelId, exit.id, kind)
       state.noteDecision({
         modelId,
         routed: true,
@@ -274,14 +305,25 @@ export async function registerHooks(
     "http.response",
     async (input) => {
       if (input.model.providerID !== PROVIDER_ID) return
-      if (!state.settings().enabled) return
       const exitId = exitIdOf(input.request)
       if (exitId === undefined) return
       const exit = state.exit(exitId)
       if (!exit) return
       const sessionID = input.sessionID ?? ""
       const modelId = input.model.id
-      const timing = state.finishTiming(sessionID, modelId)
+      // The kind of request this is: a session's title request runs beside
+      // its agent loop with the same model, and the two must not take each
+      // other's timing or blame.
+      const kind = input.kind ?? "primary"
+      // Routing was switched off while this request was in flight. Nothing
+      // can be concluded about the exit, but the request's own mark must be
+      // cleared: one left behind would make the retry hook take the request
+      // for one that is still waiting for an answer.
+      if (!state.settings().enabled) {
+        state.finishTiming(sessionID, modelId, kind)
+        return
+      }
+      const timing = state.finishTiming(sessionID, modelId, kind)
       const answer = readResponseState(input.response)
       // The bridge answers a few requests itself: a wrong secret, a target it
       // does not allow, a proxy that is gone. Those answers say nothing about
@@ -303,7 +345,7 @@ export async function registerHooks(
             code >= 500
               ? "The proxy could not carry the request."
               : "The local proxy bridge refused the request.",
-        })
+        }, kind)
         return
       }
       // A proxy has no relay headers to say where the answer came from: reaching
@@ -341,7 +383,7 @@ export async function registerHooks(
           reached: true,
           until: known,
           note: "The relay asked for another instance.",
-        })
+        }, kind)
         return
       }
 
@@ -369,7 +411,7 @@ export async function registerHooks(
             kind: "server",
             reached,
             note,
-          })
+          }, kind)
           return
         }
         state.markSuccess(exitId, timing)
@@ -394,13 +436,13 @@ export async function registerHooks(
             reached: true,
             until,
             note: "OpenCode rate-limited this exit.",
-          })
+          }, kind)
           return
         }
 
         // The request was refused. Ask once more, tiny, through the same exit:
         // only a canary that is refused too says the address is used up.
-        const canary = await tester.canary(exit)
+        const canary = await bounded(tester.canary(exit), INLINE_CANARY_MS, "inconclusive")
         if (canary === "spent") {
           const wait = parseRetryAfter(input.response.headers.get("retry-after"))
           const until = wait > 0 ? Date.now() + Math.min(wait, 24 * 60 * 60_000) : nextResetAt()
@@ -419,7 +461,7 @@ export async function registerHooks(
             reached: true,
             until,
             note: "The free allowance of this exit is gone.",
-          })
+          }, kind)
           return
         }
         // Either the request itself was refused, or the canary could not tell.
@@ -443,7 +485,7 @@ export async function registerHooks(
           reached: true,
           until,
           note,
-        })
+        }, kind)
         return
       }
 
@@ -460,7 +502,7 @@ export async function registerHooks(
           kind: "server",
           reached: true,
           note: `The exit answered with HTTP ${code}.`,
-        })
+        }, kind)
         return
       }
 
@@ -478,7 +520,7 @@ export async function registerHooks(
             kind: "server",
             reached: false,
             note,
-          })
+          }, kind)
           return
         }
         state.markBlocked(exitId, `OpenCode refused this exit (HTTP ${code}).`)
@@ -488,7 +530,7 @@ export async function registerHooks(
           kind: "blocked",
           reached: true,
           note: `OpenCode refused this exit (HTTP ${code}).`,
-        })
+        }, kind)
         return
       }
 
@@ -501,7 +543,7 @@ export async function registerHooks(
           kind: "server",
           reached: true,
           note: `The exit answered with HTTP ${code}.`,
-        })
+        }, kind)
         return
       }
 
@@ -517,7 +559,7 @@ export async function registerHooks(
           kind: "refused",
           reached,
           note,
-        })
+        }, kind)
         return
       }
 
@@ -529,7 +571,7 @@ export async function registerHooks(
         kind: "server",
         reached,
         note: `The exit answered with HTTP ${code}.`,
-      })
+      }, kind)
     },
     { providerID: PROVIDER_ID },
   )
@@ -542,9 +584,27 @@ export async function registerHooks(
     async (input) => {
       if (input.model.providerID !== PROVIDER_ID) return
       const sessionID = input.sessionID ?? ""
-      const exitId = state.relayedBy(sessionID, input.model.id)
-      if (exitId === undefined) return
-      const exit = state.exit(exitId)
+      // Which exit the failure belongs to.
+      //
+      // The response hook knows which exit answered, and the request hook
+      // leaves a note of the requests that are still waiting for an answer.
+      // The retry hook is told neither, and a session's title request runs
+      // beside its agent loop with the same model: a title that fails must
+      // not rest the exit that is serving the loop. The exit is only certain
+      // when one of the two names it.
+      const context: FailureContext | undefined = state.failureFor(sessionID, input.model.id)
+      const inflight = state.inflightExits(sessionID, input.model.id)
+      // No started mark at all means the only note is one a caller left
+      // without driving the request hook: it is still an answer, and
+      // better than none.
+      const loneNote = inflight.length === 0 ? state.relayedBy(sessionID, input.model.id) : undefined
+      const certainExit = context?.exitId ?? (inflight.length === 1 ? inflight[0] : loneNote)
+      // The exit the failure is blamed on when it is not certain: the agent
+      // loop's note is the best guess, and a wrong guess only means the
+      // retry does not rotate.
+      const blamedExit = certainExit ?? state.relayedBy(sessionID, input.model.id)
+      if (blamedExit === undefined) return
+      const exit = state.exit(blamedExit)
       if (!exit) return
       if (input.attempt >= MAX_ROTATION_RETRIES) return
 
@@ -564,13 +624,18 @@ export async function registerHooks(
         // the request hook would only replace the real error with a routing
         // failure, so the decision is left alone. The mark is taken before the
         // gate, so the exit that just failed cannot count as the way out.
-        state.markFailure(exitId, input.error.message ?? "The exit did not answer.", "unreachable")
+        //
+        // The rest is only taken when the exit is certain: a rest on the
+        // wrong exit takes a working one out of use for the rest of the
+        // session, which is worse than not resting any.
+        if (certainExit !== undefined) {
+          state.markFailure(certainExit, input.error.message ?? "The exit did not answer.", "unreachable")
+        }
         if (!canRetry()) return
         input.decision = { retry: true, delay: ROTATE_DELAY_MS }
         return
       }
 
-      const context: FailureContext | undefined = state.failureFor(sessionID, input.model.id)
       if (status < 400) {
         // The response hook rejected this as not a model answer (a 204, a
         // redirect, an HTML page, or a relay answer that never reached its
@@ -626,9 +691,10 @@ export async function registerHooks(
 
       if (status >= 500) {
         // The response hook counted and rested this failure already. Only a
-        // retry that arrived without that context needs its single mark here.
-        if (context === undefined) {
-          state.markFailure(exitId, input.error.message ?? `HTTP ${status}`, "bad")
+        // retry that arrived without that context needs its single mark here,
+        // and only when the exit is certain.
+        if (context === undefined && certainExit !== undefined) {
+          state.markFailure(certainExit, input.error.message ?? `HTTP ${status}`, "bad")
         }
         if (!canRetry()) return
         input.decision = { retry: true, delay: ROTATE_DELAY_MS }

@@ -105,6 +105,15 @@ export interface StatusLike {
   readonly skippedExitIds?: readonly string[]
   readonly routedCount: number
   readonly modelCount: number
+  /**
+   * Whether a routed request has been captured in the last 30 minutes.
+   *
+   * The deep test replays the captured headers, and the session token is
+   * among them: without one, the check would be refused on credentials that
+   * were never carried. A status from an older server says nothing, which
+   * the deep rows treat as "unknown".
+   */
+  readonly hasRequestSample?: boolean
   /** What the last request's routing decision was, when one was recorded. */
   readonly lastDecision?: {
     readonly modelId: string
@@ -248,6 +257,25 @@ function usedUpNote(status: StatusLike): string {
     return exit === undefined || exit.enabled
   }).length
   return used > 0 ? ` · ${used} used up` : ""
+}
+
+/**
+ * The suffix that counts the exits that are failing, or an empty string.
+ *
+ * An exit the user paused is out of use on purpose, and an exit nobody
+ * tested is not known to be bad. An exit that is not answering, is blocked
+ * or is failing is a thing to look at: without this the user learns about a
+ * dead backup the moment the exit they rely on runs out, which is too late
+ * to do anything about it.
+ */
+function failingNote(status: StatusLike): string {
+  const failing = status.exits.filter(
+    (exit) =>
+      exit.enabled &&
+      !isUsableExit(exit, status) &&
+      (exit.status === "unreachable" || exit.status === "blocked" || exit.status === "bad"),
+  ).length
+  return failing > 0 ? ` · ${failing} failing` : ""
 }
 
 /** What the menu says about the current selection. */
@@ -465,8 +493,12 @@ export function exitsMenuOptions(status: StatusLike): DialogSelectOption<ExitLis
     // The deep test sends the session token to every exit that is not
     // paused, so it is offered only when there is one to send it to: a
     // row that always ends in "nothing to send it through" would spend the
-    // user's confirmation on a no-op.
-    if (status.exits.some((exit) => exit.enabled)) {
+    // user's confirmation on a no-op. It also replays the captured headers,
+    // so it needs a recent routed request to replay.
+    if (
+      status.exits.some((exit) => exit.enabled) &&
+      status.hasRequestSample === true
+    ) {
       options.push({
         title: "Deep test all exits",
         value: { kind: "test-all-deep" },
@@ -770,6 +802,10 @@ export function pillTone(status: StatusLike | undefined, reachable = true): Pill
   // A used-up exit is a thing to look at, so it comes before the busy one
   // too: a scan must not hide it in word or color.
   if (status.enabled && usedUp > 0) return "warn"
+  // An exit that is not answering, is blocked or is failing is a thing to
+  // look at as well: the user has to know before the exit they rely on runs
+  // out, not after.
+  if (status.enabled && failingNote(status).length > 0) return "warn"
   // A test run reads as busy even while routing is off: the scan is what is
   // happening right now, whatever the switch says.
   const scanning = status.scanning
@@ -811,19 +847,28 @@ export function summarizePill(status: StatusLike | undefined, reachable = true):
   const scanning = status.scanning
   if (scanning !== undefined && scanning.done < scanning.total) {
     const progress = `testing ${scanning.done}/${scanning.total}`
-    // The states that need a look are not hidden by the test run: a used-up
-    // exit, or one that cannot serve, is said in the same breath.
+    // With routing off a used-up exit costs nothing, so the line says what
+    // the test run is doing and nothing else.
+    if (!status.enabled) return `relay off · ${progress} · /relay`
+    // Only the worst thing is named: the line is short, and the states that
+    // need the /relay hint are the ones whose tail the footer cuts off.
     const usedUp = status.exhausted.filter((id) => {
       const exit = status.exits.find((item) => item.id === id)
       return exit === undefined || exit.enabled
     }).length
-    const problems = [
-      ...(status.routedCount === 0 ? ["nothing routed"] : []),
-      ...(usableExits(status).length === 0 ? ["no exit can serve"] : []),
-      ...(usedUp > 0 ? [`${usedUp} used up`] : []),
-    ]
-    const tail = problems.length > 0 ? ` · ${problems.join(" · ")} · /relay` : ""
-    return status.enabled ? `relay on · ${progress}${tail}` : `relay off · ${progress} · /relay`
+    const failing = failingNote(status)
+    const worst =
+      usableExits(status).length === 0
+        ? "no exit can serve"
+        : status.routedCount === 0
+          ? "nothing routed"
+          : failing.length > 0
+            ? failing.slice(3)
+            : usedUp > 0
+              ? `${usedUp} used up`
+              : undefined
+    const tail = worst !== undefined ? ` · ${worst} · /relay` : ""
+    return `relay on · ${progress}${tail}`
   }
   if (!status.enabled) {
     // The pill is how someone finds the menu again, so it always shows once
@@ -862,5 +907,11 @@ export function summarizePill(status: StatusLike | undefined, reachable = true):
     !isUsableExit(named, status)
       ? trafficCount(status)
       : (named.stats?.requests ?? 0)
-  return `relay · ${routingName(status)} · ${traffic} req${usedUpNote(status)}`
+  // A used-up exit is a state the user has to look at, and so is one that is
+  // failing, so the line carries the suffix that leads to the menu even when
+  // the traffic looks fine.
+  const usedUp = usedUpNote(status)
+  const failing = failingNote(status)
+  const look = usedUp.length > 0 || failing.length > 0
+  return `relay · ${routingName(status)} · ${traffic} req${usedUp}${failing}${look ? " · /relay" : ""}`
 }
