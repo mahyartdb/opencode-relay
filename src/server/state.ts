@@ -665,13 +665,37 @@ export class RelayState {
     try {
       await this.enqueueWrite(PROXIES_KEY, () => writeProxies(this.storage, this.proxyList))
     } catch (error) {
-      // The edit did not land, so the old proxy goes back: a reader would
-      // otherwise see an address the disk does not have. The rest and the
-      // counters go with it, or the proxy would keep resting on a map entry
-      // that is gone.
-      this.proxyList = this.proxyList.map((proxy) => (proxy.id === id ? current : proxy))
-      if (coolingBefore !== undefined) this.cooling.set(id, coolingBefore)
-      if (statsBefore !== undefined) this.stats.set(id, statsBefore)
+      // The edit did not land, so it is taken back. A URL change is a new
+      // exit: the old record goes back whole, with the rest and the counters
+      // it carried, or the proxy would keep resting on a map entry that is
+      // gone. A rename is not: only the fields this call set go back, and
+      // only where the record still holds what this call wrote — a verdict
+      // that landed while the write was in flight owns the record now.
+      if (urlChanged) {
+        this.proxyList = this.proxyList.map((proxy) => (proxy.id === id ? current : proxy))
+        if (coolingBefore !== undefined) this.cooling.set(id, coolingBefore)
+        if (statsBefore !== undefined) this.stats.set(id, statsBefore)
+      } else {
+        const live = this.proxy(id)
+        if (live !== undefined) {
+          // The name and the url go back only where the live record still
+          // holds what this call wrote; a verdict that landed meanwhile is
+          // left alone.
+          const restored: { name?: string; url?: string } = {}
+          if (input.name !== undefined && live.name === input.name) {
+            restored.name = current.name
+          }
+          if (input.url !== undefined && live.url === input.url) {
+            restored.url = current.url
+          }
+          if (restored.name !== undefined || restored.url !== undefined) {
+            const next = { ...live, ...restored } as ProxyRecord
+            this.proxyList = this.proxyList.map((proxy) =>
+              proxy.id === id ? next : proxy,
+            )
+          }
+        }
+      }
       throw error
     }
     return next
@@ -1279,6 +1303,11 @@ export class RelayState {
   /** Whether an exit may serve a request now. */
   private usable(exit: ExitRecord, now: number): boolean {
     if (!exit.enabled) return false
+    // An imported exit nobody has tested stays out of service, whatever its
+    // record says: a test that proved nothing must not leave the mark half
+    // cleared, and a sweep that runs beside such a test must not promote the
+    // address into live routing.
+    if (exit.imported === true) return false
     // A live "used up" latch outranks every failure verdict: a transport
     // failure that lands after the exhaustion verdict would otherwise clear
     // the latch in all but name, and the exit would serve an address whose
@@ -1601,7 +1630,25 @@ export class RelayState {
         proxy.id === id ? (next as ProxyRecord) : proxy,
       )
     }
-    await this.replaceExit(next)
+    try {
+      await this.replaceExit(next)
+    } catch (error) {
+      // The write did not land, so the mark goes back: memory must not say
+      // the exit is tested when the disk still says imported — the next
+      // restart would read the mark back and the menu would not lie, but the
+      // running process would serve an address it never vetted.
+      const marked: ExitRecord = { ...next, imported: true }
+      if (marked.kind === "relay") {
+        this.relayList = this.relayList.map((relay) =>
+          relay.id === id ? (marked as RelayRecord) : relay,
+        )
+      } else {
+        this.proxyList = this.proxyList.map((proxy) =>
+          proxy.id === id ? (marked as ProxyRecord) : proxy,
+        )
+      }
+      throw error
+    }
   }
 
   /** A request was sent through this exit. */
@@ -2121,25 +2168,6 @@ export class RelayState {
     return started === undefined ? undefined : Date.now() - started.at
   }
 
-  /**
-   * The exits the requests of this session and model are still waiting for.
-   *
-   * The retry hook is not told which request failed, so the ones still
-   * waiting are the candidates: a request that already answered is not the
-   * one that failed. More than one exit means the request is not pinned on
-   * an exit, and the caller must not rest one.
-   */
-  inflightExits(sessionID: string, modelID: string, now = Date.now()): readonly string[] {
-    const prefix = attributionPrefix(sessionID, modelID)
-    const exits: string[] = []
-    for (const [key, entry] of this.started) {
-      if (!key.startsWith(prefix)) continue
-      if (now - entry.at > ATTRIBUTION_TTL_MS) continue
-      if (!exits.includes(entry.exitId)) exits.push(entry.exitId)
-    }
-    return exits
-  }
-
   /** What the last answer for this session and model said, for the retry hook. */
   noteFailureContext(
     sessionID: string,
@@ -2154,6 +2182,37 @@ export class RelayState {
       }
     }
     this.failures.set(attributionKey(sessionID, modelID, kind), context)
+  }
+
+  /**
+   * The exit the agent loop's own request used, when the retry hook can be
+   * certain of it.
+   *
+   * A session's title request runs beside its agent loop with the same
+   * model, and the retry hook is told neither: resting a title's exit for
+   * the loop's failure would keep retrying a broken one, and resting the
+   * loop's exit for a title's failure would bench a working one. Only the
+   * loop's own marks count — the request it started, the answer recorded
+   * for it, or a note a caller left without driving the request hook. The
+   * two marks name the exit when they agree, either one names it alone, and
+   * anything else is not certain.
+   */
+  primaryExitForRetry(sessionID: string, modelID: string, now = Date.now()): string | undefined {
+    const key = attributionKey(sessionID, modelID, PRIMARY_KIND)
+    const started = this.started.get(key)
+    const failure = this.failures.get(key)
+    const liveStart =
+      started !== undefined && now - started.at <= ATTRIBUTION_TTL_MS ? started : undefined
+    const liveFailure =
+      failure !== undefined && now - failure.at <= 60_000 ? failure : undefined
+    if (liveStart !== undefined && liveFailure !== undefined) {
+      return liveStart.exitId === liveFailure.exitId ? liveStart.exitId : undefined
+    }
+    if (liveStart !== undefined) return liveStart.exitId
+    if (liveFailure !== undefined) return liveFailure.exitId
+    const relayed = this.relayed.get(key)
+    if (relayed !== undefined && now - relayed.at <= ATTRIBUTION_TTL_MS) return relayed.exitId
+    return undefined
   }
 
   /**

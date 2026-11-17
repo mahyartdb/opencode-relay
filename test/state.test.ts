@@ -1303,5 +1303,49 @@ describe("a title request beside the agent loop", () => {
     expect(state.exit("relay-b")?.status).toBe("ready")
     expect(state.coolingExits()).not.toContain("relay-b")
   })
+
+  test("a title that answered 400 does not decide which exit a transport failure rests", async () => {
+    const { state, hooks } = await makeRoutedHooks()
+    await state.addRelay(relay("relay-a"))
+    await state.addRelay(relay("relay-b"))
+    await state.setHealth("relay-a", { status: "ready" })
+    await state.setHealth("relay-b", { status: "ready" })
+    // Round robin, so the two requests really leave through different exits.
+    await state.setStrategy("round-robin")
+
+    // The title leaves through relay-a and is refused by the request itself
+    // (a 400): the exit answered, so relay-a stays ready.
+    const title = routedRequest("title")
+    await hooks.get("http.request")?.(title as never)
+    expect(title.request.headers.get("x-relay-id")).toBe("relay-a")
+    await hooks.get("http.response")?.({
+      ...responseInput("session-title", "relay-a", 400),
+      kind: "title",
+    } as never)
+    expect(state.exit("relay-a")?.status).toBe("ready")
+
+    // The agent loop leaves through relay-b and dies at the transport: the
+    // failure is relay-b's, and only relay-b may rest for it.
+    const primary = routedRequest("primary")
+    await hooks.get("http.request")?.(primary as never)
+    expect(primary.request.headers.get("x-relay-id")).toBe("relay-b")
+
+    const retry = {
+      sessionID: "session-title",
+      model: { id: freeModel.id, providerID: "opencode" },
+      error: { message: "The connection was refused." },
+      attempt: 1,
+      decision: { retry: false } as { retry: boolean; delay?: number },
+    }
+    await hooks.get("retry")?.(retry as never)
+
+    expect(state.exit("relay-b")?.status).toBe("unreachable")
+    expect(state.coolingExits()).toContain("relay-b")
+    // The newer failure of another kind must not point the rest at relay-a:
+    // resting it would keep retrying the exit that cannot carry the loop.
+    expect(state.exit("relay-a")?.status).toBe("ready")
+    expect(state.coolingExits()).not.toContain("relay-a")
+    expect(state.pickExit({ advance: false }).exit?.id).toBe("relay-a")
+  })
 })
 

@@ -15,11 +15,9 @@ import {
   refreshStatus,
   relayClient,
   releaseRelayMenu,
-  resetRefresh,
   reportError,
 } from "./dialogs.tsx"
 import { renderRelayPill } from "./pill.tsx"
-import { clearState } from "./state.ts"
 
 /**
  * The part of the host's resolved theme the pill reads. The host's
@@ -173,6 +171,8 @@ export default Plugin.define({
     // not be painted as dead, and the heartbeat owns the dead verdict from
     // then on. Nothing is toasted here: the pill says it, and a toast on a
     // plugin that is merely starting would be a wrong word.
+    let firstPaintTimer: ReturnType<typeof setTimeout> | undefined
+    let wakeFirstPaint: (() => void) | undefined
     const firstPaint = async (): Promise<void> => {
       for (const wait of [250, 500, 1000, 2000, 4000]) {
         // A dead activation must not keep asking: the retries stop the
@@ -181,7 +181,17 @@ export default Plugin.define({
         if (!alive) return
         const result = await refreshStatus(context, client, { quiet: true })
         if (result.ok) return
-        await new Promise((resolve) => setTimeout(resolve, wait))
+        await new Promise<void>((resolve) => {
+          // The wait is tracked so the cleanup can take the timer back: a
+          // timer that outlives the plugin would keep the process alive for
+          // nothing. Waking the waiter with it lets the loop reach the
+          // `alive` check and stop, instead of hanging on the await.
+          firstPaintTimer = setTimeout(resolve, wait)
+          wakeFirstPaint = resolve
+        })
+        clearTimeout(firstPaintTimer)
+        firstPaintTimer = undefined
+        wakeFirstPaint = undefined
       }
       if (!alive) return
       // The server is still not there: the pill says so, and the heartbeat
@@ -197,18 +207,26 @@ export default Plugin.define({
       stopModels()
       releaseSlot()
       clearInterval(heartbeat)
+      if (firstPaintTimer !== undefined) {
+        clearTimeout(firstPaintTimer)
+        firstPaintTimer = undefined
+      }
+      // The retry loop wakes on the cleanup, sees the dead activation and
+      // stops, instead of hanging on its await.
+      wakeFirstPaint?.()
+      wakeFirstPaint = undefined
       // The keymap layer belongs to the host, which releases it right after
       // this cleanup runs; there is no handle to call.
-      clearState()
       // The menu guard lives in a module that outlives this activation: a
       // plugin that is reloaded with its menu open would otherwise stay
-      // locked out of its own menu. The refresh latch lives in the same kind
-      // of module, and a new activation must not join the old promise.
+      // locked out of its own menu.
       releaseRelayMenu(token)
-      resetRefresh()
       // The activation is over, so anything it started stops drawing: a menu
       // that is still running must not toast into, or close, the dialogs of
-      // the plugin that replaced it.
+      // the plugin that replaced it. The footer state and the refresh latch
+      // go with it, but only when this activation is really the last one —
+      // a cleanup that runs after the replacement's setup must not wipe the
+      // replacement's state.
       endActivation(token)
     }
   },

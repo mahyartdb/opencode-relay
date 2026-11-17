@@ -1497,6 +1497,60 @@ describe("the server half", () => {
     }
   })
 
+  test("a deep test that proves nothing leaves an imported exit imported", async () => {
+    const store = new Map<string, unknown>()
+    const storage = {
+      get: async (key: string) => store.get(key),
+      set: async (key: string, value: unknown) => {
+        store.set(key, value)
+      },
+      remove: async (key: string) => {
+        store.delete(key)
+      },
+      scan: async () => ({ entries: [] }),
+    }
+    const state = new RelayState(storage as never)
+    await state.load()
+    const tester = new Tester({ state, announce: async () => {} })
+    const handlers = createHandlers({
+      state,
+      catalog: {} as never,
+      bridge: {} as never,
+      tester,
+      announce: async () => {},
+    })
+    await handlers.setEnabled({ enabled: true }, {} as never)
+
+    const imported = (await handlers.importConfig(
+      {
+        json: JSON.stringify({
+          version: 1,
+          relays: [{ name: "imported relay", url: "http://127.0.0.1:9", access: ACCESS }],
+          proxies: [],
+        }),
+      },
+      {} as never,
+    )) as { relays: number }
+    expect(imported.relays).toBe(1)
+    const relayExit = state.relays()[0]!
+    expect(relayExit.imported).toBe(true)
+
+    // No routed request was ever captured, so a deep test has no headers to
+    // replay and can learn nothing.
+    const result = (await handlers.testExit({ id: relayExit.id, deep: true }, {} as never)) as {
+      ok: boolean
+      status: string
+    }
+    expect(result.status).toBe("unknown")
+
+    // The mark must survive a test that proved nothing: the ten-minute sweep
+    // promotes via the api check, and an unvetted address must not ride it.
+    expect(state.exit(relayExit.id)?.imported).toBe(true)
+    const swept = state.pickExit({ advance: false })
+    expect(swept.exit).toBeUndefined()
+    expect(swept.skipped.map((entry) => entry.id)).toContain(relayExit.id)
+  })
+
   test("an imported relay is tracked only, never an update target", async () => {
     const app = await start()
     try {

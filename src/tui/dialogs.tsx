@@ -43,7 +43,7 @@ import {
   type ExitListAction,
   type MenuAction,
 } from "./present.ts"
-import { currentStatus, isReachable, markReachable, publishStatus, type RelayModel, type RelayStatus } from "./state.ts"
+import { currentStatus, isReachable, markReachable, publishStatus, clearState, type RelayModel, type RelayStatus } from "./state.ts"
 
 /** The typed client for the relay contract, so both ends speak the same shapes. */
 export function relayClient(context: Context) {
@@ -513,7 +513,17 @@ export function beginActivation(): number {
 
 /** End an activation: everything it started stops touching the screen. */
 export function endActivation(token: number): void {
-  if (token === activation) activation += 1
+  // Only the activation that is on screen ends itself: a cleanup that runs
+  // after the host has already set up the replacement must not wipe the new
+  // activation's footer state or its refresh latch.
+  if (token === activation) {
+    activation += 1
+    // The footer goes quiet, and the refresh latch is released: the same
+    // reset a new activation would do for itself, done here for one whose
+    // cleanup really is the last one.
+    clearState()
+    resetRefresh()
+  }
 }
 
 /**

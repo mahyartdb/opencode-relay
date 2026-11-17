@@ -921,10 +921,15 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
 
     /** Test one exit: an OpenCode request, or a tiny real model request. */
     testExit: async (input) => {
-      // The user asked for this exit by name, so an imported one is now
-      // theirs: it may enter service.
-      await state.markTested(input.id)
       const result = await tester.test(input.id, input.deep ? "deep" : "api")
+      // The user asked for this exit by name, so a test that saw an answer
+      // makes an imported one theirs: it may enter service. A test that
+      // proved nothing (no captured request to replay, a paused exit) has
+      // not earned that: clearing the mark anyway would let the sweep put
+      // an unvetted address into live routing.
+      if (result.status !== "unknown") {
+        await state.markTested(input.id)
+      }
       announceChanged(announce, "exit tested")
       return {
         ok: result.ok,

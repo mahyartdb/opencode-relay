@@ -586,19 +586,16 @@ export async function registerHooks(
       const sessionID = input.sessionID ?? ""
       // Which exit the failure belongs to.
       //
-      // The response hook knows which exit answered, and the request hook
-      // leaves a note of the requests that are still waiting for an answer.
-      // The retry hook is told neither, and a session's title request runs
-      // beside its agent loop with the same model: a title that fails must
-      // not rest the exit that is serving the loop. The exit is only certain
-      // when one of the two names it.
+      // The retry hook is told neither the request nor the answer, and a
+      // session's title request runs beside its agent loop with the same
+      // model. Only the agent loop's own marks can make an exit certain
+      // enough to rest: a rest on a title's exit would keep a broken one in
+      // use, and a rest on the loop's exit for a title's failure would bench
+      // a working one. `context` (which still falls back across kinds) is
+      // read only for what the failure *was* — it never decides which exit
+      // is rested.
+      const certainExit = state.primaryExitForRetry(sessionID, input.model.id)
       const context: FailureContext | undefined = state.failureFor(sessionID, input.model.id)
-      const inflight = state.inflightExits(sessionID, input.model.id)
-      // No started mark at all means the only note is one a caller left
-      // without driving the request hook: it is still an answer, and
-      // better than none.
-      const loneNote = inflight.length === 0 ? state.relayedBy(sessionID, input.model.id) : undefined
-      const certainExit = context?.exitId ?? (inflight.length === 1 ? inflight[0] : loneNote)
       // The exit the failure is blamed on when it is not certain: the agent
       // loop's note is the best guess, and a wrong guess only means the
       // retry does not rotate.
