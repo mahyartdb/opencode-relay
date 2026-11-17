@@ -642,6 +642,11 @@ export class RelayState {
         url: input.url,
         enabled: current.enabled,
         status: "untested" as Status,
+        // The flag travels with the edit: a new address the user typed is
+        // theirs, but the auto-test the handler runs afterwards must not be
+        // the thing that clears the imported mark — only a test the user
+        // asked for by name does that.
+        ...(current.imported === true ? { imported: true } : {}),
         createdAt: current.createdAt,
       }
       this.cooling.delete(id)

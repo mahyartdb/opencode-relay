@@ -456,7 +456,13 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
   const checkUntested = (): void => {
     const run = async (): Promise<void> => {
       await tester.scan("api")
-      if (state.exits().some((exit) => exit.status === "untested")) {
+      // The re-sweep only happens when something the sweep can reach is still
+      // untested: an imported exit is never swept, and counting it here would
+      // double-test every exit the sweep did reach.
+      const sweepable = state.exits().some(
+        (exit) => exit.imported !== true && exit.status === "untested",
+      )
+      if (sweepable) {
         await tester.scan("api")
       }
     }
@@ -947,9 +953,14 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
       const deep = input.deep === true
       const exits = state.exits()
       // A deep check carries the user's OpenCode session token, so it only
-      // goes to the exits that are in use. The count is the one the scan will
+      // goes to the exits that are in use, and an imported exit is never
+      // swept: its address came from a shared file, and only a test the user
+      // asked for by name may send it. The count is the one the scan will
       // really make, so the toast cannot promise checks that never run.
-      const total = deep ? exits.filter((exit) => exit.enabled).length : exits.length
+      const scannable = exits.filter(
+        (exit) => exit.imported !== true && (deep ? exit.enabled : true),
+      )
+      const total = scannable.length
       if (total === 0 || state.scanning() !== undefined) {
         return { total, started: false }
       }

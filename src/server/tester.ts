@@ -662,10 +662,13 @@ export class Tester {
   scan(mode: TestMode = "api"): Promise<void> {
     if (this.running !== undefined) return this.running
     // A deep check carries the user's OpenCode session token, so it only
-    // goes to the exits that are in use. The count says how many checks this
-    // run will really make.
+    // goes to the exits that are in use, and an imported exit is never
+    // swept: only a test the user asked for by name may send to it. The
+    // count says how many checks this run will really make.
     const exits = this.deps.state.exits()
-    const total = mode === "deep" ? exits.filter((exit) => exit.enabled).length : exits.length
+    const total = exits.filter(
+      (exit) => exit.imported !== true && (mode === "deep" ? exit.enabled : true),
+    ).length
     if (total === 0) return Promise.resolve()
     this.running = this.runScan(mode, total).finally(() => {
       this.running = undefined

@@ -812,7 +812,9 @@ async function toggleRouting(context: Context, client: RelayClient, status: Rela
   const enabled = !status.enabled
   const result = await callRpc(context, "Relay", () => client.setEnabled({ enabled }))
   if (!result) return
-  const refreshed = await refreshStatus(context, client)
+  const refreshed = await withWorking(context, "Reading the relay", () =>
+    refreshStatus(context, client),
+  )
   const note = refreshed.ok ? refreshed.status.note : undefined
   const summary = enabled ? "Routing is on." : "Routing is off."
   // The server's own note begins with the same words the summary uses, so
@@ -1830,7 +1832,11 @@ async function editProxy(
       }
       context.ui.toast.show({
         title: "Relay",
-        message: "The address was changed and is being checked.",
+        // The rename and the address can change in one flow: saying only
+        // what the last step did would make the first look lost.
+        message: changed
+          ? `${name} was renamed, and the new address is being checked.`
+          : "The address was changed and is being checked.",
         variant: "success",
       })
       await refreshStatus(context, client)
@@ -1989,19 +1995,22 @@ async function startTestAll(context: Context, client: RelayClient, deep: boolean
   if (deep) {
     // A deep check carries the user's OpenCode session token, so the user is
     // told what it does before it does it to every exit at once. The scan
-    // skips only paused exits: used-up, cooling and untested exits all get
-    // the token, so the set is named as it is.
+    // skips paused exits and imported ones: a paused exit was put aside on
+    // purpose, and an imported one gets the token only from a test the user
+    // asked for by name.
     const sure = await context.ui.dialog.confirm({
       title: "Send a real request through every exit?",
       message: hasSample
-        ? "This sends your OpenCode session token through every exit that is not paused, including ones that are used up, cooling down or not tested yet. It is the only check that can tell an address that works from one whose allowance is gone."
+        ? "This sends your OpenCode session token through every exit of yours that is not paused, including ones that are used up, cooling down or not tested yet. It is the only check that can tell an address that works from one whose allowance is gone."
         : "No routed request has been captured in the last 30 minutes, so there are no headers to send. Route one request through any exit first, then run this check.",
       label: hasSample
         ? { confirm: "Send them", cancel: "Not now" }
         : { confirm: "Got it", cancel: "Not now" },
     })
     if (!sure) return
-    if (!hasSample) return
+    // The capture may have aged out while the dialog was open: a scan that
+    // cannot send anything is not worth starting after the user agreed.
+    if (!hasSample || currentStatus()?.hasRequestSample !== true) return
   }
   const result = await callRpc(context, "Relay", () => client.testAll({ deep }))
   if (!result) return
@@ -2057,7 +2066,7 @@ async function updateAllRelays(context: Context, client: RelayClient): Promise<v
   if (!result) return
   // Both ways out show the same exits again, and both have to show their new
   // health: a partial failure leaves the same list it started from.
-  await refreshStatus(context, client)
+  await withWorking(context, "Reading the relay", () => refreshStatus(context, client))
   // A relay that was not redeployed is named, not counted away: the user
   // asked for every relay to be updated, and one still running the old code
   // has to be said out loud.
@@ -2189,7 +2198,9 @@ async function transferConfig(context: Context, client: RelayClient): Promise<vo
 /** Deploy a new relay to one region, or several at once. */
 async function deployRelay(context: Context, client: RelayClient): Promise<void> {
   // Fresh state: the account list may have changed since the menu opened.
-  let refreshed = await refreshStatus(context, client)
+  let refreshed = await withWorking(context, "Reading the relay", () =>
+    refreshStatus(context, client),
+  )
   let status = refreshed.ok ? refreshed.status : currentStatus()
   if (!status) {
     // Nothing is known about the accounts, so asking to add one would be a
@@ -2497,16 +2508,41 @@ async function addAccount(context: Context, client: RelayClient): Promise<void> 
     "Paste the Vercel token to add the account.",
   )
   if (token === undefined) return
-  const added = await withWorking(context, "Checking the Vercel token", () =>
-    callRpc(context, "Relay", () => client.addAccount({ name, token })),
-  )
-  if (!added) return
-  context.ui.toast.show({
-    title: "Relay",
-    message: `${added.name} added (${added.plan ?? "plan unknown"}).`,
-    variant: "success",
-  })
-  await refreshStatus(context, client)
+  for (;;) {
+    const added = await withWorking(context, "Checking the Vercel token", () =>
+      callRpc(context, "Relay", () => client.addAccount({ name, token })),
+    )
+    if (added) {
+      context.ui.toast.show({
+        title: "Relay",
+        message: `${added.name} added (${added.plan ?? "plan unknown"}).`,
+        variant: "success",
+      })
+      await refreshStatus(context, client)
+      return
+    }
+    // The call was refused - a token Vercel did not accept, most likely, or
+    // a check that could not run. The name is the user's own word, so it is
+    // offered again with what was typed already in the box. The token is
+    // asked for fresh: it is a credential, and it is never shown again.
+    const nextName = await context.ui.dialog.prompt({
+      title: "Name this account",
+      description: "A name for this account",
+      placeholder: "personal",
+      value: name,
+    })
+    if (nextName === undefined) return
+    const nextToken = await askFor(
+      context,
+      {
+        title: "Vercel token",
+        description: "Vercel Settings -> Tokens",
+        placeholder: "vercel token",
+      },
+      "Paste the Vercel token to add the account.",
+    )
+    if (nextToken === undefined) return
+  }
 }
 
 /** Forget an account. The relays deployed with it stay: they run on their own. */
