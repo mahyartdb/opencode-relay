@@ -169,17 +169,21 @@ through a loopback HTTP-to-SOCKS bridge started by the plugin on first use.
 
 - **Test through OpenCode** - asks the models endpoint through the exit. It
   proves the exit can reach OpenCode without spending a chat completion, and
-  it sends no credentials: the model list is answered without a session token,
-  and this check runs on every exit on a timer.
+  it sends no credentials: the model list is answered without a session token.
+  It runs on a timer on every exit you added by hand; an imported exit is
+  never checked by the timer, because a shared configuration must not be able
+  to aim your traffic at an address of its own choosing.
 - **Deep test with a real model** - sends a one-token chat request with the
   headers of a captured real request. This is the only check that can tell
   "OpenCode accepts this address" from "this address is used up". It is the
   one that carries your OpenCode session token, so it asks first, and it only
-  goes to exits that are in use: a paused exit was put aside on purpose.
-- **Test all exits** (Exits) - starts the same checks for all exits in the
-  background; the status page and the pill show progress.
+  goes to exits that are not paused: a paused exit was put aside on purpose,
+  and used-up, cooling and untested exits all get the token - they are the
+  ones the check has to tell apart.
+- **Test all exits** (Exits) - starts the same checks for all exits you added
+  by hand in the background; the status page and the pill show progress.
 - **Deep test all exits** (Exits) - the same, with a real model request
-  through each exit that is in use. It asks first, because it sends your
+  through each exit that is not paused. It asks first, because it sends your
   OpenCode session token to every one of them.
 
 A 429 that looks like the free usage limit is only a suspicion. The plugin sends
@@ -207,9 +211,10 @@ Accounts, export, import, and the background checks live in **Settings**:
   are not tested: a deep test carries your OpenCode session token, and a
   shared configuration must not be able to aim that at an address of its own
   choosing. Test an imported exit yourself to put it in use.
-- **Background checks** - when on, and while routing is on, every exit is
-  checked every ten minutes, four at a time. When off, exits are only checked
-  when you ask.
+- **Background checks** - when on, and while routing is on, every exit you
+  added by hand is checked every ten minutes, four at a time. An imported
+  exit is never checked in the background: test it yourself to put it in
+  use. When off, exits are only checked when you ask.
 
 ### Keys
 

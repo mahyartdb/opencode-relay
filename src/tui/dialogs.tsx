@@ -1989,7 +1989,8 @@ async function addProxies(context: Context, client: RelayClient): Promise<void> 
 /** Start checking every exit without blocking the menu. */
 async function startTestAll(context: Context, client: RelayClient, deep: boolean): Promise<void> {
   // The deep test replays a captured request's headers, and the session
-  // token is among them: without a capture there is nothing to send.
+  // token is among them: without a capture there is nothing to send. The
+  // server has the last word on that, and its refusal is shown.
   const status = currentStatus()
   const hasSample = deep && status?.hasRequestSample === true
   if (deep) {
@@ -2008,18 +2009,28 @@ async function startTestAll(context: Context, client: RelayClient, deep: boolean
         : { confirm: "Got it", cancel: "Not now" },
     })
     if (!sure) return
-    // The capture may have aged out while the dialog was open: a scan that
-    // cannot send anything is not worth starting after the user agreed.
+    // The capture may have aged out while the dialog was open: the server
+    // refuses the scan then, and its answer is shown below rather than a
+    // silent return.
     if (!hasSample || currentStatus()?.hasRequestSample !== true) return
   }
   const result = await callRpc(context, "Relay", () => client.testAll({ deep }))
   if (!result) return
+  if (result.refused !== undefined) {
+    context.ui.toast.show({
+      title: "Relay",
+      message: result.refused,
+      variant: "warning",
+      duration: 9000,
+    })
+    return
+  }
   context.ui.toast.show({
     title: "Relay",
     message:
       result.total === 0
         ? deep
-          ? "No exit is unpaused, so there is nothing to send a real request through."
+          ? "No exit of yours is unpaused, so there is nothing to send a real request through."
           : "There is no exit to check."
         : result.started
           ? `Checking ${result.total} exit${result.total === 1 ? "" : "s"}${deep ? " with a real model request" : ""} in the background.`

@@ -433,7 +433,18 @@ export const Relay = Rpc.define({
         Schema.Struct({ deep: Schema.optional(Schema.Boolean) }),
       ),
       output: Schema.toStandardSchemaV1(
-        Schema.Struct({ total: Schema.Number, started: Schema.Boolean }),
+        Schema.Struct({
+          total: Schema.Number,
+          started: Schema.Boolean,
+          /**
+           * Why the scan did not start, when it did not.
+           *
+           * A deep scan without a captured routed request has no headers to
+           * send, and the client's snapshot may be seconds old: the server
+           * is the one that knows, so the refusal travels here.
+           */
+          refused: Schema.optional(Schema.String),
+        }),
       ),
     },
 

@@ -951,6 +951,19 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
     /** Start checking every exit in the background. */
     testAll: async (input) => {
       const deep = input.deep === true
+      // A deep check replays a captured routed request's headers, and the
+      // session token is among them. The client's snapshot of the capture is
+      // seconds old at best, so the server decides here: without one there
+      // is nothing to send, and starting the scan would promise a real-model
+      // run that goes out credential-less.
+      if (deep && !state.hasRequestSample()) {
+        return {
+          total: 0,
+          started: false,
+          refused:
+            "No routed request has been captured in the last 30 minutes, so there are no headers to send. Route one request through any exit first, then run this check.",
+        }
+      }
       const exits = state.exits()
       // A deep check carries the user's OpenCode session token, so it only
       // goes to the exits that are in use, and an imported exit is never
