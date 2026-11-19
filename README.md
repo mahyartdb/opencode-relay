@@ -77,9 +77,27 @@ it, and Esc inside a submenu returns to the main menu.
 
 ### The menu
 
-The main menu is a handful of hubs; the live state lives on the Status page,
-in the exits list, and in the footer pill rather than under each title:
+The actions lead, in the order you reach for them; **Status** and **Preview
+the next request** are read-only pages at the bottom, under their own group.
+The live state lives on the Status page, in the exits list, and in the footer
+pill rather than under each title:
 
+- **Exits** - the exits hub, described below.
+- **Add exits** - the three ways to get another address, one step from the main
+  menu: deploy a relay, track an existing relay, or paste proxies. Each is
+  described below.
+- **Models** - route every free model, or choose free models one by one. The
+  picker also offers **Select all** and **Clear selection** above the list.
+  Paid models are filtered out of the picker and dropped from a custom list:
+  the plugin never sends paid traffic through an exit.
+- **Test all exits** - shown when there is an exit to scan: a quick scan of
+  every exit you added by hand, checking OpenCode through each in the
+  background. The deep variant stays on the Exits page, because it needs a
+  captured request and sends your session token.
+- **Turn routing on / off** - routing starts off. Nothing is changed until you
+  turn it on.
+- **Settings** - how exits are used, the direct policy, background checks,
+  Vercel accounts, and export or import.
 - **Status** - a read-only page with everything the plugin knows: routing on
   or off, which models are routed, the strategy and direct policy, background
   checks, the traffic through exits, every exit with its latency and requests,
@@ -88,15 +106,6 @@ in the exits list, and in the footer pill rather than under each title:
 - **Preview the next request** - a read-only page that says where the next
   request would go, why, and which exits are being skipped, without sending
   anything or advancing the rotation.
-- **Turn routing on / off** - routing starts off. Nothing is changed until you
-  turn it on.
-- **Models** - route every free model, or choose free models one by one. The
-  picker also offers **Select all** and **Clear selection** above the list.
-  Paid models are filtered out of the picker and dropped from a custom list:
-  the plugin never sends paid traffic through an exit.
-- **Exits** - the exits hub, described below.
-- **Settings** - how exits are used, the direct policy, background checks,
-  export or import, and Vercel accounts.
 
 ### Routing rules
 
@@ -126,9 +135,10 @@ can carry a request, and the strategy picks among both.
 
 - **The exits list** - one entry per exit with its state, latency, requests,
   and whether it is chosen; a deployed relay's name already carries its
-  region. **Test all exits**, **Deep test all exits**, **Update all relays**,
-  **Bring used-up exits back**, and **Resume all paused exits** sit under the
-  list, and **Add exits** below them.
+  region. The batch moves - **Add exits**, **Test all exits**, **Deep test all
+  exits**, **Update all relays**, **Bring used-up exits back**, and **Resume
+  all paused exits** - sit above the exit rows, so a long list never hides
+  them; **Back** is last.
 - **Add exits** - **Deploy a relay** (pick a Vercel account and one or more
   regions; each relay is its own Vercel project, and a Hobby project runs in
   one region, so a multi-region setup deploys one relay per region), **Track
@@ -137,12 +147,11 @@ can carry a request, and the strategy picks among both.
   stopping. A tracked relay needs an `https://` address, because it carries
   the access token; a relay on this machine (`127.0.0.1`, `localhost`) is
   accepted over plain `http://`, since nothing leaves the machine.
-- **Exit detail** - open an exit for **Details** (a read-only page with the
-  address, project when it has one, health, egress, runtime, request
-  counters, and the last error),
-  **Use this exit**, both checks, **Pause/Resume**, **Update this relay**
-  (relays this plugin deployed), **Edit its name or address** (proxies), and
-  **Remove this exit**.
+- **Exit detail** - open an exit for **Use this exit**, both checks,
+  **Pause/Resume**, **Details** (a read-only page with the address, project
+  when it has one, health, egress, runtime, request counters, and the last
+  error), **Update this relay** (relays this plugin deployed), **Edit its name
+  or address** (proxies), and **Remove this exit**.
 
 ### Proxies
 
@@ -180,8 +189,9 @@ through a loopback HTTP-to-SOCKS bridge started by the plugin on first use.
   goes to exits that are not paused: a paused exit was put aside on purpose,
   and used-up, cooling and untested exits all get the token - they are the
   ones the check has to tell apart.
-- **Test all exits** (Exits) - starts the same checks for all exits you added
-  by hand in the background; the status page and the pill show progress.
+- **Test all exits** (main menu or Exits) - starts the same checks for all
+  exits you added by hand in the background; the status page and the pill show
+  progress.
 - **Deep test all exits** (Exits) - the same, with a real model request
   through each exit that is not paused. It asks first, because it sends your
   OpenCode session token to every one of them.

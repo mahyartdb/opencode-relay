@@ -699,8 +699,12 @@ async function runAction(
     }
     case "models":
       return chooseModels(context, client, reportRefresh)
+    case "test-all":
+      return startTestAll(context, client, false)
     case "exits":
       return manageExits(context, client, reportRefresh)
+    case "add-exits":
+      return addExits(context, client)
     case "settings":
       return openSettings(context, client, reportRefresh)
     case "preview":
@@ -747,8 +751,8 @@ async function openSettings(
         value: "health",
         description: status.healthChecks !== false ? "Automatic checks every 10 minutes while routing is on" : "Only when you ask",
       },
-      { title: "Export or import", value: "transfer", description: "Move exits and rules between machines" },
       { title: "Add a Vercel account", value: "add-account", description: "Needs a Vercel API token" },
+      { title: "Export or import", value: "transfer", description: "Move exits and rules between machines" },
       ...(status.accounts.length > 0
         ? [
             {
@@ -1465,11 +1469,6 @@ async function exitDetail(
     const isDeployedRelay = isDeployedExit(exit, status)
     const options: DialogSelectOption<DetailAction>[] = [
       {
-        title: "Details",
-        value: "details",
-        description: "Address, health, traffic, last error",
-      },
-      {
         title: exhausted ? "Choose it for when it resets" : "Use this exit",
         value: "use",
         description: chosen
@@ -1506,6 +1505,11 @@ async function exitDetail(
         description: exit.enabled
           ? "Keep it, but stop using it"
           : "Use it again in routing and checks",
+      },
+      {
+        title: "Details",
+        value: "details",
+        description: "Address, health, traffic, last error",
       },
       ...(isDeployedRelay
         ? [

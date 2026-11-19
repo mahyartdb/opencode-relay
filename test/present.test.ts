@@ -189,30 +189,59 @@ describe("describeSettings", () => {
 })
 
 describe("menuOptions", () => {
-  test("offers the seven hubs, in order", () => {
+  test("offers the exits and the moves first, the read-only pages last", () => {
     const options = menuOptions(status())
 
     expect(options.map((option) => option.value)).toEqual([
+      "exits",
+      "add-exits",
+      "models",
+      "test-all",
+      "toggle",
+      "settings",
       "status",
       "preview",
-      "toggle",
-      "models",
-      "exits",
-      "settings",
       "close",
     ])
+
+    // An imported exit waits for a person to test it, so the quick scan has
+    // nothing it would reach and its row is left out rather than disabled.
+    const imported = menuOptions(
+      status({
+        exits: [exit({ id: "i1", imported: true }), exit({ id: "i2", kind: "proxy", imported: true })],
+      }),
+    )
+    expect(imported.map((option) => option.value)).not.toContain("test-all")
+  })
+
+  test("the quick scan appears under the same rule as the Exits page", () => {
+    const importedOnly = status({
+      exits: [exit({ id: "i1", imported: true }), exit({ id: "i2", kind: "proxy", imported: true })],
+    })
+    expect(menuOptions(importedOnly).map((option) => option.value)).not.toContain("test-all")
+    expect(exitsMenuOptions(importedOnly).some((option) => option.value.kind === "test-all")).toBe(
+      false,
+    )
+
+    const mixed = status({
+      exits: [exit({ id: "i1", imported: true }), exit({ id: "p1", kind: "proxy" })],
+    })
+    expect(menuOptions(mixed).map((option) => option.value)).toContain("test-all")
+    expect(exitsMenuOptions(mixed).some((option) => option.value.kind === "test-all")).toBe(true)
   })
 
   test("groups the hubs, and Close stands outside the groups", () => {
     const categories = menuOptions(status()).map((option) => [option.value, option.category])
 
     expect(categories).toEqual([
-      ["status", "Routing"],
-      ["preview", "Routing"],
-      ["toggle", "Routing"],
-      ["models", "Routing"],
       ["exits", "Exits"],
+      ["add-exits", "Exits"],
+      ["models", "Routing"],
+      ["test-all", "Routing"],
+      ["toggle", "Routing"],
       ["settings", "Settings"],
+      ["status", "Info"],
+      ["preview", "Info"],
       ["close", undefined],
     ])
   })
@@ -240,7 +269,13 @@ describe("menuOptions", () => {
       paused: ["p1"],
     })
 
-    for (const option of menuOptions(rich)) {
+    const options = menuOptions(rich)
+    // Both rows that were added with the redesign are here, so the loop below
+    // really covers them.
+    const values = options.map((option) => option.value)
+    expect(values).toContain("add-exits")
+    expect(values).toContain("test-all")
+    for (const option of options) {
       expect(option.description).toBeUndefined()
       expect(option.footer).toBeUndefined()
     }
@@ -258,19 +293,28 @@ describe("exitsMenuOptions", () => {
     expect(options.some((option) => option.value.kind === "restore")).toBe(false)
   })
 
-  test("lists every exit first, keeping the id, name, kind and deployed flag", () => {
+  test("keeps the exit rows in order, at their new place after the moves", () => {
     const options = exitsMenuOptions(
       status({
         exits: [exit({ id: "fra", name: "Frankfurt" }), exit({ id: "p1", kind: "proxy", name: "My proxy" })],
       }),
     )
+    const titles = options.map((option) => option.title)
+    const first = titles.indexOf("Frankfurt")
+    const second = titles.indexOf("My proxy")
 
-    expect(options[0]?.value).toEqual({ id: "fra", name: "Frankfurt", kind: "relay", deployed: false })
-    expect(options[0]?.title).toBe("Frankfurt")
-    expect(options[1]?.value).toEqual({ id: "p1", name: "My proxy", kind: "proxy", deployed: false })
+    expect(first).toBeGreaterThan(0)
+    expect(second).toBe(first + 1)
+    // The moves that act on the whole list lead, so they are not a scroll
+    // past every row.
+    expect(titles.indexOf("Add exits")).toBeLessThan(first)
+    expect(titles.indexOf("Test all exits")).toBeLessThan(first)
+    expect(options[first]?.value).toEqual({ id: "fra", name: "Frankfurt", kind: "relay", deployed: false })
+    expect(options[second]?.value).toEqual({ id: "p1", name: "My proxy", kind: "proxy", deployed: false })
+    expect(options.at(-1)?.value).toEqual({ kind: "back" })
   })
 
-  test("offers the list-level moves in a fixed order once they apply", () => {
+  test("offers the list-level moves first, in a fixed order once they apply", () => {
     const options = exitsMenuOptions(
       status({
         accounts: [{ id: "acc-1", name: "personal" }],
@@ -284,23 +328,27 @@ describe("exitsMenuOptions", () => {
     )
 
     expect(options.map((option) => option.title)).toEqual([
-      "fra",
-      "p1",
+      "Add exits",
       "Test all exits",
       "Deep test all exits",
       "Update all relays",
       "Bring used-up exits back",
-      "Add exits",
+      "fra",
+      "p1",
       "Back",
     ])
-    expect(options.slice(2).map((option) => option.value)).toEqual([
+    expect(options.slice(0, 5).map((option) => option.value)).toEqual([
+      { kind: "add" },
       { kind: "test-all" },
       { kind: "test-all-deep" },
       { kind: "update-all" },
       { kind: "restore" },
-      { kind: "add" },
-      { kind: "back" },
     ])
+    expect(options.slice(5, 7).map((option) => (option.value as { id: string }).id)).toEqual([
+      "fra",
+      "p1",
+    ])
+    expect(options.at(-1)?.value).toEqual({ kind: "back" })
   })
 
   test("offers to resume the paused exits only while there are some", () => {

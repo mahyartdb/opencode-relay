@@ -19,6 +19,8 @@ export type MenuAction =
   | "toggle"
   | "models"
   | "exits"
+  | "add-exits"
+  | "test-all"
   | "settings"
   | "close"
 
@@ -312,27 +314,51 @@ export function describeStrategy(status: StatusLike): string {
   return `Now: ${STRATEGY_LABELS[status.strategy].title}`
 }
 
-/** The main menu: a few categorized hubs, and nothing that would do nothing.
+/**
+ * The exits the quick scan will actually reach.
  *
- * No descriptions: the host draws an option's title and description on one
- * line and clips the tail, so a description only ever read as a truncated
- * sentence. The state each hub would have described lives on its own page,
- * in the exit list, and in the footer pill.
+ * The sweep leaves an imported exit alone until a person tests it, so only
+ * the exits it will reach may be counted: a row that promised to check an
+ * imported address would end in nothing being sent. The main menu and the
+ * Exits page both read this one rule.
+ */
+function scannableExits(status: StatusLike): readonly ExitSummaryLike[] {
+  return status.exits.filter((exit) => exit.imported !== true)
+}
+
+/** The main menu: what a user acts on, in the order they reach for it.
+ *
+ * The exits come first and the moves that grow the pool sit next to them;
+ * the read-only pages are at the bottom, where they cost a step only when
+ * the user asks for them. No descriptions: the host draws an option's title
+ * and description on one line and clips the tail, so a description only ever
+ * read as a truncated sentence. The state each hub would have described
+ * lives on its own page, in the exit list, and in the footer pill.
  */
 export function menuOptions(status: StatusLike): DialogSelectOption<MenuAction>[] {
-  return [
-    { title: "Status", value: "status", category: "Routing" },
-    { title: "Preview the next request", value: "preview", category: "Routing" },
+  const options: DialogSelectOption<MenuAction>[] = [
+    { title: "Exits", value: "exits", category: "Exits" },
+    { title: "Add exits", value: "add-exits", category: "Exits" },
+    { title: "Models", value: "models", category: "Routing" },
+  ]
+  // The quick scan only: the deep test spends a real request through every
+  // exit and needs a captured request to replay, so that decision stays on
+  // the Exits page. A row that ended in "nothing to test" would waste a step.
+  if (scannableExits(status).length > 0) {
+    options.push({ title: "Test all exits", value: "test-all", category: "Routing" })
+  }
+  options.push(
     {
       title: status.enabled ? "Turn routing off" : "Turn routing on",
       value: "toggle",
       category: "Routing",
     },
-    { title: "Models", value: "models", category: "Routing" },
-    { title: "Exits", value: "exits", category: "Exits" },
     { title: "Settings", value: "settings", category: "Settings" },
+    { title: "Status", value: "status", category: "Info" },
+    { title: "Preview the next request", value: "preview", category: "Info" },
     { title: "Close", value: "close" },
-  ]
+  )
+  return options
 }
 
 /** The most an exit line may take in a dialog, where the host clips the tail. */
@@ -478,17 +504,25 @@ export type ExitListAction =
   | { readonly kind: "restore" }
   | { readonly kind: "resume-all" }
 
-/** The Exits submenu: every exit, then the list-level moves, then Back.
+/** The Exits submenu: the list-level moves, then every exit, then Back.
+ *
+ * The moves come first because they are what a user opens this page for:
+ * with a long exit list they sat one scroll below every row. Add exits stays
+ * even when there is nothing to list, so an empty page still has the one
+ * thing it can do.
  *
  * Descriptions stay short on purpose: the host renders them on the same line
  * as the title and clips the tail, so anything long reads as a cut word.
  */
 export function exitsMenuOptions(status: StatusLike): DialogSelectOption<ExitListAction>[] {
-  const options: DialogSelectOption<ExitListAction>[] = [...exitList(status)]
-  // The sweep leaves an imported exit alone until a person tests it, so only
-  // the exits it will actually reach are counted here: a row that promised to
-  // check an imported address would end in nothing being sent.
-  const scannable = status.exits.filter((exit) => exit.imported !== true)
+  const options: DialogSelectOption<ExitListAction>[] = [
+    {
+      title: "Add exits",
+      value: { kind: "add" },
+      description: "Deploy a relay, track one, paste proxies",
+    },
+  ]
+  const scannable = scannableExits(status)
   if (scannable.length > 0) {
     const count = scannable.length
     options.push({
@@ -541,11 +575,7 @@ export function exitsMenuOptions(status: StatusLike): DialogSelectOption<ExitLis
       description: `${paused.length} exit${paused.length === 1 ? " is" : "s are"} paused`,
     })
   }
-  options.push({
-    title: "Add exits",
-    value: { kind: "add" },
-    description: "Deploy a relay, track one, paste proxies",
-  })
+  options.push(...exitList(status))
   options.push({ title: "Back", value: { kind: "back" } })
   return options
 }
