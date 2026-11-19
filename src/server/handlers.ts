@@ -206,7 +206,12 @@ function describeState(options: {
       const exit = exits.find((entry) => entry.id === id)
       if (exit === undefined) continue
       if (!exit.enabled) paused.push(exit.name)
-      else if (exit.status === "limited") limited.push(exit.name)
+      // Like the blocked case, an imported exit is its own sentence: it is not
+      // waiting on a verdict a check could clear, and "has not been tested
+      // yet" would hide that only the user's own test can put it in use.
+      else if (exit.imported === true) {
+        problems.push(`${exit.name} is imported and not tested by you, so it is skipped.`)
+      } else if (exit.status === "limited") limited.push(exit.name)
       else if (exit.status === "exhausted") continue
       else if (exit.status === "untested" || exit.status === "unknown") untested.push(exit.name)
       else if (exit.status === "blocked") {

@@ -51,6 +51,7 @@ interface StatusAnswer {
     readonly accountId?: string
     readonly statusLabel: string
     readonly lastError?: string
+    readonly imported?: boolean
     readonly stats: { readonly requests: number }
   }[]
   readonly exhausted: readonly string[]
@@ -690,6 +691,25 @@ describe("the server half", () => {
       // The picker names nothing, and says which exit it left out.
       expect(status.servingExitId).toBeUndefined()
       expect(status.skippedExitIds).toEqual(["fresh"])
+    } finally {
+      await app.dispose()
+    }
+  })
+
+  test("the status carries the imported mark, and only when it is set", async () => {
+    const store = new Map<string, unknown>()
+    store.set("relays", [
+      { ...storedRelay("imported", "imported", "reachable"), imported: true },
+      storedRelay("normal", "normal", "reachable"),
+    ])
+    store.set("settings", storedSettings("imported"))
+    const app = await start(true, store)
+    try {
+      const status = (await app.call("status")) as StatusAnswer
+      expect(status.exits.find((exit) => exit.id === "imported")?.imported).toBe(true)
+      // A missing mark is not written as false: an older reader sees the same
+      // record it always did.
+      expect(status.exits.find((exit) => exit.id === "normal")?.imported).toBeUndefined()
     } finally {
       await app.dispose()
     }
@@ -1484,7 +1504,7 @@ describe("the server half", () => {
       const swept = state.pickExit({ advance: false })
       expect(swept.exit).toBeUndefined()
       expect(swept.skipped.map((entry) => entry.id).sort()).toEqual([relayExit.id, proxyExit.id].sort())
-      expect(swept.skipped.every((entry) => entry.reason === "not tested yet")).toBe(true)
+      expect(swept.skipped.every((entry) => entry.reason === "imported - test it to use it")).toBe(true)
 
       // The user's own test clears the import mark, and a check run after it
       // can promote the exit; without that, the sweep never would.

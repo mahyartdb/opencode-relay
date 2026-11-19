@@ -233,22 +233,11 @@ export async function registerHooks(
       // to rewrite, and sending it unchanged would be a silent direct request.
       if (!exit) return
 
-      // The request is remembered before it is rewritten, so a test later can
-      // look exactly like the request OpenCode Free is willing to answer.
-      // It is taken here, and only for routed models: a sample of a request
-      // that never went through an exit would make a test look like traffic
-      // this plugin never sent.
-      state.noteSample({
-        modelID: modelId,
-        path: `${url.pathname}${url.search}`,
-        headers: headerRecord(input.request),
-      })
-
-      // The exit is chosen here; the in-memory timing starts now. A request that
-      // never reaches the exit still has a started mark, which the response
-      // hook clears when the failure surfaces.
-      state.noteStarted(sessionID, modelId, exit.id, kind)
       try {
+        // The timing starts with the rewrite, so a request that fails on its
+        // way to the exit still has a started mark. A rewrite that throws
+        // leaves none: the catch takes it back.
+        state.noteStarted(sessionID, modelId, exit.id, kind)
         if (exit.kind === "relay") {
           input.request = relayRequest(input.request, {
             id: exit.id,
@@ -264,6 +253,12 @@ export async function registerHooks(
           })
         }
       } catch (error) {
+        // Nothing about this request reached the exit, so nothing may be
+        // charged to it: a started mark would make the retry hook certain
+        // about an exit the request never used, and a rest for the direct
+        // request's own failure would double this one and bury the rewrite
+        // error in the note.
+        state.forgetRelayed(sessionID, modelId, kind)
         state.markFailure(exit.id, errorText(error))
         state.noteDecision({
           modelId,
@@ -273,6 +268,15 @@ export async function registerHooks(
         if (settings.direct === "never") throw error
         return
       }
+      // The request is remembered only once it was actually rewritten, so a
+      // test later can look exactly like the request OpenCode Free is willing
+      // to answer. A sample of a request that never went through an exit would
+      // make a test look like traffic this plugin never sent.
+      state.noteSample({
+        modelID: modelId,
+        path: `${url.pathname}${url.search}`,
+        headers: headerRecord(input.request),
+      })
       // The request count moved, and the footer counts requests that went
       // through an exit. Saying so is what keeps the number on the pill true
       // while traffic happens. A rewrite that threw never left the machine,
@@ -665,11 +669,14 @@ export async function registerHooks(
       }
 
       if (status === 409) {
-        // Only a relay that asked for another instance, or a refusal that
-        // confirmed the address is used up, is a reason to send the same
-        // request somewhere else. A bare 409 is the request's own conflict:
-        // another exit would answer it the same way.
-        if (context?.kind !== "rotate" && context?.kind !== "exhausted") return
+        // A relay that asked for another instance, a refusal that confirmed
+        // the address is used up, or the local bridge answering for a proxy it
+        // could not use is a reason to send the same request somewhere else.
+        // The bridge's 409 says the exit is unavailable, not that the request
+        // was wrong; a real upstream 409 through an exit carries reached: true
+        // and is left alone.
+        const bridgeRefusal = context?.kind === "server" && context.reached === false
+        if (context?.kind !== "rotate" && context?.kind !== "exhausted" && !bridgeRefusal) return
         // A used-up relay leaves no exit behind, but the request can still go
         // direct when the user allows it. Without that, it would just die.
         if (!canRetry()) return

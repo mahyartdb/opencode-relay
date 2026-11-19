@@ -58,6 +58,8 @@ export interface ExitSummaryLike {
   readonly lastCheck?: number
   /** When the exit was added. */
   readonly createdAt?: number
+  /** True while the exit is imported and nobody has tested it. */
+  readonly imported?: boolean
   /** How many requests have gone through this exit, when the status carried them. */
   readonly stats?: {
     readonly requests: number
@@ -483,8 +485,12 @@ export type ExitListAction =
  */
 export function exitsMenuOptions(status: StatusLike): DialogSelectOption<ExitListAction>[] {
   const options: DialogSelectOption<ExitListAction>[] = [...exitList(status)]
-  if (status.exits.length > 0) {
-    const count = status.exits.length
+  // The sweep leaves an imported exit alone until a person tests it, so only
+  // the exits it will actually reach are counted here: a row that promised to
+  // check an imported address would end in nothing being sent.
+  const scannable = status.exits.filter((exit) => exit.imported !== true)
+  if (scannable.length > 0) {
+    const count = scannable.length
     options.push({
       title: "Test all exits",
       value: { kind: "test-all" },
@@ -494,9 +500,10 @@ export function exitsMenuOptions(status: StatusLike): DialogSelectOption<ExitLis
     // paused, so it is offered only when there is one to send it to: a
     // row that always ends in "nothing to send it through" would spend the
     // user's confirmation on a no-op. It also replays the captured headers,
-    // so it needs a recent routed request to replay.
+    // so it needs a recent routed request to replay. An imported exit is
+    // left out of the deep sweep too, so it cannot make the row apply.
     if (
-      status.exits.some((exit) => exit.enabled) &&
+      status.exits.some((exit) => exit.enabled && exit.imported !== true) &&
       status.hasRequestSample === true
     ) {
       options.push({
@@ -811,10 +818,6 @@ export function pillTone(status: StatusLike | undefined, reachable = true): Pill
   const scanning = status.scanning
   if (scanning !== undefined && scanning.done < scanning.total) return "busy"
   if (!status.enabled) return "off"
-  // Routing on, but nothing survives the free-model filter: whatever the
-  // exits look like, no request will leave through one. That is a thing to
-  // look at, not a healthy state.
-  if (status.routedCount === 0) return "warn"
   if (status.exits.length === 0) return "warn"
   if (usable === 0) return status.direct === "never" ? "bad" : "warn"
   return "ok"

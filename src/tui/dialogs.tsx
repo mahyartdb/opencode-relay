@@ -1026,7 +1026,7 @@ async function chooseModels(
       title: "No free models",
       message:
         models.length === 0
-          ? "The model list of the OpenCode provider could not be read. The plugin cannot tell which models are free, so nothing is routed."
+          ? "The OpenCode provider's model list is empty or could not be read. The plugin cannot tell which models are free, so nothing is routed."
           : "The OpenCode provider lists no free model right now. The plugin only routes free models.",
     })
     return
@@ -2009,10 +2009,20 @@ async function startTestAll(context: Context, client: RelayClient, deep: boolean
         : { confirm: "Got it", cancel: "Not now" },
     })
     if (!sure) return
-    // The capture may have aged out while the dialog was open: the server
-    // refuses the scan then, and its answer is shown below rather than a
-    // silent return.
-    if (!hasSample || currentStatus()?.hasRequestSample !== true) return
+    // The capture may have aged out while the dialog was open, or was never
+    // there: without headers the call cannot do what the user agreed to. The
+    // same warning the single-exit flow gives is shown here, rather than a
+    // return that looks like nothing happened; the server's own refusal stays
+    // as the backstop.
+    if (!hasSample || currentStatus()?.hasRequestSample !== true) {
+      context.ui.toast.show({
+        title: "Relay",
+        message:
+          "No routed request has been captured in the last 30 minutes, so there are no headers to send.",
+        variant: "warning",
+      })
+      return
+    }
   }
   const result = await callRpc(context, "Relay", () => client.testAll({ deep }))
   if (!result) return
@@ -2499,7 +2509,7 @@ async function trackRelay(context: Context, client: RelayClient): Promise<void> 
 
 /** Add a Vercel account, so a relay can be deployed later. */
 async function addAccount(context: Context, client: RelayClient): Promise<void> {
-  const name = await askFor(
+  let name = await askFor(
     context,
     {
       title: "Name this account",
@@ -2509,7 +2519,7 @@ async function addAccount(context: Context, client: RelayClient): Promise<void> 
     "Give the account a name before adding it.",
   )
   if (name === undefined) return
-  const token = await askFor(
+  let token = await askFor(
     context,
     {
       title: "Vercel token",
@@ -2520,8 +2530,13 @@ async function addAccount(context: Context, client: RelayClient): Promise<void> 
   )
   if (token === undefined) return
   for (;;) {
+    // The closure below reads the mutable name and token, and TypeScript
+    // widens those back to string | undefined inside a closure. The values
+    // each attempt sends are captured in a const the loop rebuilds every
+    // round, so a retry sends the fresh answers and the types hold.
+    const attempt = { name, token }
     const added = await withWorking(context, "Checking the Vercel token", () =>
-      callRpc(context, "Relay", () => client.addAccount({ name, token })),
+      callRpc(context, "Relay", () => client.addAccount(attempt)),
     )
     if (added) {
       context.ui.toast.show({
@@ -2535,7 +2550,9 @@ async function addAccount(context: Context, client: RelayClient): Promise<void> 
     // The call was refused - a token Vercel did not accept, most likely, or
     // a check that could not run. The name is the user's own word, so it is
     // offered again with what was typed already in the box. The token is
-    // asked for fresh: it is a credential, and it is never shown again.
+    // asked for fresh: it is a credential, and it is never shown again. Both
+    // go back into the variables the call reads, or the retry would send the
+    // refused answer again.
     const nextName = await context.ui.dialog.prompt({
       title: "Name this account",
       description: "A name for this account",
@@ -2543,6 +2560,7 @@ async function addAccount(context: Context, client: RelayClient): Promise<void> 
       value: name,
     })
     if (nextName === undefined) return
+    name = nextName.trim()
     const nextToken = await askFor(
       context,
       {
@@ -2553,6 +2571,7 @@ async function addAccount(context: Context, client: RelayClient): Promise<void> 
       "Paste the Vercel token to add the account.",
     )
     if (nextToken === undefined) return
+    token = nextToken
   }
 }
 

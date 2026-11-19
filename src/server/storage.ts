@@ -62,6 +62,9 @@ const HealthFields = {
   // retire the exit all over again. Absent when only a test is on record.
   coolingUntil: Schema.optionalKey(Schema.Number),
   failures: Schema.optionalKey(Schema.Number),
+  // Written only while true. Read back missing as "not imported", so an older
+  // file loads as if every exit were tested.
+  imported: Schema.optionalKey(Schema.Boolean),
   createdAt: Schema.Number,
 }
 
@@ -121,6 +124,7 @@ type StoredHealth = {
   readonly exhaustedUntil?: number
   readonly coolingUntil?: number
   readonly failures?: number
+  readonly imported?: boolean
   readonly createdAt: number
 }
 
@@ -143,6 +147,7 @@ function healthJson(exit: StoredHealth): Record<string, Schema.Json> {
   if (exit.exhaustedUntil !== undefined) json.exhaustedUntil = exit.exhaustedUntil
   if (exit.coolingUntil !== undefined) json.coolingUntil = exit.coolingUntil
   if (exit.failures !== undefined) json.failures = exit.failures
+  if (exit.imported === true) json.imported = true
   return json
 }
 
@@ -158,6 +163,7 @@ function healthOf(stored: StoredHealth): {
   exhaustedUntil?: number
   coolingUntil?: number
   failures?: number
+  imported?: boolean
 } {
   return {
     enabled: stored.enabled ?? true,
@@ -171,6 +177,7 @@ function healthOf(stored: StoredHealth): {
     ...(stored.exhaustedUntil !== undefined ? { exhaustedUntil: stored.exhaustedUntil } : {}),
     ...(stored.coolingUntil !== undefined ? { coolingUntil: stored.coolingUntil } : {}),
     ...(stored.failures !== undefined ? { failures: stored.failures } : {}),
+    ...(stored.imported === true ? { imported: true } : {}),
   }
 }
 

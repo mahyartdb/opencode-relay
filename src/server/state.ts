@@ -677,9 +677,16 @@ export class RelayState {
       // only where the record still holds what this call wrote — a verdict
       // that landed while the write was in flight owns the record now.
       if (urlChanged) {
-        this.proxyList = this.proxyList.map((proxy) => (proxy.id === id ? current : proxy))
-        if (coolingBefore !== undefined) this.cooling.set(id, coolingBefore)
-        if (statsBefore !== undefined) this.stats.set(id, statsBefore)
+        // The old record goes back only where nothing else touched the entry:
+        // a pause or a verdict that landed meanwhile is on disk now, and
+        // restoring the record whole would resume or revive an exit the disk
+        // says is paused (or lose the rest a live failure just armed).
+        const live = this.proxy(id)
+        if (live !== undefined && sameExitRecord(live, next)) {
+          this.proxyList = this.proxyList.map((proxy) => (proxy.id === id ? current : proxy))
+          if (coolingBefore !== undefined) this.cooling.set(id, coolingBefore)
+          if (statsBefore !== undefined) this.stats.set(id, statsBefore)
+        }
       } else {
         const live = this.proxy(id)
         if (live !== undefined) {
@@ -1191,6 +1198,10 @@ export class RelayState {
 
   /** Choose how the exits are used. */
   async setStrategy(strategy: Strategy): Promise<void> {
+    // A load that read no file defaults to "fixed", so the stored value is
+    // always set by now. Choosing the strategy that is already in place is a
+    // no-op: the rotation stands where it is instead of starting over.
+    if (this.rules.strategy === strategy) return
     // Round robin starts at the exit the user chose, so switching to it does
     // not silently move the first request somewhere else.
     const previousStart = this.rotationStartId
@@ -1233,9 +1244,15 @@ export class RelayState {
       this.cursor = 0
     }
     // The stored position goes with the strategy: a restart would otherwise
-    // resume the rotation where it was.
+    // resume the rotation where it was. An update that leaves the strategy
+    // alone leaves the position alone too — an import that changes nothing
+    // would otherwise drop it while memory keeps serving in turn.
     try {
-      await this.writeRules(() => ({ ...this.rules, ...update, rotationId: undefined }))
+      await this.writeRules(() => ({
+        ...this.rules,
+        ...update,
+        ...(update.strategy !== undefined ? { rotationId: undefined } : {}),
+      }))
     } catch (error) {
       this.rotationStartId = previousStart
       this.lastServedId = previousServed
@@ -1338,6 +1355,9 @@ export class RelayState {
   /** Why an exit is not usable, in words the menu can show. */
   private skipReason(exit: ExitRecord, now: number): string {
     if (!exit.enabled) return "paused"
+    // An imported exit is not waiting on a verdict: it is kept out of service
+    // until a person tests it, so the reason says what to do about it.
+    if (exit.imported === true) return "imported - test it to use it"
     // A live "used up" latch outranks every failure verdict, so the reason
     // says so too: the exit is not failing, its allowance is gone.
     if ((exit.exhaustedUntil ?? 0) > now) return `used up until ${resetTime(exit.exhaustedUntil ?? 0)}`
@@ -1547,9 +1567,14 @@ export class RelayState {
    * connection should not sideline an exit for the session, and an exit that
    * keeps failing should not be tried on every request.
    */
-  markFailure(id: string, note?: string, status: ExitStatus = "unreachable"): void {
+  markFailure(id: string, note?: string, status: ExitStatus = "unreachable", healthEpoch?: number): void {
     const exit = this.exit(id)
     if (!exit) return
+    // A check that started before a live verdict or a new address has an
+    // answer about the exit as it was then: retiring the record now would
+    // bench an address nobody tested. Callers that do not stamp an epoch keep
+    // their old behavior.
+    if (healthEpoch !== undefined && healthEpoch !== this.healthEpoch(id)) return
     const rested = this.rest(id)
     this.bumpHealthEpoch(id)
     // The rest is written with the status in one replaceExit, so a crash
@@ -1642,15 +1667,24 @@ export class RelayState {
       // the exit is tested when the disk still says imported — the next
       // restart would read the mark back and the menu would not lie, but the
       // running process would serve an address it never vetted.
-      const marked: ExitRecord = { ...next, imported: true }
-      if (marked.kind === "relay") {
-        this.relayList = this.relayList.map((relay) =>
-          relay.id === id ? (marked as RelayRecord) : relay,
-        )
-      } else {
-        this.proxyList = this.proxyList.map((proxy) =>
-          proxy.id === id ? (marked as ProxyRecord) : proxy,
-        )
+      //
+      // It goes back only where the record still holds exactly what this call
+      // wrote: a field that landed while the write was in flight — an address
+      // learned from an answer — owns the record now, and putting the old one
+      // back would lose it. The mark then stays on disk alone and the next
+      // restart re-arms it, which fails closed.
+      const live = this.exit(id)
+      if (live !== undefined && sameExitRecord(live, next)) {
+        const marked: ExitRecord = { ...next, imported: true }
+        if (marked.kind === "relay") {
+          this.relayList = this.relayList.map((relay) =>
+            relay.id === id ? (marked as RelayRecord) : relay,
+          )
+        } else {
+          this.proxyList = this.proxyList.map((proxy) =>
+            proxy.id === id ? (marked as ProxyRecord) : proxy,
+          )
+        }
       }
       throw error
     }
@@ -1957,8 +1991,11 @@ export class RelayState {
       const { exhaustedUntil: _until, coolingUntil: _cooling, failures: _failures, ...rest } = proxy
       return { ...rest, status: "reachable" as Status }
     })
-    this.cursor = 0
+    // An empty restore must not restart the rotation: the reset below says
+    // "the rotation starts over because every exit is back", and saying it
+    // with nothing restored would move a rotation the call never touched.
     if (restored.length === 0) return { restored, stillUsedUp }
+    this.cursor = 0
     /**
      * Put every restored exit back exactly as it was, record and live map
      * entries included. The epoch is not rewound: a bump is monotonic, and

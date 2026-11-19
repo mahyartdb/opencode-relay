@@ -397,7 +397,7 @@ export class Tester {
       // Nothing was learned about the exit: it simply did not answer. A rest
       // is the honest verdict, not a retirement that only another test
       // could lift.
-      this.deps.state.markFailure(exit.id, note.slice(0, 240), "unreachable")
+      this.deps.state.markFailure(exit.id, note.slice(0, 240), "unreachable", healthEpoch)
       return { ok: false, status: "unreachable", code: 0, ms: elapsed(), note }
     }
   }
@@ -456,27 +456,7 @@ export class Tester {
           note: "No routed request has been captured in the last 30 minutes, so there are no headers to send. Route one request through any exit first, then run this check.",
         }
       }
-      const model = sample?.modelID ?? (await this.pickModel(exit, signal))
-      if (model === undefined) {
-        // Nothing was learned about the exit: the test could not be built.
-        // Recording a verdict would retire it without a rest, on something
-        // the check never earned.
-        const result: TestResult = {
-          ok: false,
-          status: "unknown",
-          code: 0,
-          ms: elapsed(),
-          note: "No model could be read to test with.",
-        }
-        await this.record(exit.id, {
-          status: result.status,
-          latencyMs: result.ms,
-          lastError: result.note,
-          checkedAt,
-          healthEpoch,
-        })
-        return result
-      }
+      const model = sample.modelID
       target = UPSTREAM_CHAT
       const body = JSON.stringify({
         model,
@@ -496,7 +476,7 @@ export class Tester {
       // The exit never answered, so nothing was learned about it. A rest
       // (not a retirement) is the honest verdict: the exit is tried again
       // later, rather than staying out of use until a person tests it.
-      this.deps.state.markFailure(exit.id, note.slice(0, 240), "unreachable")
+      this.deps.state.markFailure(exit.id, note.slice(0, 240), "unreachable", healthEpoch)
       return {
         ok: false,
         status: "unreachable",
@@ -585,31 +565,6 @@ export class Tester {
       ...(about.egress !== undefined ? { egress: about.egress } : {}),
       ...(about.runtime !== undefined ? { runtime: about.runtime } : {}),
       ...(verdict.note !== undefined ? { note: verdict.note } : {}),
-    }
-  }
-
-  /** The first model OpenCode lists through the exit. */
-  private async pickModel(exit: ExitRecord, signal: AbortSignal): Promise<string | undefined> {
-    try {
-      const response = await send(exit, UPSTREAM_MODELS, {
-        method: "GET",
-        headers: replayHeaders(undefined, false),
-        signal,
-      })
-      if (!response.ok) return undefined
-      // The model list is read with a cap: an exit that answers the endpoint
-      // with a huge or never-ending body must not fill the memory doing it.
-      const text = (await readBody(response, 5000, 200_000)) ?? ""
-      let data: { data?: Array<{ id?: unknown }> }
-      try {
-        data = JSON.parse(text) as { data?: Array<{ id?: unknown }> }
-      } catch {
-        return undefined
-      }
-      const first = data.data?.find((entry) => typeof entry.id === "string")
-      return typeof first?.id === "string" ? first.id : undefined
-    } catch {
-      return undefined
     }
   }
 
@@ -788,15 +743,4 @@ export class Tester {
         update.healthEpoch === this.deps.state.healthEpoch(id))
     )
   }
-}
-
-/** One line for a test result, so every surface says it the same way. */
-export function describeTest(result: TestResult): string {
-  if (result.ok) {
-    return result.status === "reachable"
-      ? `Reachable in ${result.ms} ms, but no model request was tried.`
-      : `Ready: a model request worked (${result.ms} ms).`
-  }
-  const code = result.code > 0 ? ` (HTTP ${result.code})` : ""
-  return (result.note ?? "The test failed.") + code
 }

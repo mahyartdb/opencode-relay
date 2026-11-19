@@ -61,6 +61,7 @@ const ExitSummary = Schema.Struct({
   /** Why OpenCode said the address is used up, when it said. */
   spendReason: Schema.optional(Schema.String),
   lastError: Schema.optional(Schema.String),
+  imported: Schema.optional(Schema.Boolean),
   stats: ExitStats,
 })
 

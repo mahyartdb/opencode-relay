@@ -385,6 +385,47 @@ describe("exitsMenuOptions", () => {
     expect(noSample.some((option) => option.value.kind === "test-all-deep")).toBe(false)
   })
 
+  test("test-all counts only the exits the scan will reach", () => {
+    // An imported exit is left out of every sweep until a person tests it, so
+    // a row that promised to check it would end in "nothing to test".
+    const importedOnly = exitsMenuOptions(
+      status({
+        exits: [
+          exit({ id: "i1", imported: true }),
+          exit({ id: "i2", kind: "proxy", imported: true }),
+        ],
+        hasRequestSample: true,
+      }),
+    )
+    expect(importedOnly.some((option) => option.value.kind === "test-all")).toBe(false)
+    expect(importedOnly.some((option) => option.value.kind === "test-all-deep")).toBe(false)
+
+    const mixed = exitsMenuOptions(
+      status({
+        exits: [
+          exit({ id: "i1", imported: true }),
+          exit({ id: "i2", kind: "proxy", imported: true }),
+          exit({ id: "p1", kind: "proxy" }),
+        ],
+        hasRequestSample: true,
+      }),
+    )
+    expect(mixed.find((option) => option.value.kind === "test-all")?.description).toBe(
+      "1 exit - checks OpenCode through each",
+    )
+    expect(mixed.some((option) => option.value.kind === "test-all-deep")).toBe(true)
+  })
+
+  test("deep test needs an unpaused, not imported exit to send the token to", () => {
+    const importedLive = exitsMenuOptions(
+      status({
+        exits: [exit({ id: "fra", imported: true })],
+        hasRequestSample: true,
+      }),
+    )
+    expect(importedLive.some((option) => option.value.kind === "test-all-deep")).toBe(false)
+  })
+
   test("restore only when an exit is used up, and says how many", () => {
     const one = exitsMenuOptions(status({ exits: [exit({ id: "a" }), exit({ id: "spent" })], exhausted: ["spent"] }))
     const none = exitsMenuOptions(status({ exits: [exit({ id: "a" })] }))

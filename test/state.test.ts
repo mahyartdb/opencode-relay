@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { relayRequest } from "../src/lib/routing.ts"
+import { proxyRequest, relayRequest } from "../src/lib/routing.ts"
 import type { ProxyRecord, RelayRecord } from "../src/lib/types.ts"
 import { registerHooks, ROTATE_DELAY_MS } from "../src/server/hooks.ts"
 import { RelayState, StorageError, COOLDOWN_BASE_MS } from "../src/server/state.ts"
@@ -51,6 +51,44 @@ function failingStorage() {
     get: async (key: string) => store.get(key),
     set: async (key: string, value: unknown) => {
       if (failing.has(key)) throw new Error(`ENOSPC: no space left on device (${key})`)
+      store.set(key, value)
+    },
+    remove: async (key: string) => {
+      store.delete(key)
+    },
+    scan: async () => ({ entries: [] }),
+  }
+}
+
+/**
+ * A storage whose next write to one key waits for a release, then fails.
+ *
+ * The wait is what makes the interleaving reachable: the edit is still on its
+ * way to the disk when the next change is made, as a slow disk would leave it.
+ */
+function deferredFailureStorage() {
+  const store = new Map<string, unknown>()
+  const held = new Set<string>()
+  let gate = Promise.resolve()
+  let release: (() => void) | undefined
+  return {
+    store,
+    arm: (key: string) => {
+      held.add(key)
+      gate = new Promise<void>((resolve) => {
+        release = resolve
+      })
+    },
+    release: () => {
+      release?.()
+      release = undefined
+    },
+    get: async (key: string) => store.get(key),
+    set: async (key: string, value: unknown) => {
+      if (held.delete(key)) {
+        await gate
+        throw new Error(`ENOSPC: no space left on device (${key})`)
+      }
       store.set(key, value)
     },
     remove: async (key: string) => {
@@ -560,6 +598,27 @@ describe("across a restart", () => {
     expect(state.pickExit({ advance: true }).exit?.id).toBe("relay-a")
   })
 
+  test("re-choosing the strategy that is already in place keeps the rotation", async () => {
+    const { state } = await makeRestartable()
+    await state.addRelay(relay("relay-a"))
+    await state.addRelay(relay("relay-b"))
+    await state.addRelay(relay("relay-c"))
+    await state.setEnabled(true)
+    await state.setStrategy("round-robin")
+    await state.setHealth("relay-a", { status: "ready" })
+    await state.setHealth("relay-b", { status: "ready" })
+    await state.setHealth("relay-c", { status: "ready" })
+
+    expect(state.pickExit({ advance: true }).exit?.id).toBe("relay-a")
+    expect(state.pickExit({ advance: true }).exit?.id).toBe("relay-b")
+
+    // Choosing round robin again is not a change: nothing about the rotation
+    // moved, so the next request continues in turn instead of the rotation
+    // starting over at the first exit.
+    await state.setStrategy("round-robin")
+    expect(state.pickExit({ advance: true }).exit?.id).toBe("relay-c")
+  })
+
   test("a rate limit rests an exit for a bounded time, whatever the header said", async () => {
     const { state } = await makeRestartable()
     await state.addRelay(relay("relay-1"))
@@ -728,6 +787,20 @@ describe("across a restart", () => {
     expect(state.pickExit({ advance: true }).exit?.id).toBe("relay-c")
   })
 
+  test("an imported exit stays imported across a restart", async () => {
+    const { state, restart } = await makeRestartable()
+    await state.addProxy({ ...proxy("imported"), imported: true })
+    await state.addProxy(proxy("normal"))
+
+    const next = await restart()
+    // The mark kept only in memory would be gone after a restart, and the
+    // startup sweep would promote an address nobody tested.
+    expect(next.exit("imported")?.imported).toBe(true)
+    // The mark is written only when it is true, so a normal record restarts
+    // without a key to drop.
+    expect(next.exit("normal")?.imported).toBeUndefined()
+  })
+
   test("a partial settings object keeps what it says and defaults the rest", async () => {
     const { state, restart, store } = await makeRestartable()
     await state.addRelay(relay("relay-1"))
@@ -760,6 +833,27 @@ describe("across a restart", () => {
     expect(kept.selection).toBe("custom")
     expect(kept.customModels).toEqual(["iceman-free"])
     expect(kept.activeExitId).toBe("relay-2")
+  })
+
+  test("a settings update that leaves the strategy alone keeps the stored rotation", async () => {
+    const { state, store } = await makeRestartable()
+    await state.addRelay(relay("relay-1"))
+    await state.addRelay(relay("relay-2"))
+    await state.setEnabled(true)
+    await state.setStrategy("round-robin")
+    await state.setHealth("relay-1", { status: "ready" })
+    await state.setHealth("relay-2", { status: "ready" })
+    expect(state.pickExit({ advance: true }).exit?.id).toBe("relay-1")
+    await Bun.sleep(0)
+    expect((store.get("settings") as { rotationId?: string }).rotationId).toBe("relay-1")
+
+    // An imported settings block that changes an unrelated rule must not
+    // touch the rotation: memory keeps serving in turn, and the disk has to
+    // keep the position a restart resumes from.
+    await state.applySettings({ healthChecks: false })
+    await Bun.sleep(0)
+    expect((store.get("settings") as { rotationId?: string }).rotationId).toBe("relay-1")
+    expect(state.pickExit({ advance: true }).exit?.id).toBe("relay-2")
   })
 })
 
@@ -833,6 +927,34 @@ describe("a live verdict during a check", () => {
     // The reset still brings the exit back on its own.
     expect(state.exhaustedExits(until + 1)).toEqual([])
     expect(state.exit("relay-1")?.status).toBe("reachable")
+  })
+
+  test("a failure from a check that started before a new address does not retire it", async () => {
+    const { state } = await makeRestartable()
+    await state.addProxy(proxy("proxy-1"))
+    // What the check saw when it began.
+    const epoch = state.healthEpoch("proxy-1")
+
+    // The address is edited while the check is in flight. The record starts
+    // over untested, and the old check's failure must not retire a record the
+    // user has not tested: the check was asking about the machine the entry no
+    // longer points at.
+    await state.updateProxy("proxy-1", { url: "http://new.example.com:8080" })
+    state.markFailure("proxy-1", "The old check did not answer.", "unreachable", epoch)
+
+    expect(state.exit("proxy-1")?.status).toBe("untested")
+    expect(state.failureCount("proxy-1")).toBe(0)
+
+    // A failure stamped with the epoch the record carries now still applies,
+    // and a caller that does not stamp one keeps its old behavior.
+    state.markFailure(
+      "proxy-1",
+      "The exit did not answer.",
+      "unreachable",
+      state.healthEpoch("proxy-1"),
+    )
+    expect(state.exit("proxy-1")?.status).toBe("unreachable")
+    expect(state.failureCount("proxy-1")).toBe(1)
   })
 
   test("a success during a check keeps the check's answer from overwriting it", async () => {
@@ -919,6 +1041,44 @@ describe("the response and retry hooks on a 409", () => {
     expect(retry.decision).toEqual({ retry: false })
   })
 
+  test("a bridge refusing a proxy's request is retried elsewhere", async () => {
+    const { state, hooks } = await makeHooks()
+    await state.addProxy(proxy("proxy-1"))
+    await state.addRelay(relay("relay-1"))
+    await state.setHealth("proxy-1", { status: "ready" })
+    await state.setHealth("relay-1", { status: "ready" })
+
+    // The local bridge answers a paused or deleted proxy itself: a 409 with
+    // its own error header, never reaching the upstream. The exit is
+    // unavailable, not the request wrong, so another exit can serve it.
+    await hooks.get("http.response")?.({
+      sessionID: "session-bridge",
+      model: { id: "iceman-free", providerID: "opencode" },
+      request: proxyRequest(new Request("https://opencode.ai/inference/openai/v1/models"), {
+        bridge: "http://127.0.0.1:1",
+        key: "bridge-key",
+        id: "proxy-1",
+      }),
+      response: new Response("{}", { status: 409, headers: { "x-bridge-error": "1" } }),
+    } as never)
+
+    expect(state.failureFor("session-bridge", "iceman-free")).toMatchObject({
+      kind: "server",
+      reached: false,
+    })
+
+    const retry = {
+      sessionID: "session-bridge",
+      model: { id: "iceman-free", providerID: "opencode" },
+      error: { status: 409 },
+      attempt: 1,
+      decision: { retry: false } as { retry: boolean; delay?: number },
+    }
+    await hooks.get("retry")?.(retry as never)
+
+    expect(retry.decision).toEqual({ retry: true, delay: ROTATE_DELAY_MS })
+  })
+
   test("the exhausted strategy keeps the chosen exit through a short rest", async () => {
     const { state } = await makeRestartable()
     await state.addRelay(relay("relay-a"))
@@ -1001,6 +1161,29 @@ describe("the response and retry hooks on a 409", () => {
     expect(state.isSpent("203.0.113.21")).toBe(true)
   })
 
+  test("a restore with nothing to restore leaves the rotation where it was", async () => {
+    const { state } = await makeRestartable()
+    await state.addRelay(relay("relay-a"))
+    await state.addRelay(relay("relay-b"))
+    await state.addRelay(relay("relay-c"))
+    await state.setEnabled(true)
+    await state.setStrategy("round-robin")
+    await state.setHealth("relay-a", { status: "ready" })
+    await state.setHealth("relay-b", { status: "ready" })
+    await state.setHealth("relay-c", { status: "ready" })
+
+    expect(state.pickExit({ advance: true }).exit?.id).toBe("relay-a")
+    expect(state.pickExit({ advance: true }).exit?.id).toBe("relay-b")
+
+    // Nothing is used up, so the restore is a no-op — and a no-op must not
+    // move the rotation: the next request continues in turn. The chosen-exit
+    // start and the last-served mark are cleared first, so the cursor is the
+    // only place the rotation's position lives.
+    await state.setActiveExit(undefined)
+    await state.restoreExhausted()
+    expect(state.pickExit({ advance: true }).exit?.id).toBe("relay-c")
+  })
+
   test("a rotate 409 with a spent address retires the exit, and asks for another attempt", async () => {
     const { state, hooks } = await makeHooks()
     await state.addRelay(relay("relay-1"))
@@ -1074,6 +1257,65 @@ describe("the response and retry hooks on a 409", () => {
   })
 })
 
+describe("a rewrite that throws", () => {
+  /** A routed state whose only relay cannot be rewritten: its address is not https. */
+  async function unsafeRelayHooks() {
+    const made = await makeRoutedHooks()
+    await made.state.addRelay({ ...relay("relay-1"), url: "http://relay.example.com" })
+    await made.state.setHealth("relay-1", { status: "ready" })
+    return made
+  }
+
+  function retryAfterTransportFailure() {
+    return {
+      sessionID: "session-title",
+      model: { id: freeModel.id, providerID: "opencode" },
+      error: { status: undefined, message: "fetch failed" },
+      attempt: 0,
+      decision: { retry: false } as { retry: boolean; delay?: number },
+    }
+  }
+
+  test("keeps no sample of a request it never sent", async () => {
+    const { state, hooks } = await unsafeRelayHooks()
+
+    const request = routedRequest("primary")
+    await hooks.get("http.request")?.(request as never)
+
+    // The relay was refused before anything left: the request is untouched,
+    // and a test must not later replay it as traffic this plugin sent.
+    expect(request.request.url).toBe("https://opencode.ai/inference/openai/v1/models")
+    expect(state.requestSample()).toBeUndefined()
+    // The rewrite failure itself is still one failure of the exit.
+    expect(state.failureCount("relay-1")).toBe(1)
+  })
+
+  test("does not rest the exit again for the failure of its own rewrite", async () => {
+    const { state, hooks } = await unsafeRelayHooks()
+
+    await hooks.get("http.request")?.(routedRequest("primary") as never)
+
+    const retry = retryAfterTransportFailure()
+    await hooks.get("retry")?.(retry as never)
+
+    // The direct request's transport failure must not be charged to an exit
+    // the request never used: a second rest doubles the wait, and the note
+    // would bury the reason the request went direct.
+    expect(state.failureCount("relay-1")).toBe(1)
+    expect(state.summaryOf("relay-1")?.lastError).toContain("https address")
+  })
+
+  test("keeps the sample of a relay that was rewritten", async () => {
+    const { state, hooks } = await makeRoutedHooks()
+    await state.addRelay(relay("relay-1"))
+    await state.setHealth("relay-1", { status: "ready" })
+
+    await hooks.get("http.request")?.(routedRequest("primary") as never)
+
+    expect(state.requestSample()?.path).toBe("/inference/openai/v1/models")
+  })
+})
+
 describe("a write that does not land", () => {
   test("a pause that was not written leaves the exit in use", async () => {
     const storage = failingStorage()
@@ -1142,6 +1384,56 @@ describe("a write that does not land", () => {
     expect(state.exit("relay-1")?.status).toBe("unreachable")
     expect(state.exit("relay-1")?.coolingUntil).toBeDefined()
     expect(state.coolingExits()).toContain("relay-1")
+  })
+
+  test("a tested mark that was not written goes back, unless a live field landed", async () => {
+    // A plain failure: the mark goes back, or the running process would serve
+    // an address the disk still calls imported.
+    const plain = failingStorage()
+    const state = new RelayState(plain as never)
+    await state.load()
+    await state.addProxy({ ...proxy("proxy-1"), imported: true })
+    plain.fail("proxies")
+    await expect(state.markTested("proxy-1")).rejects.toThrow(/proxies/)
+    expect(state.exit("proxy-1")?.imported).toBe(true)
+
+    // A write that lost to a live field: the field belongs to the record now,
+    // and putting the pre-write record back would lose it. The mark stays only
+    // on disk, so a restart re-arms it — failing closed rather than serving an
+    // address the disk still calls imported.
+    const raced = failingStorage()
+    const other = new RelayState(raced as never)
+    await other.load()
+    await other.addProxy({ ...proxy("proxy-2"), imported: true })
+    raced.fail("proxies")
+    const marking = other.markTested("proxy-2")
+    other.noteEgress("proxy-2", "203.0.113.9")
+    await expect(marking).rejects.toThrow(/proxies/)
+
+    expect(other.exit("proxy-2")?.egress).toBe("203.0.113.9")
+  })
+
+  test("a url edit that was not written leaves a pause that landed alone", async () => {
+    const storage = deferredFailureStorage()
+    const state = new RelayState(storage as never)
+    await state.load()
+    await state.addProxy(proxy("proxy-1"))
+    await state.setHealth("proxy-1", { status: "ready" })
+    storage.arm("proxies")
+
+    // The edit is still on its way to the disk when the user pauses the exit.
+    // The pause is queued behind it and lands once the edit fails.
+    const editing = state.updateProxy("proxy-1", { url: "http://new.example.com:8080" })
+    const pausing = state.setExitEnabled("proxy-1", false)
+    await Bun.sleep(0)
+    storage.release()
+    await expect(editing).rejects.toThrow(/proxies/)
+    await pausing
+
+    // The pause is on disk, so the record must keep it: putting the old record
+    // back whole would resume an exit the disk says is paused.
+    expect(state.exit("proxy-1")?.enabled).toBe(false)
+    expect(state.exit("proxy-1")?.url).toBe("http://new.example.com:8080")
   })
 
   test("a restore that was not written puts the provider's window back", async () => {
@@ -1254,6 +1546,19 @@ describe("the picker's reasons", () => {
     // An exit that could serve but was left out still gets the caller's reason.
     const excluded = pick.skipped.find((exit) => exit.id === "relay-2")
     expect(excluded?.reason).toBe(exclusion.reason)
+  })
+
+  test("an imported exit asks for a test instead of claiming it cannot serve", async () => {
+    const state = await makeState()
+    await state.addProxy({ ...proxy("proxy-1"), imported: true })
+    await state.setHealth("proxy-1", { status: "reachable" })
+
+    const pick = state.pickExit({ advance: false })
+
+    expect(pick.exit).toBeUndefined()
+    expect(pick.skipped.find((entry) => entry.id === "proxy-1")?.reason).toBe(
+      "imported - test it to use it",
+    )
   })
 })
 

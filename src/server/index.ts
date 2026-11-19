@@ -92,8 +92,15 @@ export default Plugin.define({
     })
 
     // Exits that were added but never checked (an import, a list of proxies)
-    // are looked at once the plugin is fully set up, not before.
-    if (state.settings().enabled && state.exits().some((exit) => exit.status === "untested")) {
+    // are looked at once the plugin is fully set up, not before. With
+    // background checks off this sweep is a check nobody asked for: the exits
+    // wait for a test, as the setting promises.
+    const startup = state.settings()
+    if (
+      startup.enabled &&
+      startup.healthChecks &&
+      state.exits().some((exit) => exit.status === "untested")
+    ) {
       void tester.scan("api").catch(() => {})
     }
 

@@ -312,6 +312,13 @@ export interface ExitSummary {
    */
   readonly spendReason?: string
   readonly lastError?: string
+  /**
+   * True while the exit came from an imported file and nobody has tested it.
+   *
+   * The server never sweeps such an exit, so the menus leave it out of the
+   * batch rows: a scan would skip it and the row would be a no-op.
+   */
+  readonly imported?: boolean
   readonly stats: ExitStats
 }
 
@@ -364,6 +371,7 @@ export function toExitSummary(
     ...(exit.exhaustedUntil !== undefined ? { exhaustedUntil: exit.exhaustedUntil } : {}),
     ...(spendReason !== undefined ? { spendReason } : {}),
     ...(exit.lastError !== undefined ? { lastError: exit.lastError } : {}),
+    ...(exit.imported === true ? { imported: true } : {}),
     stats,
   }
   if (exit.kind === "relay") {
