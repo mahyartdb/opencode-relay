@@ -186,6 +186,13 @@ export default Plugin.define({
           // timer that outlives the plugin would keep the process alive for
           // nothing. Waking the waiter with it lets the loop reach the
           // `alive` check and stop, instead of hanging on the await.
+          //
+          // The cleanup can land during the refresh above, before this timer
+          // exists: arming one then would be a timer it never sees.
+          if (!alive) {
+            resolve()
+            return
+          }
           firstPaintTimer = setTimeout(resolve, wait)
           wakeFirstPaint = resolve
         })

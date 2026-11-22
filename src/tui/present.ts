@@ -149,6 +149,8 @@ const STATUS_LABELS: Record<string, string> = {
   unreachable: "not answering",
   bad: "failing",
   unknown: "not tested",
+  /** The refusal a second test of a busy exit answers with, never stored. */
+  testing: "already being tested",
 }
 
 /** The label for a status, whatever spelling the record used. */

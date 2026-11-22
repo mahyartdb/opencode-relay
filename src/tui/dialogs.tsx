@@ -109,6 +109,35 @@ let refreshLoud = false
  */
 let refreshGeneration = 0
 
+/**
+ * The quick actions that have not settled yet, by exit id.
+ *
+ * The list stays open while `t` and `u` work, and the host runs an action on
+ * every keypress. Holding either key would otherwise start a second check or
+ * a second deployment of the same project. A failed call has still stopped,
+ * so its entry is released on the way out either way.
+ */
+const actionInFlight = new Map<string, Promise<void>>()
+
+/**
+ * Whether the Exits list is waiting for a choice.
+ *
+ * The host's select cannot take new options, so an action that changes a row
+ * ends by closing the list and letting it ask again. The flag says that close
+ * was asked for: an empty answer then means "rebuild", not "the user backed
+ * out".
+ */
+let exitsListPending = false
+let exitsRebuildRequested = false
+/**
+ * The exit a quick action acted on, when a rebuild was asked for.
+ *
+ * The rebuild pre-selects the row the cursor sat on; the acted-on exit is the
+ * one the user was looking at, so the cursor stays there across the rebuild
+ * instead of jumping to whatever exit the routing happens to use.
+ */
+let exitsRebuildExit: string | undefined
+
 /** Release the refresh latch, so a re-activated plugin starts fresh. */
 export function resetRefresh(): void {
   refreshGeneration += 1
@@ -117,6 +146,13 @@ export function resetRefresh(): void {
   // A loud caller from the last activation must not make the new one's
   // startup probe paint a starting server as dead.
   refreshLoud = false
+  // A quick action belongs to the activation that started it: its latch must
+  // not outlive the reload, or the next activation's `t` and `u` would answer
+  // nothing at all.
+  actionInFlight.clear()
+  exitsListPending = false
+  exitsRebuildRequested = false
+  exitsRebuildExit = undefined
   // The callers that were waiting are let go: a promise that never settles
   // would leave a menu loop suspended across the reload.
   const pending = refreshPending
@@ -1252,16 +1288,36 @@ function describeTest(
  * they are choosing from, so it never opens a dialog of its own.
  */
 async function quickTest(context: Context, client: RelayClient, exit: ExitChoice): Promise<void> {
-  context.ui.toast.show({ title: "Relay", message: `Testing ${exit.name}...`, variant: "info" })
-  const result = await callRpc(context, "Relay", () => client.testExit({ id: exit.id }))
-  if (!result) return
-  context.ui.toast.show({
-    title: "Relay",
-    message: describeTest(result, exit.name),
-    variant: result.ok ? "success" : "warning",
-    duration: result.ok ? 4000 : 8000,
-  })
-  void refreshStatus(context, client)
+  const generation = activation
+  try {
+    context.ui.toast.show({ title: "Relay", message: `Testing ${exit.name}...`, variant: "info" })
+    const result = await callRpc(context, "Relay", () => client.testExit({ id: exit.id }))
+    if (!result) return
+    context.ui.toast.show({
+      title: "Relay",
+      message: describeTest(result, exit.name),
+      variant: result.ok ? "success" : "warning",
+      duration: result.ok ? 4000 : 8000,
+    })
+  } finally {
+    // A reload already dropped the whole latch: deleting by id here could
+    // take out an entry the new activation set for the same exit.
+    if (generation === activation) {
+      // callRpc swallows a failure into a toast and answers undefined, so a
+      // success-path release would leave the exit latched forever.
+      actionInFlight.delete(exit.id)
+      void refreshStatus(context, client)
+      // The list cannot be handed new options, so it is closed and asked
+      // again: that is the only way the new verdict reaches the row. A failed
+      // test asks for the same rebuild, because its verdict changed too — and
+      // a transport failure counts, since its refusal is a verdict of sorts.
+      if (exitsListPending) {
+        exitsRebuildRequested = true
+        exitsRebuildExit = exit.id
+        context.ui.dialog.clear()
+      }
+    }
+  }
 }
 
 /** The key binding that tests the exit the cursor is on. */
@@ -1283,7 +1339,12 @@ function testAction(context: Context, client: RelayClient): DialogSelectAction<E
         })
         return
       }
-      void quickTest(context, client, value)
+      // The list stays open and the host runs this on every keypress, so a
+      // held key would otherwise probe the same exit again and again. The
+      // call is wrapped so a throw before its first await cannot escape the
+      // keypress handler.
+      if (actionInFlight.has(value.id)) return
+      actionInFlight.set(value.id, Promise.resolve().then(() => quickTest(context, client, value)))
     },
   }
 }
@@ -1296,23 +1357,38 @@ function testAction(context: Context, client: RelayClient): DialogSelectAction<E
  * says what it is doing in a toast and the list keeps its own loop.
  */
 async function quickUpdate(context: Context, client: RelayClient, exit: ExitChoice): Promise<void> {
-  context.ui.toast.show({ title: "Relay", message: `Updating ${exit.name}...`, variant: "info" })
-  const result = await callRpc(context, "Relay", () => client.updateRelay({ id: exit.id }))
-  if (!result) return
-  context.ui.toast.show({
-    title: "Relay",
-    // A relay that answered with a status has a problem of its own - a wrong
-    // access token, most of all - and "did not answer" would send the user
-    // looking in the wrong place.
-    message: result.reachable
-      ? `${exit.name} is redeployed and answered.`
-      : result.status !== undefined && result.status > 0
-        ? `${exit.name} is redeployed, but it answered HTTP ${result.status}.`
-        : `${exit.name} is redeployed, but did not answer yet.`,
-    variant: result.reachable ? "success" : "warning",
-    duration: result.reachable ? 6000 : 9000,
-  })
-  void refreshStatus(context, client)
+  const generation = activation
+  try {
+    context.ui.toast.show({ title: "Relay", message: `Updating ${exit.name}...`, variant: "info" })
+    const result = await callRpc(context, "Relay", () => client.updateRelay({ id: exit.id }))
+    if (!result) return
+    context.ui.toast.show({
+      title: "Relay",
+      // A relay that answered with a status has a problem of its own - a wrong
+      // access token, most of all - and "did not answer" would send the user
+      // looking in the wrong place.
+      message: result.reachable
+        ? `${exit.name} is redeployed and answered.`
+        : result.status !== undefined && result.status > 0
+          ? `${exit.name} is redeployed, but it answered HTTP ${result.status}.`
+          : `${exit.name} is redeployed, but did not answer yet.`,
+      variant: result.reachable ? "success" : "warning",
+      duration: result.reachable ? 6000 : 9000,
+    })
+  } finally {
+    // A refusal is answered with a toast and no value, and must not latch the
+    // exit against every later attempt. A reload has already dropped the
+    // latch, so deleting by id here could take out the new activation's entry.
+    if (generation === activation) {
+      actionInFlight.delete(exit.id)
+      void refreshStatus(context, client)
+      if (exitsListPending) {
+        exitsRebuildRequested = true
+        exitsRebuildExit = exit.id
+        context.ui.dialog.clear()
+      }
+    }
+  }
 }
 
 /** The key binding that redeploys the relay the cursor is on. */
@@ -1344,7 +1420,11 @@ function updateAction(context: Context, client: RelayClient): DialogSelectAction
         })
         return
       }
-      void quickUpdate(context, client, value)
+      // Holding the key would start a second deployment of the same Vercel
+      // project, and the two would race each other. The call is wrapped so a
+      // throw before its first await cannot escape the keypress handler.
+      if (actionInFlight.has(value.id)) return
+      actionInFlight.set(value.id, Promise.resolve().then(() => quickUpdate(context, client, value)))
     },
   }
 }
@@ -1385,6 +1465,9 @@ async function manageExits(
   client: RelayClient,
   reportRefresh: (refresh: Refresh) => void,
 ): Promise<void> {
+  // A request left over from a list the user already backed out of has
+  // nothing to rebuild, and must not reopen the next one.
+  exitsRebuildRequested = false
   for (;;) {
     const refreshed = await withWorking(context, "Reading the relay", () =>
       refreshStatus(context, client),
@@ -1393,24 +1476,50 @@ async function manageExits(
     if (!status) return
     if (!refreshed.ok) reportRefresh(refreshed)
     const active = status.activeExit
-    // The dialog finds the pre-selected row by deep equality with the option
-    // values, so this carries the same deployed flag exitList sets.
+    // The rebuild pre-selects the exit a quick action acted on, so the cursor
+    // stays on the row the user was working with; the active exit is the
+    // fallback when that one is gone. The dialog finds the pre-selected row
+    // by deep equality with the option values, so this carries the same
+    // deployed flag exitList sets.
+    const preselect =
+      exitsRebuildExit !== undefined
+        ? status.exits.find((exit) => exit.id === exitsRebuildExit)
+        : undefined
+    exitsRebuildExit = undefined
+    const chosen = preselect ?? (active === undefined ? undefined : status.exits.find((exit) => exit.id === active.id))
     const current: ExitChoice | undefined =
-      active === undefined
+      chosen === undefined
         ? undefined
         : {
-            id: active.id,
-            name: active.name,
-            kind: active.kind,
-            deployed: active.kind === "relay" && isDeployedExit(active, status),
+            id: chosen.id,
+            name: chosen.name,
+            kind: chosen.kind,
+            deployed: chosen.kind === "relay" && isDeployedExit(chosen, status),
           }
-    const choice = await context.ui.dialog.select<ExitListAction>({
-      title: `Exits${refreshed.ok ? "" : " · last known state"}`,
-      options: exitsMenuOptions(status),
-      ...(current !== undefined ? { current } : {}),
-      actions: [testAction(context, client), updateAction(context, client)],
-    })
-    if (choice === undefined) return
+    exitsListPending = true
+    const choice = await context.ui.dialog
+      .select<ExitListAction>({
+        title: `Exits${refreshed.ok ? "" : " · last known state"}`,
+        options: exitsMenuOptions(status),
+        ...(current !== undefined ? { current } : {}),
+        actions: [testAction(context, client), updateAction(context, client)],
+      })
+      .finally(() => {
+        exitsListPending = false
+      })
+    if (choice === undefined) {
+      // A quick action closed the list so the flow could ask again with the
+      // new verdicts: this empty answer is that ask, not a way out.
+      if (exitsRebuildRequested) {
+        exitsRebuildRequested = false
+        continue
+      }
+      return
+    }
+    // The chosen row leads somewhere else, so a rebuild requested too late
+    // has nothing left to rebuild.
+    exitsRebuildRequested = false
+    exitsRebuildExit = undefined
     if (!("id" in choice)) {
       switch (choice.kind) {
         case "add":
