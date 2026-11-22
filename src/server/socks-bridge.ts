@@ -16,7 +16,7 @@ import dns from "node:dns/promises"
 import { UPSTREAM_HOST } from "../lib/types.ts"
 
 export interface SocksUpstream {
-  readonly version: 4 | 5
+  readonly version: 4 | 5 | "4a"
   readonly host: string
   readonly port: number
   readonly username?: string
@@ -62,6 +62,15 @@ interface Bridge {
 
 const bridges = new Map<string, Promise<SocksBridge>>()
 const meta = new Map<string, Bridge>()
+/**
+ * Every accepted client and upstream socket, across every bridge.
+ *
+ * `server.close()` stops new accepts but leaves the sockets it already accepted
+ * piping, so a tunnel open at unload would keep relaying traffic through a
+ * module that can no longer be reached. Closing the bridges has to destroy
+ * these itself.
+ */
+const live = new Set<net.Socket>()
 
 function dropBridge(bridge: Bridge): void {
   bridge.server.close()
@@ -91,8 +100,10 @@ function isAllowedTarget(host: string): boolean {
   return name === UPSTREAM_HOST || name.endsWith(`.${UPSTREAM_HOST}`)
 }
 
+// JSON keeps the fields apart: a colon or @ inside a credential cannot make
+// two different upstreams share a key and therefore a bridge.
 const keyOf = (up: SocksUpstream): string =>
-  `${up.version}|${up.username ?? ""}:${up.password ?? ""}@${up.host}:${up.port}`
+  JSON.stringify([up.version, up.username ?? "", up.password ?? "", up.host, up.port])
 
 const REPLIES = [
   "succeeded",
@@ -248,7 +259,13 @@ export function socks5Connect(
   })
 }
 
-/** Open a SOCKS4 tunnel. SOCKS4 carries IPv4 only, so the name is resolved here. */
+/**
+ * Open a SOCKS4 tunnel.
+ *
+ * SOCKS4 carries IPv4 only, so the name is resolved here. SOCKS4a leaves the
+ * name to the proxy: the request carries 0.0.0.1 in place of the address and
+ * appends the hostname after the userid.
+ */
 export async function socks4Connect(
   up: SocksUpstream,
   host: string,
@@ -258,7 +275,11 @@ export async function socks4Connect(
   if (!credentialsFit(up)) {
     throw new Error(`The SOCKS credentials for ${up.host}:${up.port} are longer than ${CREDENTIAL_LIMIT} bytes.`)
   }
-  const ip = net.isIPv4(host) ? host : (await dns.lookup(host, { family: 4 })).address
+  const ip = net.isIPv4(host)
+    ? host
+    : up.version === "4a"
+      ? undefined
+      : (await dns.lookup(host, { family: 4 })).address
   return new Promise((resolve, reject) => {
     const socket = net.connect({ host: up.host, port: up.port })
     socket.setNoDelay(true)
@@ -279,9 +300,10 @@ export async function socks4Connect(
       socket.write(
         Buffer.concat([
           Buffer.from([0x04, 0x01, (port >> 8) & 0xff, port & 0xff]),
-          Buffer.from(ip.split(".").map(Number)),
+          ip === undefined ? Buffer.from([0, 0, 0, 1]) : Buffer.from(ip.split(".").map(Number)),
           Buffer.from(up.username ?? ""),
           Buffer.from([0x00]),
+          ...(ip === undefined ? [Buffer.from(host), Buffer.from([0x00])] : []),
         ]),
       ),
     )
@@ -312,7 +334,7 @@ export async function socks4Connect(
 }
 
 function connect(up: SocksUpstream, host: string, port: number): Promise<net.Socket> {
-  return up.version === 4 ? socks4Connect(up, host, port) : socks5Connect(up, host, port)
+  return up.version === 5 ? socks5Connect(up, host, port) : socks4Connect(up, host, port)
 }
 
 function link(a: net.Socket, b: net.Socket): void {
@@ -395,7 +417,16 @@ function handle(client: net.Socket, up: SocksUpstream, auth: string): void {
     const rest = head.subarray(end + 4)
     const lines = text.split("\r\n")
     const [method, target, version] = (lines[0] ?? "").split(" ")
-    if (!method || !target || !version) {
+    // The request line is written back out, so its tokens are checked to the
+    // HTTP grammar: a control character in the method or the version would
+    // otherwise smuggle a line into the forwarded request.
+    if (
+      !method ||
+      !target ||
+      !version ||
+      !/^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/.test(method) ||
+      !/^HTTP\/\d(?:\.\d)?$/.test(version)
+    ) {
       refuse("400 Bad Request")
       return
     }
@@ -418,7 +449,9 @@ function handle(client: net.Socket, up: SocksUpstream, auth: string): void {
         }
         const host = target.slice(0, colon).replace(/^\[|\]$/g, "")
         const port = Number(target.slice(colon + 1))
-        if (!host || !(port > 0)) {
+        // A port outside 1..65535 wraps in the SOCKS bytes, so it would dial
+        // some other port than the one the client asked for.
+        if (!host || !Number.isInteger(port) || port < 1 || port > 65535) {
           refuse("400 Bad Request")
           return
         }
@@ -427,6 +460,8 @@ function handle(client: net.Socket, up: SocksUpstream, auth: string): void {
           return
         }
         const upstream = await connect(up, host, port)
+        live.add(upstream)
+        upstream.once("close", () => live.delete(upstream))
         if (client.destroyed) {
           upstream.destroy()
           return
@@ -447,6 +482,8 @@ function handle(client: net.Socket, up: SocksUpstream, auth: string): void {
         return
       }
       const upstream = await connect(up, url.hostname.replace(/^\[|\]$/g, ""), port)
+      live.add(upstream)
+      upstream.once("close", () => live.delete(upstream))
       if (client.destroyed) {
         upstream.destroy()
         return
@@ -505,8 +542,12 @@ export function socksBridge(up: SocksUpstream): Promise<SocksBridge> {
     }
     const entry = { key, server: undefined as unknown as net.Server, auth, active: 0, last: Date.now() }
     const server = net.createServer((client) => {
+      // Tracked before handle(): a client still mid-handshake is the bridge's
+      // socket too, and must not survive the unload.
+      live.add(client)
       entry.active++
       client.once("close", () => {
+        live.delete(client)
         entry.active--
         entry.last = Date.now()
       })
@@ -514,15 +555,23 @@ export function socksBridge(up: SocksUpstream): Promise<SocksBridge> {
     })
     entry.server = server
     meta.set(key, entry)
-    server.once("error", (error) => {
+    const onListenError = (error: Error) => {
       // A bind error must not leave a dead entry behind: it would count
-      // against the cap forever, with nothing listening at all.
+      // against the cap forever, with nothing listening at all. Rejecting
+      // also drops the `bridges` entry.
       meta.delete(key)
       reject(error)
+    }
+    server.once("error", onListenError)
+    server.listen(0, "127.0.0.1", () => {
+      // After a successful listen an error means the server is dead. A
+      // permanent handler takes over so a second error is not unhandled, and
+      // it drops the bridge from both maps: a dead bridge must never be
+      // handed out again.
+      server.off("error", onListenError)
+      server.on("error", () => dropBridge(entry))
+      resolve({ url: `http://127.0.0.1:${(server.address() as net.AddressInfo).port}`, secret })
     })
-    server.listen(0, "127.0.0.1", () =>
-      resolve({ url: `http://127.0.0.1:${(server.address() as net.AddressInfo).port}`, secret }),
-    )
   })
   bridges.set(key, started)
   started.catch(() => bridges.delete(key))
@@ -532,17 +581,19 @@ export function socksBridge(up: SocksUpstream): Promise<SocksBridge> {
 /** Stop every local bridge. Called when the plugin unloads. */
 export function closeSocksBridges(): void {
   for (const bridge of meta.values()) bridge.server.close()
+  for (const socket of live) socket.destroy()
+  live.clear()
   bridges.clear()
   meta.clear()
 }
 
-/** Read a socks4:// or socks5:// URL into an upstream, or nothing. */
+/** Read a socks4://, socks4a:// or socks5:// URL into an upstream, or nothing. */
 export function parseSocksUrl(raw: string): SocksUpstream | undefined {
   try {
     const url = new URL(raw)
     if (!/^socks(4a?|5h?):$/.test(url.protocol)) return undefined
     const upstream: SocksUpstream = {
-      version: url.protocol.startsWith("socks4") ? 4 : 5,
+      version: url.protocol === "socks4:" ? 4 : url.protocol === "socks4a:" ? "4a" : 5,
       host: url.hostname.replace(/^\[|\]$/g, ""),
       port: Number(url.port) || 1080,
       ...(url.username.length > 0 ? { username: decodeURIComponent(url.username) } : {}),
