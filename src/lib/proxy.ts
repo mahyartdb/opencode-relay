@@ -13,7 +13,7 @@
 import net from "node:net"
 
 /** The proxy protocols OpenCode traffic can use through the local bridge. */
-export type ProxyScheme = "http" | "https" | "socks4" | "socks5"
+export type ProxyScheme = "http" | "https" | "socks4" | "socks4a" | "socks5"
 
 /** One proxy read from a list. */
 export interface ParsedProxy {
@@ -47,7 +47,7 @@ const SCHEMES: Record<string, ProxyScheme> = {
   https: "https",
   socks: "socks5",
   socks4: "socks4",
-  socks4a: "socks4",
+  socks4a: "socks4a",
   socks5: "socks5",
   socks5h: "socks5",
 }
@@ -84,25 +84,29 @@ export function redactProxyToken(value: string): string {
   const clean = value.replace(/[\u0000-\u001f\u007f-\u009f\u001b]/g, "")
   const at = clean.lastIndexOf("@")
   if (at >= 0) {
-    const after = clean.slice(at + 1)
-    // Only the part after the @ may be shown when it really is an address:
-    // the swapped host:port@user:pass shape would otherwise show the
-    // password where the host belongs. When both sides read as host:port
-    // the sides are ambiguous, so nothing after the @ is shown either. The
-    // scheme is stripped before the check: it is never part of the address,
-    // and it keeps the other side from parsing.
+    // The address is the side that reads as a machine; a side that does not
+    // is never shown, because in the swapped host:port@user:pass shape it is
+    // the password. When both sides or neither read as an address the sides
+    // are ambiguous, so nothing is shown. A side containing an @ is never an
+    // address either — in `user@host:port@host:port` the @-carrying side is
+    // the credentials — so it stays hidden even when it ends in a host and
+    // port. The scheme is stripped first, so the index into the remaining
+    // text is the same one the sides are cut with.
     const scheme = /^([a-z][a-z0-9+.-]*):\/\//i.exec(clean)
-    const before = splitHostPort(
-      (scheme === null ? clean : clean.slice(scheme[0].length)).slice(0, at),
-    )
-    const address = splitHostPort(after)
+    const prefix = scheme === null ? "" : scheme[0]
+    const rest = clean.slice(prefix.length)
+    const cut = at - prefix.length
+    const before = rest.slice(0, cut)
+    const after = rest.slice(cut + 1)
+    const beforeAddress = looksLikeAddress(before)
+    const afterAddress = looksLikeAddress(after)
     const shown =
-      address !== undefined &&
-      address.port !== undefined &&
-      !(before !== undefined && before.port !== undefined)
-        ? after.slice(0, 100)
-        : "***"
-    return `***@${shown}`.slice(0, 120)
+      afterAddress && !beforeAddress
+        ? after
+        : beforeAddress && !afterAddress && !before.includes("@")
+          ? before
+          : undefined
+    return `***@${shown === undefined ? "***" : shown.slice(0, 100)}`.slice(0, 120)
   }
   // The legacy host:port:user[:pass] shapes carry credentials after the
   // port with no @ to mark them. The port is what tells the two apart: a
@@ -118,7 +122,15 @@ export function redactProxyToken(value: string): string {
   const second = rest.indexOf(":", first + 1)
   const port = second < 0 ? rest.slice(first + 1) : rest.slice(first + 1, second)
   if (!/^\d+$/.test(port)) return `${prefix}${rest.slice(0, first)}:***`.slice(0, 120)
-  if (second < 0) return clean.slice(0, 120)
+  if (second < 0) {
+    // A bare host:port is shown whole, but a numeric password can look like
+    // a port too: only a value a port can hold is one.
+    const number = Number(port)
+    if (number < 1 || number > 65535) {
+      return `${prefix}${rest.slice(0, first)}:***`.slice(0, 120)
+    }
+    return clean.slice(0, 120)
+  }
   return `${prefix}${rest.slice(0, second)}:***`.slice(0, 120)
 }
 
@@ -191,6 +203,21 @@ function splitHostPort(value: string): { host: string; port?: number } | undefin
   const host = single[1] ?? ""
   const port = single[2] === undefined ? undefined : Number(single[2])
   return port === undefined ? { host } : { host, port }
+}
+
+/**
+ * Whether a host:port side reads as a machine: an IP, localhost, or a dotted
+ * name.
+ *
+ * A side that does not is treated as credentials, both by the parser when it
+ * decides which side of an @ is the address and by the redactor when it
+ * decides what may be shown.
+ */
+function looksLikeAddress(side: string): boolean {
+  const parsed = splitHostPort(side)
+  if (parsed === undefined || parsed.port === undefined) return false
+  const name = parsed.host.toLowerCase()
+  return net.isIP(name) !== 0 || name === "localhost" || /\.[a-z]/i.test(name)
 }
 
 /** Whether the host is something a proxy URL can point at. */
@@ -288,12 +315,6 @@ function readToken(
     auth = hostPart
     hostPart = swap
   } else if (auth !== undefined && splitHostPort(auth) !== undefined && splitHostPort(hostPart) !== undefined) {
-    const looksLikeAddress = (side: string): boolean => {
-      const parsedSide = splitHostPort(side)
-      if (parsedSide === undefined || parsedSide.port === undefined) return false
-      const name = parsedSide.host.toLowerCase()
-      return net.isIP(name) !== 0 || name === "localhost" || /\.[a-z]/i.test(name)
-    }
     if (!looksLikeAddress(hostPart) && looksLikeAddress(auth)) {
       const swap = auth
       auth = hostPart

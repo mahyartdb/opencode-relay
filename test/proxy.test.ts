@@ -139,7 +139,7 @@ describe("parseProxyList", () => {
   test("maps the scheme aliases", () => {
     expect(parseProxyUrl("socks://1.2.3.4:1080")?.scheme).toBe("socks5")
     expect(parseProxyUrl("socks5h://1.2.3.4:1080")?.scheme).toBe("socks5")
-    expect(parseProxyUrl("socks4a://1.2.3.4:1080")?.scheme).toBe("socks4")
+    expect(parseProxyUrl("socks4a://1.2.3.4:1080")?.scheme).toBe("socks4a")
     expect(parseProxyUrl("https://1.2.3.4:443")?.scheme).toBe("https")
   })
 
@@ -337,6 +337,34 @@ describe("redactProxyToken", () => {
     // @, where the address belongs: masking only the @ would show the
     // password where the host should be.
     expect(redactProxyToken("host:port@alice:MyS3cretPw")).not.toContain("MyS3cretPw")
+  })
+
+  test("shows the address whichever side of the @ it is on", () => {
+    expect(redactProxyToken("alice:secret@1.2.3.4:8080")).toBe("***@1.2.3.4:8080")
+    expect(redactProxyToken("1.2.3.4:8080@alice:secret")).toBe("***@1.2.3.4:8080")
+  })
+
+  test("shows neither side when the address-like side carries an @", () => {
+    // WHATWG reads `http://alice@example.com:8080@proxy:3128` with username
+    // `alice@example.com` and password `8080`: the side before the last @ is
+    // the credentials, so it must not be shown even though it ends in a
+    // dotted host and port that the address check accepts. An address side
+    // never contains an @.
+    expect(redactProxyToken("http://alice@example.com:8080@proxy:3128")).toBe("***@***")
+  })
+
+  test("shows neither side when neither reads as an address", () => {
+    // The address side lost its port, so "hunter2:12345" parses as a
+    // host:port even though it is the password: neither side may be shown.
+    expect(redactProxyToken("1.2.3.4@hunter2:12345")).toBe("***@***")
+    // With a scheme the cut must still land on the same side: "host:8080"
+    // is not an address-like host, so "user:12345" stays hidden.
+    expect(redactProxyToken("http://host:8080@user:12345")).toBe("***@***")
+  })
+
+  test("does not show a numeric password as if it were a port", () => {
+    // 873459 cannot be a port, so it is the password, not the address.
+    expect(redactProxyToken("alice:873459")).toBe("alice:***")
   })
 
   test("does not show a password that has no port to mark it", () => {

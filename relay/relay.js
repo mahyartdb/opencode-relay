@@ -188,6 +188,12 @@ export default {
     }
     if (url.protocol !== 'https:' || !hostAllowed(url.hostname.toLowerCase()))
       return json(403, { error: 'Target host not allowed' });
+    // The allowlist names hosts, so a port would choose a different service
+    // than the one it allows. The plugin's own targets carry no port, so only
+    // the default HTTPS one is forwarded.
+    if (url.port !== '' && url.port !== '443')
+      return json(403, { error: 'Target port not allowed' });
+    if (!path.startsWith('/')) return json(403, { error: 'Target path not allowed' });
 
     const headers = new Headers();
     for (const [k, v] of req.headers) if (!IDENTITY.test(k)) headers.set(k, v);
