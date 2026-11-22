@@ -92,26 +92,24 @@ const StoredProxy = Schema.Struct({
   ...HealthFields,
 })
 
-/** The stored shape of the routing rules. */
-const StoredSettings = Schema.Struct({
+/** The stored shape of the routing rules, read one field at a time. */
+const SETTINGS_FIELDS = {
   // A file written by hand or by an older version may be missing any of the
   // first three; readSettings fills in what a fresh installation starts with
   // instead of dropping every saved choice.
-  enabled: Schema.optionalKey(Schema.Boolean),
-  selection: Schema.optionalKey(Schema.Literals(["all", "free", "custom"])),
+  enabled: Schema.Boolean,
+  selection: Schema.Literals(["all", "free", "custom"]),
   // Written before the strategies existed, so a stored value may not have it.
-  strategy: Schema.optionalKey(
-    Schema.Literals(["fixed", "round-robin", "exhausted", "fastest"]),
-  ),
-  customModels: Schema.optionalKey(Schema.Array(Schema.String)),
+  strategy: Schema.Literals(["fixed", "round-robin", "exhausted", "fastest"]),
+  customModels: Schema.Array(Schema.String),
   // The field was called activeRelayId before proxies existed.
-  activeExitId: Schema.optionalKey(Schema.String),
-  activeRelayId: Schema.optionalKey(Schema.String),
-  direct: Schema.optionalKey(Schema.Literals(["allow", "never"])),
-  healthChecks: Schema.optionalKey(Schema.Boolean),
+  activeExitId: Schema.String,
+  activeRelayId: Schema.String,
+  direct: Schema.Literals(["allow", "never"]),
+  healthChecks: Schema.Boolean,
   /** Where the round-robin rotation stood, so a restart does not start over. */
-  rotationId: Schema.optionalKey(Schema.String),
-})
+  rotationId: Schema.String,
+} as const
 
 type StoredHealth = {
   readonly enabled?: boolean
@@ -320,24 +318,62 @@ export async function readProxies(storage: StorageDomain): Promise<ProxyRecord[]
   return proxies
 }
 
-/** The stored rules, or nothing when there are none yet. */
-export async function readSettings(storage: StorageDomain): Promise<Settings | undefined> {
+/**
+ * The stored rules, or nothing when there are none yet.
+ *
+ * A file that exists but does not make sense is read field by field, so one
+ * wrong value cannot take every other saved choice with it. Only such a file
+ * is reported: a fresh installation has no file, and nothing is wrong.
+ */
+export async function readSettings(
+  storage: StorageDomain,
+  note?: (message: string) => void,
+): Promise<Settings | undefined> {
   const raw = await storage.get(SETTINGS_KEY)
-  const decoded = Schema.decodeUnknownOption(StoredSettings)(raw)
-  if (Option.isNone(decoded)) return undefined
-  const settings = decoded.value
-  const activeExitId = settings.activeExitId ?? settings.activeRelayId
+  if (raw === undefined) return undefined
+  const stored =
+    typeof raw === "object" && raw !== null && !Array.isArray(raw)
+      ? (raw as Record<string, unknown>)
+      : undefined
+  const broken: string[] = []
+  const field = <A>(key: string, schema: Schema.ConstraintDecoder<A>): A | undefined => {
+    const value = stored?.[key]
+    if (value === undefined) return undefined
+    const decoded = Schema.decodeUnknownOption(schema)(value)
+    if (Option.isSome(decoded)) return decoded.value
+    broken.push(key)
+    return undefined
+  }
+  const enabled = field("enabled", SETTINGS_FIELDS.enabled)
+  const selection = field("selection", SETTINGS_FIELDS.selection)
+  const strategy = field("strategy", SETTINGS_FIELDS.strategy)
+  const customModels = field("customModels", SETTINGS_FIELDS.customModels)
+  const activeExitId =
+    field("activeExitId", SETTINGS_FIELDS.activeExitId) ??
+    field("activeRelayId", SETTINGS_FIELDS.activeRelayId)
+  const direct = field("direct", SETTINGS_FIELDS.direct)
+  const healthChecks = field("healthChecks", SETTINGS_FIELDS.healthChecks)
+  const rotationId = field("rotationId", SETTINGS_FIELDS.rotationId)
+  if (stored === undefined) {
+    note?.(
+      "The stored routing rules are not an object, so their defaults were used. Saving the rules again replaces the file.",
+    )
+  } else if (broken.length > 0) {
+    note?.(
+      `The stored routing rules could not be read in full: ${broken.join(", ")} had the wrong shape, so their defaults were used. Saving the rules again replaces the file.`,
+    )
+  }
   return {
-    enabled: settings.enabled ?? false,
+    enabled: enabled ?? false,
     // "all" predates the free-only rule. It is read as "free", which is what
     // the plugin would have routed anyway once paid models were filtered out.
-    selection: (settings.selection === "all" ? "free" : (settings.selection ?? "free")) as Selection,
-    strategy: (settings.strategy ?? "fixed") as Strategy,
-    customModels: [...(settings.customModels ?? [])],
-    direct: (settings.direct ?? "allow") as DirectPolicy,
-    healthChecks: settings.healthChecks ?? true,
+    selection: (selection === "all" ? "free" : (selection ?? "free")) as Selection,
+    strategy: (strategy ?? "fixed") as Strategy,
+    customModels: [...(customModels ?? [])],
+    direct: (direct ?? "allow") as DirectPolicy,
+    healthChecks: healthChecks ?? true,
     ...(activeExitId !== undefined ? { activeExitId } : {}),
-    ...(settings.rotationId !== undefined ? { rotationId: settings.rotationId } : {}),
+    ...(rotationId !== undefined ? { rotationId } : {}),
   }
 }
 

@@ -258,6 +258,13 @@ export interface HealthUpdate {
   readonly runtime?: string
   readonly lastError?: string
   readonly exhaustedUntil?: number
+  /**
+   * The rest a rate-limited verdict has to persist with the verdict.
+   *
+   * The tester arms the same cooldown again right after, but a crash between
+   * the two writes must not leave a "limited" record a restart would serve.
+   */
+  readonly coolingUntil?: number
   readonly checkedAt?: number
   /**
    * The epoch this check saw when it started.
@@ -318,13 +325,19 @@ export class RelayState {
   /** What the last answer said, so the retry hook does not have to guess. */
   private readonly failures = new Map<string, FailureContext>()
   /**
-   * The requests that went direct instead of through an exit.
+   * The requests that went direct instead of through an exit, by request key,
+   * with the time each mark was made.
    *
    * The retry hook looks for the agent loop's exit and falls back to another
    * kind's note when the loop has none. A request that went direct has no
    * exit to blame, so the fallback must not reach for another kind's note.
+   *
+   * There is no hard cap: the map is only trimmed when it grows past 200, and
+   * then only entries older than the attribution window are evicted — a mark
+   * younger than that is still read, so it is never dropped for size while it
+   * lives.
    */
-  private readonly direct = new Set<string>()
+  private readonly direct = new Map<string, number>()
   /** The last real request, so a test can send the headers OpenCode Free expects. */
   private sample: RequestSample | undefined
   private lastDecision_: LastDecision | undefined
@@ -340,7 +353,7 @@ export class RelayState {
       readAccounts(this.storage),
       readRelays(this.storage),
       readProxies(this.storage),
-      readSettings(this.storage),
+      readSettings(this.storage, (message) => this.noteFailure(message)),
     ])
     this.accountList = accounts
     // Whether a used-up latch has run out is decided on the stored records,
@@ -433,6 +446,19 @@ export class RelayState {
       next.catch(() => {}),
     )
     return next
+  }
+
+  /**
+   * Wait for every queued write to land.
+   *
+   * A dispose uses this to close only after the records it changed are on
+   * disk; the queued tails never reject, so a failed write does not turn the
+   * flush itself into a failure. The dispose disposes its hooks before
+   * calling this, so a write a hook queues on the way out is still waiting
+   * in a queue when this runs, and the snapshot the next load reads carries it.
+   */
+  async flush(): Promise<void> {
+    await Promise.all([...this.writeQueues.values()])
   }
 
   /** The stored relays. */
@@ -765,13 +791,22 @@ export class RelayState {
     const usedUp = previousUntil !== undefined && previousUntil > checkedAt
     const stillUsedUp = usedUp && update.status !== "ready"
     const until = stillUsedUp ? previousUntil : update.exhaustedUntil ?? previousUntil
+    const status = stillUsedUp ? "exhausted" : update.status
     // The runtime is the exit's own word about itself, and it is drawn on the
     // exit's page: it is stripped here, once, so no path can bring an escape
     // sequence to the screen.
     const runtime = exitReportedText(update.runtime)
+    // A verdict from a test or a probe supersedes whatever live rest was
+    // armed: the record it writes carries no live rest fields, and the
+    // in-memory entry goes with it, for every status. A `bad` verdict then
+    // governs alone — retired until another test — instead of reviving when
+    // an older live rest happens to run out. A "limited" verdict is the one
+    // exception: its own cooldown travels with it, so a crash before the
+    // follow-up mark cannot leave a record a restart would serve.
+    const previousCooling = this.cooling.get(id)
     const next: ExitRecord = {
       ...rest,
-      status: stillUsedUp ? "exhausted" : update.status,
+      status,
       lastCheck: checkedAt,
       ...(update.latencyMs !== undefined ? { latencyMs: update.latencyMs } : {}),
       ...(update.egress !== undefined ? { egress: update.egress } : {}),
@@ -780,13 +815,10 @@ export class RelayState {
       ...(until !== undefined && (stillUsedUp || update.status === "exhausted")
         ? { exhaustedUntil: until }
         : {}),
+      ...(status === "limited" && update.coolingUntil !== undefined
+        ? { coolingUntil: update.coolingUntil, failures: previousCooling?.failures ?? 0 }
+        : {}),
     }
-    // A verdict from a test or a probe supersedes whatever live rest was
-    // armed: the record it writes carries no rest fields, and the in-memory
-    // entry goes with it, for every status. A `bad` verdict then governs
-    // alone — retired until another test — instead of reviving when an older
-    // live rest happens to run out.
-    const previousCooling = this.cooling.get(id)
     this.cooling.delete(id)
     try {
       await this.replaceExit(next)
@@ -808,6 +840,17 @@ export class RelayState {
         this.cooling.set(id, previousCooling)
       }
       throw error
+    }
+    // Re-arm only after the rest is on disk: arming before the write would
+    // leave a cooldown in memory a restart could not see. A live verdict that
+    // landed meanwhile owns the entry, and its newer rest must not be
+    // replaced by this one.
+    if (
+      status === "limited" &&
+      next.coolingUntil !== undefined &&
+      this.cooling.get(id) === undefined
+    ) {
+      this.cooling.set(id, { until: next.coolingUntil, failures: next.failures ?? 0 })
     }
     return (
       current.status !== next.status ||
@@ -1868,6 +1911,9 @@ export class RelayState {
       for (const exit of expired) {
         const { exhaustedUntil: _until, coolingUntil: _cooling, failures: _failures, ...rest } = exit
         const next: ExitRecord = { ...rest, status: "reachable" }
+        // Clearing the latch is live evidence too: a check that began before
+        // it must not re-exhaust the exit for a fresh day.
+        this.bumpHealthEpoch(exit.id)
         // The rest goes with the latch: the record no longer carries it, so
         // the live map must not keep it either.
         this.cooling.delete(exit.id)
@@ -1937,6 +1983,15 @@ export class RelayState {
     // rolled back on their own, and their addresses have to go back with
     // them.
     const forgivenProxyEgresses: string[] = []
+    // Which exit forgave each address, so a rollback only takes an address
+    // back with the record it also puts back: a verdict that landed owns the
+    // record, and its forgiveness stays.
+    const forgivenByExit = new Map<string, Set<string>>()
+    const forgave = (egress: string, id: string): void => {
+      const ids = forgivenByExit.get(egress) ?? new Set<string>()
+      ids.add(id)
+      forgivenByExit.set(egress, ids)
+    }
     // The windows the spent addresses had, taken before anything forgives
     // them: the provider's own window is what a rollback has to restore, and
     // one this plugin made up would shorten it.
@@ -1965,6 +2020,7 @@ export class RelayState {
       if (relay.egress !== undefined && forgive(relay.egress)) {
         this.spent.delete(relay.egress)
         forgivenEgresses.push(relay.egress)
+        forgave(relay.egress, relay.id)
       }
       this.cooling.delete(relay.id)
       // A restore is live evidence too: a check that began before it must
@@ -1985,40 +2041,63 @@ export class RelayState {
         this.spent.delete(proxy.egress)
         forgivenEgresses.push(proxy.egress)
         forgivenProxyEgresses.push(proxy.egress)
+        forgave(proxy.egress, proxy.id)
       }
       this.cooling.delete(proxy.id)
       this.bumpHealthEpoch(proxy.id)
       const { exhaustedUntil: _until, coolingUntil: _cooling, failures: _failures, ...rest } = proxy
       return { ...rest, status: "reachable" as Status }
     })
+    // The records this call wrote, so a rollback can tell its own restore
+    // from one a live verdict has replaced meanwhile.
+    const afterRelays = new Map(this.relayList.map((relay) => [relay.id, relay]))
+    const afterProxies = new Map(this.proxyList.map((proxy) => [proxy.id, proxy]))
+    /** Whether this call's restore of the exit is still the live record. */
+    const owned = (id: string): boolean => {
+      const live = this.exit(id)
+      if (live === undefined) return false
+      const after = restoredRelays.has(id) ? afterRelays.get(id) : afterProxies.get(id)
+      return after !== undefined && sameExitRecord(live, after)
+    }
+    /** Put forgiven addresses back, but only those whose exit is rolled back too. */
+    const revertForgiven = (egresses: readonly string[], reverted: ReadonlySet<string>): void => {
+      for (const egress of egresses) {
+        const owners = forgivenByExit.get(egress)
+        if (owners === undefined || ![...owners].some((id) => reverted.has(id))) continue
+        const until = beforeSpent.get(egress)
+        if (until === undefined) this.spent.delete(egress)
+        else this.spent.set(egress, until)
+      }
+    }
     // An empty restore must not restart the rotation: the reset below says
     // "the rotation starts over because every exit is back", and saying it
     // with nothing restored would move a rotation the call never touched.
     if (restored.length === 0) return { restored, stillUsedUp }
     this.cursor = 0
     /**
-     * Put every restored exit back exactly as it was, record and live map
-     * entries included. The epoch is not rewound: a bump is monotonic, and
+     * Put the restored exits back exactly as they were, record and live map
+     * entries included, but only where the record still holds what this call
+     * wrote: a live verdict that landed while the write was in flight owns
+     * the record now. The epoch is not rewound: a bump is monotonic, and
      * lowering it would let a check that started before a live verdict
      * overwrite that verdict. The spent map does not lose what another
      * writer put there: only the egresses this call forgave go back, and
      * they go back with the window the provider gave them.
      */
     const undo = (): void => {
+      const revertedRelays = new Set([...restoredRelays].filter(owned))
+      const revertedProxies = new Set([...restoredProxies].filter(owned))
+      const reverted = new Set([...revertedRelays, ...revertedProxies])
       this.relayList = this.relayList.map((relay) =>
-        restoredRelays.has(relay.id) ? (beforeRelays.get(relay.id) as RelayRecord) : relay,
+        revertedRelays.has(relay.id) ? (beforeRelays.get(relay.id) as RelayRecord) : relay,
       )
       this.proxyList = this.proxyList.map((proxy) =>
-        restoredProxies.has(proxy.id) ? (beforeProxies.get(proxy.id) as ProxyRecord) : proxy,
+        revertedProxies.has(proxy.id) ? (beforeProxies.get(proxy.id) as ProxyRecord) : proxy,
       )
-      for (const egress of forgivenEgresses) {
-        const until = beforeSpent.get(egress)
-        if (until === undefined) this.spent.delete(egress)
-        else this.spent.set(egress, until)
-      }
-      // Only the exits this call touched go back: a rest another writer armed
-      // meanwhile is not this call's to undo.
-      for (const id of [...restoredRelays, ...restoredProxies]) {
+      revertForgiven(forgivenEgresses, reverted)
+      // Only the exits this call put back lose their rest: a rest another
+      // writer armed meanwhile is not this call's to undo.
+      for (const id of reverted) {
         const entry = beforeCooling.get(id)
         if (entry === undefined) this.cooling.delete(id)
         else this.cooling.set(id, entry)
@@ -2028,29 +2107,29 @@ export class RelayState {
     try {
       await this.enqueueWrite(RELAYS_KEY, () => writeRelays(this.storage, this.relayList))
     } catch (error) {
-      // The relays were not written, so everything this call changed goes
-      // back exactly as it was: the records, the latches and the live maps.
-      // The proxies have not been touched yet.
+      // The relays were not written, so everything this call changed and
+      // still owns goes back exactly as it was: the records, the latches and
+      // the live maps. The proxies have not been touched yet.
       undo()
       throw error
     }
     try {
       await this.enqueueWrite(PROXIES_KEY, () => writeProxies(this.storage, this.proxyList))
     } catch (error) {
-      // The proxies were not written, so they go back to being used up, and
-      // the addresses they left from go back to being spent: an address the
-      // provider refused is what keeps the other exits off it. The relays
-      // were written, so they stay as they are: a rollback of both would
-      // leave the disk saying something the memory does not.
+      // The proxies were not written, so the ones this call still owns go
+      // back to being used up, and the addresses they left from go back to
+      // being spent: an address the provider refused is what keeps the other
+      // exits off it. The relays were written, so they stay as they are: a
+      // rollback of both would leave the disk saying something the memory
+      // does not.
+      // Only the proxies this call still owns go back: a verdict that landed
+      // while the write was in flight owns its record now and is left alone.
+      const revertedProxies = new Set([...restoredProxies].filter(owned))
       this.proxyList = this.proxyList.map((proxy) =>
-        restoredProxies.has(proxy.id) ? (beforeProxies.get(proxy.id) as ProxyRecord) : proxy,
+        revertedProxies.has(proxy.id) ? (beforeProxies.get(proxy.id) as ProxyRecord) : proxy,
       )
-      for (const egress of forgivenProxyEgresses) {
-        const until = beforeSpent.get(egress)
-        if (until === undefined) this.spent.delete(egress)
-        else this.spent.set(egress, until)
-      }
-      for (const id of restoredProxies) {
+      revertForgiven(forgivenProxyEgresses, revertedProxies)
+      for (const id of revertedProxies) {
         const entry = beforeCooling.get(id)
         if (entry === undefined) this.cooling.delete(id)
         else this.cooling.set(id, entry)
@@ -2063,7 +2142,7 @@ export class RelayState {
       // are still out of use, so reporting them as restored would claim
       // exits the next request cannot use. They are named with the exits
       // that were left out instead.
-      for (const id of restoredProxies) stillUsedUp.push(id)
+      for (const id of revertedProxies) stillUsedUp.push(id)
       return {
         restored: restored.filter((id) => restoredRelays.has(id)),
         stillUsedUp,
@@ -2151,13 +2230,32 @@ export class RelayState {
     this.relayed.delete(key)
     this.failures.delete(key)
     this.started.delete(key)
-    this.direct.add(key)
-    // The set carries no timestamps, so the oldest entry goes first: it is
-    // only ever read for the session and model being asked about.
+    const now = Date.now()
+    this.direct.set(key, now)
+    // The bound is the attribution window, not the map size: an entry younger
+    // than that is still read, so the map may pass 200 until entries age out.
     if (this.direct.size > 200) {
-      const oldest = this.direct.values().next().value
-      if (oldest !== undefined) this.direct.delete(oldest)
+      for (const [entryKey, at] of this.direct) {
+        if (now - at > ATTRIBUTION_TTL_MS) this.direct.delete(entryKey)
+      }
     }
+  }
+
+  /**
+   * Whether a request for this session and model went direct lately.
+   *
+   * The mark carries the kind of the request that went direct, but the retry
+   * hook is not told the kind: a mark of any kind rules the fallback out,
+   * because another kind's note belongs to another request.
+   */
+  private wentDirect(sessionID: string, modelID: string, now = Date.now()): boolean {
+    const prefix = attributionPrefix(sessionID, modelID)
+    for (const [key, at] of this.direct) {
+      if (!key.startsWith(prefix)) continue
+      if (now - at <= ATTRIBUTION_TTL_MS) return true
+      this.direct.delete(key)
+    }
+    return false
   }
 
   /**
@@ -2174,9 +2272,9 @@ export class RelayState {
     const primaryKey = attributionKey(sessionID, modelID, PRIMARY_KIND)
     const primary = this.relayed.get(primaryKey)
     if (primary !== undefined && now - primary.at <= ATTRIBUTION_TTL_MS) return primary.exitId
-    // The agent loop went direct, so there is no exit to blame: another kind's
-    // note belongs to another request.
-    if (this.direct.has(primaryKey)) return undefined
+    // A request of any kind went direct, so there is no exit to blame for it:
+    // another kind's note belongs to another request.
+    if (this.wentDirect(sessionID, modelID, now)) return undefined
     let newest: { readonly at: number; readonly exitId: string } | undefined
     const prefix = attributionPrefix(sessionID, modelID)
     for (const [key, entry] of this.relayed) {
@@ -2271,8 +2369,9 @@ export class RelayState {
       if (Date.now() - primary.at <= 60_000) return primary
       this.failures.delete(primaryKey)
     }
-    // The agent loop went direct, so it has no failure of its own to report.
-    if (this.direct.has(primaryKey)) return undefined
+    // A request of any kind went direct, so there is no failure of its own to
+    // report.
+    if (this.wentDirect(sessionID, modelID)) return undefined
     let newest: FailureContext | undefined
     const prefix = attributionPrefix(sessionID, modelID)
     for (const [key, entry] of this.failures) {

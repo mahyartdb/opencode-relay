@@ -403,6 +403,31 @@ describe("across a restart", () => {
     expect(next.pickExit({ advance: false, now: now + 61_000 }).exit?.id).toBe("relay-1")
   })
 
+  test("a limited verdict carries its rest in the first write", async () => {
+    const { state, restart, store } = await makeRestartable()
+    await state.addRelay(relay("relay-1"))
+    await state.setHealth("relay-1", { status: "ready" })
+
+    // The tester writes the verdict first and arms the cooldown right after.
+    // A crash between the two writes must not leave a "limited" record that a
+    // restart would serve before the cooldown is over.
+    const until = Date.now() + 60_000
+    await state.setHealth("relay-1", {
+      status: "limited",
+      coolingUntil: until,
+      checkedAt: Date.now(),
+    })
+
+    const persisted = (store.get("relays") as (Record<string, unknown> | undefined)[])?.find(
+      (entry) => entry?.id === "relay-1",
+    )
+    expect(persisted).toMatchObject({ status: "limited", coolingUntil: until, failures: 0 })
+
+    const next = await restart()
+    expect(next.pickExit({ advance: false }).exit).toBeUndefined()
+    expect(next.pickExit({ advance: false, now: until + 1_000 }).exit?.id).toBe("relay-1")
+  })
+
   test("a test verdict still waits for another test", async () => {
     const { state, restart } = await makeRestartable()
     await state.addRelay(relay("relay-1"))
@@ -835,6 +860,41 @@ describe("across a restart", () => {
     expect(kept.activeExitId).toBe("relay-2")
   })
 
+  test("a broken settings field keeps the fields that still make sense", async () => {
+    const { state, restart, store } = await makeRestartable()
+    await state.addRelay(relay("relay-1"))
+    // A hand-edited file: two fields have the wrong shape, the rest are valid.
+    store.set("settings", {
+      enabled: "true",
+      selection: "custom",
+      strategy: "not-a-strategy",
+      customModels: ["iceman-free"],
+      healthChecks: false,
+      activeExitId: "relay-1",
+    })
+
+    const next = await restart()
+    const rules = next.settings()
+
+    // Only the broken fields take their defaults; every valid choice survives.
+    expect(rules.enabled).toBe(false)
+    expect(rules.strategy).toBe("fixed")
+    expect(rules.selection).toBe("custom")
+    expect(rules.customModels).toEqual(["iceman-free"])
+    expect(rules.healthChecks).toBe(false)
+    expect(rules.activeExitId).toBe("relay-1")
+    // The user is told which fields could not be read.
+    const note = next.notes().find((entry) => entry.includes("routing rules"))
+    expect(note).toContain("enabled")
+    expect(note).toContain("strategy")
+  })
+
+  test("a fresh installation does not report the rules as broken", async () => {
+    const state = await makeState()
+
+    expect(state.notes()).toEqual([])
+  })
+
   test("a settings update that leaves the strategy alone keeps the stored rotation", async () => {
     const { state, store } = await makeRestartable()
     await state.addRelay(relay("relay-1"))
@@ -867,6 +927,38 @@ describe("attribution", () => {
     expect(state.relayedBy("session-1", "iceman-free", now + 10 * 60_000)).toBe("relay-1")
     // Half an hour later it is no longer this failure's exit.
     expect(state.relayedBy("session-1", "iceman-free", now + 31 * 60_000)).toBeUndefined()
+  })
+
+  test("a direct request of another kind keeps the fallback from blaming a note", async () => {
+    const state = await makeState()
+    const now = Date.now()
+    // Another request of the session left a note, and the title request went
+    // direct. The retry hook is not told the kind, so the title's failure must
+    // not reach the other request's note.
+    state.noteRelayed("session-1", "iceman-free", "relay-1", "summary")
+    state.noteFailureContext(
+      "session-1",
+      "iceman-free",
+      { at: now, exitId: "relay-1", kind: "server", reached: true },
+      "summary",
+    )
+    state.forgetRelayed("session-1", "iceman-free", "title")
+
+    expect(state.relayedBy("session-1", "iceman-free", now + 1)).toBeUndefined()
+    expect(state.failureFor("session-1", "iceman-free")).toBeUndefined()
+  })
+
+  test("a direct mark survives a flood of other requests", async () => {
+    const state = await makeState()
+    state.forgetRelayed("session-1", "iceman-free", "title")
+    // More marks than the map's bound: a fresh one is never dropped for an
+    // older one, so the live title mark must survive them all.
+    for (let index = 0; index < 250; index++) {
+      state.forgetRelayed(`other-${index}`, "iceman-free", "title")
+    }
+    state.noteRelayed("session-1", "iceman-free", "relay-1", "summary")
+
+    expect(state.relayedBy("session-1", "iceman-free")).toBeUndefined()
   })
 })
 
@@ -927,6 +1019,34 @@ describe("a live verdict during a check", () => {
     // The reset still brings the exit back on its own.
     expect(state.exhaustedExits(until + 1)).toEqual([])
     expect(state.exit("relay-1")?.status).toBe("reachable")
+  })
+
+  test("an expired latch makes a check that began before it stale", async () => {
+    const state = await readyState(["relay-1"])
+    const until = Date.now() + 60 * 60_000
+    await state.setHealth("relay-1", { status: "exhausted", exhaustedUntil: until })
+    // What a check saw while the exit was still used up.
+    const epoch = state.healthEpoch("relay-1")
+    const checkedAt = Date.now()
+
+    // The reset passes while the check is still in flight, so the latch is
+    // cleared and the exit is worth trying again.
+    expect(state.exhaustedExits(until + 1)).toEqual([])
+    expect(state.exit("relay-1")?.status).toBe("reachable")
+
+    // The check comes back with a fresh exhaustion. The cleared latch is live
+    // evidence: the answer is stale, or it would retire the exit the reset
+    // has only just brought back.
+    const applied = await state.setHealth("relay-1", {
+      status: "exhausted",
+      exhaustedUntil: until + 24 * 60 * 60_000,
+      checkedAt,
+      healthEpoch: epoch,
+    })
+
+    expect(applied).toBe(false)
+    expect(state.exit("relay-1")?.status).toBe("reachable")
+    expect(state.exit("relay-1")?.exhaustedUntil).toBeUndefined()
   })
 
   test("a failure from a check that started before a new address does not retire it", async () => {
@@ -1316,6 +1436,30 @@ describe("a rewrite that throws", () => {
   })
 })
 
+describe("flush", () => {
+  test("waits for a write that is still on its way", async () => {
+    const storage = deferredFailureStorage()
+    const state = new RelayState(storage as never)
+    await state.load()
+    await state.addRelay(relay("relay-1"))
+    await state.setHealth("relay-1", { status: "ready" })
+    storage.arm("relays")
+
+    const writing = state.setHealth("relay-1", { status: "bad" })
+    let flushed = false
+    const flushing = state.flush().then(() => {
+      flushed = true
+    })
+    await Bun.sleep(0)
+    expect(flushed).toBe(false)
+
+    storage.release()
+    await expect(writing).rejects.toThrow(/relays/)
+    await flushing
+    expect(flushed).toBe(true)
+  })
+})
+
 describe("a write that does not land", () => {
   test("a pause that was not written leaves the exit in use", async () => {
     const storage = failingStorage()
@@ -1458,6 +1602,68 @@ describe("a write that does not land", () => {
     expect(state.isSpent("203.0.113.7")).toBe(true)
     // The window is the provider's, not one this plugin made up.
     expect(state.spentUntil("203.0.113.7")).toBe(window)
+  })
+
+  test("a restore that was not written leaves a verdict that landed alone", async () => {
+    const storage = deferredFailureStorage()
+    const state = new RelayState(storage as never)
+    await state.load()
+    await state.addRelay(relay("relay-1"))
+    await state.setHealth("relay-1", { status: "ready" })
+    const window = Date.now() + 60 * 60_000
+    state.noteEgress("relay-1", "203.0.113.7")
+    state.markSpent("203.0.113.7", window)
+    await state.setHealth("relay-1", { status: "exhausted", exhaustedUntil: window })
+    storage.arm("relays")
+
+    const restoring = state.restoreExhausted(() => true)
+    // A live failure lands while the restore is still on its way to the disk.
+    state.markFailure("relay-1", "The exit did not answer.", "unreachable")
+    storage.release()
+    await expect(restoring).rejects.toThrow(/relays/)
+
+    // The verdict owns the record now, and its rest: putting the old used-up
+    // record back would bench an exit the failure has just taken out of use,
+    // and reverting the rest would leave it looking healthy.
+    expect(state.exit("relay-1")?.status).toBe("unreachable")
+    expect(state.exit("relay-1")?.exhaustedUntil).toBeUndefined()
+    expect(state.coolingExits()).toContain("relay-1")
+    // The address stays forgiven with the record the verdict owns.
+    expect(state.isSpent("203.0.113.7")).toBe(false)
+  })
+
+  test("a restore whose proxies could not be written leaves a proxy verdict alone", async () => {
+    const storage = deferredFailureStorage()
+    const state = new RelayState(storage as never)
+    await state.load()
+    await state.addRelay(relay("relay-1"))
+    await state.addProxy(proxy("proxy-1"))
+    await state.setHealth("relay-1", { status: "ready" })
+    await state.setHealth("proxy-1", { status: "ready" })
+    const window = Date.now() + 60 * 60_000
+    state.noteEgress("relay-1", "203.0.113.10")
+    state.noteEgress("proxy-1", "203.0.113.11")
+    state.markSpent("203.0.113.11", window)
+    await state.setHealth("relay-1", { status: "exhausted", exhaustedUntil: window })
+    await state.setHealth("proxy-1", { status: "exhausted", exhaustedUntil: window })
+    storage.arm("proxies")
+
+    const restoring = state.restoreExhausted(() => true)
+    // Let the relay write land so the call reaches the proxies.
+    await Bun.sleep(0)
+    // A live failure lands while the proxy write is still in flight.
+    state.markFailure("proxy-1", "The proxy did not answer.", "unreachable")
+    storage.release()
+    const result = await restoring
+
+    // The proxy records the verdict, not the rollback: it is not reported as
+    // restored, and it is not reported as still used up either.
+    expect(result.restored).toEqual(["relay-1"])
+    expect(result.stillUsedUp).toEqual([])
+    expect(result.failed?.key).toBe("proxies")
+    expect(state.exit("proxy-1")?.status).toBe("unreachable")
+    expect(state.coolingExits()).toContain("proxy-1")
+    expect(state.isSpent("203.0.113.11")).toBe(false)
   })
 
   test("a restore whose proxies could not be written reports only the relays", async () => {
