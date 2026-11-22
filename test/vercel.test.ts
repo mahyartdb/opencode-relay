@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test"
+import { afterEach, describe, expect, setSystemTime, test } from "bun:test"
 import { PLAN_LIMITS } from "../src/lib/types.ts"
 import {
   deleteVercelProject,
@@ -27,7 +27,7 @@ describe("inspectVercel", () => {
     globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input)
       calls.push({ url, init })
-      if (url === "https://api.vercel.com/v2/teams") {
+      if (url === "https://api.vercel.com/v2/teams?limit=100") {
         return jsonResponse({
           teams: [
             { id: "team_other", slug: "other", billing: { plan: "pro" } },
@@ -54,6 +54,47 @@ describe("inspectVercel", () => {
     expect(plan.projectsMore).toBe(true)
     expect(plan.limits).toEqual(PLAN_LIMITS["pro"])
     expect(calls.length).toBe(2)
+  })
+
+  test("follows team pages to find one past the first page", async () => {
+    const calls: string[] = []
+    const firstPage = Array.from({ length: 20 }, (_, index) => ({
+      id: `team_${index}`,
+      slug: `team-${index}`,
+      billing: { plan: "hobby" },
+    }))
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = String(input)
+      calls.push(url)
+      if (url === "https://api.vercel.com/v2/teams?limit=100") {
+        return jsonResponse({ teams: firstPage, pagination: { next: 1000 } })
+      }
+      if (url === "https://api.vercel.com/v2/teams?limit=100&until=1000") {
+        return jsonResponse({
+          // A team the first page already carried: pages can repeat, and the
+          // count must not grow by the repeat.
+          teams: [
+            { id: "team_0", slug: "team-0", billing: { plan: "hobby" } },
+            { id: "team_target", slug: "target", billing: { plan: "enterprise" } },
+          ],
+          pagination: { next: null },
+        })
+      }
+      if (url === "https://api.vercel.com/v9/projects?limit=100&teamId=team_target") {
+        return jsonResponse({ projects: [], pagination: { next: null } })
+      }
+      throw new Error(`unexpected url: ${url}`)
+    }) as unknown as typeof fetch
+
+    const plan = await inspectVercel({ token: "tok-secret", teamId: "team_target" })
+
+    // The chosen team sat on the page after the default one; refusing the
+    // account there would call a valid team invisible. The repeat of team_0
+    // on the second page is counted once, not twice.
+    expect(plan.team).toBe("target")
+    expect(plan.teams).toBe(21)
+    expect(plan.plan).toBe("enterprise")
+    expect(calls).toHaveLength(3)
   })
 
   test("throws on 401", async () => {
@@ -195,6 +236,38 @@ describe("deployRelay", () => {
     })
     expect(result.url).toBe("https://my-relay.vercel.app")
     expect(urls.length).toBe(1)
+  })
+
+  test("a deployment that never finishes says it did not finish within the budget", async () => {
+    // The build neither goes READY nor ERROR, so the poll runs to its
+    // deadline. The fake clock is advanced by every status answer, because
+    // with it set Date.now() does not move on its own and the deadline would
+    // never pass; no test has to wait the real two minutes.
+    globalThis.fetch = (async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url.includes("/v13/deployments?skipAutoDetectionConfirmation=1")) {
+        return jsonResponse({ id: "dep_stuck", readyState: "BUILDING" })
+      }
+      if (url.includes("/v13/deployments/dep_stuck")) {
+        setSystemTime(Date.now() + 120 * 1000)
+        return jsonResponse({ id: "dep_stuck", readyState: "BUILDING" })
+      }
+      throw new Error(`unexpected url: ${url}`)
+    }) as unknown as typeof fetch
+
+    try {
+      await expect(
+        deployRelay({
+          account: { token: "tok-secret" },
+          project: "my-relay",
+          region: "fra1",
+          access: "access-secret",
+          relaySource: "export default {}",
+        }),
+      ).rejects.toThrow(/did not finish within/)
+    } finally {
+      setSystemTime()
+    }
   })
 })
 

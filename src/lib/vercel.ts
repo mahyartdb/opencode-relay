@@ -154,6 +154,20 @@ export class VercelError extends Error {
   }
 }
 
+/**
+ * A team id the token cannot see.
+ *
+ * This is the input, not a transient Vercel problem: the same token will keep
+ * failing, so the account is refused rather than stored against a scope its
+ * deployments will never use.
+ */
+export class VercelTeamError extends VercelError {
+  constructor(message: string) {
+    super(message)
+    this.name = "VercelTeamError"
+  }
+}
+
 async function expectOk(
   res: Response,
   context: string,
@@ -200,19 +214,60 @@ function sleep(ms: number): Promise<void> {
 export async function inspectVercel(account: VercelAccount): Promise<AccountPlan> {
   const { token, teamId } = account
 
-  const teamsRes = await vercelFetch("/v2/teams", { token })
-  if (teamsRes.status === 401 || teamsRes.status === 403) {
-    throw new VercelError(
-      "Vercel refused the request (HTTP 401/403). Check the token and its permissions.",
-      teamsRes.status,
+  // The teams endpoint pages at twenty by default, so a token that belongs to
+  // more teams would hide the chosen one and the account would be refused for
+  // a team it can see. The pages walk back in time: `until` is the timestamp
+  // the previous answer named for its next page. A team repeated across pages
+  // is counted once, by its id.
+  const teams: Array<{ id?: string; slug?: string; billing?: { plan?: string } }> = []
+  let until: number | undefined
+  for (;;) {
+    const query = until === undefined ? "?limit=100" : `?limit=100&until=${until}`
+    const teamsRes = await vercelFetch(`/v2/teams${query}`, { token })
+    if (teamsRes.status === 401 || teamsRes.status === 403) {
+      throw new VercelError(
+        "Vercel refused the request (HTTP 401/403). Check the token and its permissions.",
+        teamsRes.status,
+      )
+    }
+    await expectOk(teamsRes, "Failed to read Vercel teams", token)
+    const teamsData = (await teamsRes.json()) as {
+      teams?: Array<{ id?: string; slug?: string; billing?: { plan?: string } }>
+      pagination?: { next?: string | number | null }
+    }
+    const pages = teamsData.teams ?? []
+    // Pages can repeat a team the earlier one already carried, so the ids
+    // dedupe: a token that belongs to 24 teams must not be counted as 44.
+    const seenIds = new Set(teams.map((team) => team.id))
+    for (const team of pages) {
+      if (team.id !== undefined && seenIds.has(team.id)) continue
+      if (team.id !== undefined) seenIds.add(team.id)
+      teams.push(team)
+    }
+    const next = teamsData.pagination?.next
+    const cursor = next === undefined || next === null ? undefined : Number(next)
+    // The pages walk back in time; a cursor that does not move would ask for
+    // the same page forever.
+    if (
+      cursor === undefined ||
+      !Number.isFinite(cursor) ||
+      (until !== undefined && cursor >= until)
+    ) {
+      break
+    }
+    until = cursor
+  }
+  // The plan and the deploys have to describe the same scope. With no team
+  // chosen every call runs in the personal scope, whose plan this list does
+  // not carry: reading teams[0] here would describe another account, and
+  // adopting its id would move every deployment into that team without the
+  // user asking for it.
+  const team = teamId === undefined ? undefined : teams.find((t) => t.id === teamId)
+  if (teamId !== undefined && team === undefined) {
+    throw new VercelTeamError(
+      `The token cannot see the Vercel team ${teamId}. Check the team id, or leave it empty to deploy in the personal scope.`,
     )
   }
-  await expectOk(teamsRes, "Failed to read Vercel teams", token)
-  const teamsData = (await teamsRes.json()) as {
-    teams?: Array<{ id?: string; slug?: string; billing?: { plan?: string } }>
-  }
-  const teams = teamsData.teams ?? []
-  const team = teamId ? teams.find((t) => t.id === teamId) : teams[0]
   const plan = (team?.billing?.plan ?? "unknown").toLowerCase()
   const teamSlug = team?.slug ?? team?.id
 
@@ -309,6 +364,9 @@ export async function deployRelay(input: DeployRelayInput): Promise<DeployRelayR
 
   const deadline = Date.now() + DEPLOY_TIMEOUT_MS
   let last = created
+  // The last status check that failed, when one did: a run of 429s must not
+  // be reported as a deployment that never finished.
+  let pollFailure: string | undefined
   // Inspect first, then wait: `created` already carries a readyState, so a
   // finished deployment must not be made to wait one poll interval.
   for (;;) {
@@ -325,15 +383,41 @@ export async function deployRelay(input: DeployRelayInput): Promise<DeployRelayR
     await sleep(DEPLOY_POLL_MS)
     if (Date.now() >= deadline) break
     const statusPath = withTeam(`/v13/deployments/${encodeURIComponent(id)}`, account.teamId)
-    const statusRes = await vercelFetch(statusPath, {
-      token: account.token,
-      secrets,
-      timeoutMs: DEPLOY_STATUS_TIMEOUT_MS,
-    })
-    await expectOk(statusRes, "Failed to read Vercel deployment status", account.token, secrets)
-    last = (await readJson(statusRes, secrets)) as typeof created
+    try {
+      const statusRes = await vercelFetch(statusPath, {
+        token: account.token,
+        secrets,
+        timeoutMs: DEPLOY_STATUS_TIMEOUT_MS,
+      })
+      await expectOk(statusRes, "Failed to read Vercel deployment status", account.token, secrets)
+      last = (await readJson(statusRes, secrets)) as typeof created
+      pollFailure = undefined
+    } catch (err) {
+      // A refused token will not heal before the deadline, so waiting the full
+      // two minutes to repeat the same refusal only delays the answer. The
+      // deployment already exists, so the receipt has to survive: this is
+      // thrown as a plain failure rather than a token refusal, and the caller
+      // says the project may still be running. Every other failure here (a
+      // 429, a 5xx, a reset) is one missed check, not a failed deployment.
+      if (err instanceof VercelError && (err.status === 401 || err.status === 403)) {
+        throw new Error(
+          redact(
+            `Vercel refused the status check of deployment ${id} (HTTP ${err.status}). The deployment was already created and may still be building.`,
+            secrets,
+          ),
+        )
+      }
+      pollFailure = err instanceof Error ? err.message : String(err)
+    }
   }
-  throw new Error("Vercel deployment timed out after 120 seconds.")
+  const detail =
+    pollFailure === undefined ? "" : ` The last status check failed: ${redact(pollFailure, secrets)}`
+  throw new Error(
+    redact(
+      `Vercel deployment ${id} of the project ${project} did not finish within 120 seconds.${detail} The project may still be building on Vercel; check it before deploying again.`,
+      secrets,
+    ),
+  )
 }
 
 export async function deleteVercelProject(account: VercelAccount, project: string): Promise<void> {
