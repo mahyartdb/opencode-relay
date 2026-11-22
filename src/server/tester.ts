@@ -56,13 +56,35 @@ export type TestMode = "ping" | "api" | "deep"
 /** What a check found. */
 export interface TestResult {
   readonly ok: boolean
-  readonly status: ExitStatus
+  /**
+   * The verdict — or "testing", the refusal to run a second check of an exit
+   * whose check is still in flight. The refusal is not a stored status and
+   * must never reach the record; callers tell it apart from what a check that
+   * ran may answer by comparing against TEST_IN_FLIGHT.
+   */
+  readonly status: ExitStatus | "testing"
   /** The HTTP status, or 0 when no answer arrived. */
   readonly code: number
   readonly ms: number
   readonly egress?: string
   readonly runtime?: string
   readonly note?: string
+}
+
+/**
+ * The verdict a refused check reports, instead of a result dressed up as one.
+ *
+ * A refusal must never reach the record, and every caller can tell it apart
+ * from what a check that ran may answer. Callers that must react to the
+ * refusal compare against this object; one that must act only after the
+ * running check settles awaits `inFlightTest` instead.
+ */
+export const TEST_IN_FLIGHT: TestResult = {
+  ok: false,
+  status: "testing",
+  code: 0,
+  ms: 0,
+  note: "That exit is already being tested; wait for the running check to finish.",
 }
 
 /** What the canary could prove. */
@@ -286,6 +308,8 @@ export class Tester {
   private timer: ReturnType<typeof setInterval> | undefined
   private running: Promise<void> | undefined
   private stopped = false
+  /** The exits a check is already running for, claimed at `test()`'s entry. */
+  private readonly inFlight = new Map<string, Promise<TestResult>>()
 
   constructor(private readonly deps: TesterDeps) {}
 
@@ -305,24 +329,60 @@ export class Tester {
     ;(this.timer as { unref?: () => void }).unref?.()
   }
 
-  /** Stop the background check and let a running scan finish quietly. */
-  stop(): void {
+  /**
+   * Stop the background check and let a running scan finish quietly. The scan
+   * is returned so a dispose can wait for its writes: an immediate reload
+   * that starts while they are still in flight would be clobbered by them.
+   */
+  stop(): void | Promise<void> {
     this.stopped = true
     if (this.timer !== undefined) {
       clearInterval(this.timer)
       this.timer = undefined
     }
+    return this.running
   }
 
-  /** Run one check and record what it found. */
+  /**
+   * Check one exit, unless a check of it is already running.
+   *
+   * The sweep's workers, a test the user asked for by name and a check fired
+   * after an address change all come through here: two checks of one address
+   * would spend its allowance and race their verdicts. The claim is taken
+   * before the first await, so two calls in one tick cannot both take it, and
+   * a thrown check releases it in the `finally`.
+   *
+   * A caller that was refused can await the holder through `inFlightTest`, so
+   * the check it wanted can follow the one already running.
+   */
   async test(id: string, mode: TestMode): Promise<TestResult> {
+    if (this.inFlight.has(id)) return TEST_IN_FLIGHT
+    const running = this.run(id, mode)
+    this.inFlight.set(id, running)
+    try {
+      return await running
+    } finally {
+      if (this.inFlight.get(id) === running) this.inFlight.delete(id)
+    }
+  }
+
+  /**
+   * The promise of the check another call is already running, when there is
+   * one. Awaiting it (catching errors) lets a caller follow the holder rather
+   * than race it.
+   */
+  inFlightTest(id: string): Promise<TestResult> | undefined {
+    return this.inFlight.get(id)
+  }
+
+  private async run(id: string, mode: TestMode): Promise<TestResult> {
     const exit = this.deps.state.exit(id)
     if (!exit) {
       return { ok: false, status: "unknown", code: 0, ms: 0, note: "This exit is not there any more." }
     }
-    if (mode === "ping") return this.ping(exit)
-    if (mode === "deep") return this.deep(exit)
-    return this.api(exit)
+    if (mode === "ping") return await this.ping(exit)
+    if (mode === "deep") return await this.deep(exit)
+    return await this.api(exit)
   }
 
   /** Is the machinery alive, and which address does it use? */
@@ -543,6 +603,7 @@ export class Tester {
       ...(about.runtime !== undefined ? { runtime: about.runtime } : {}),
       ...(verdict.note !== undefined ? { lastError: verdict.note } : {}),
       ...(status === "exhausted" && until !== undefined ? { exhaustedUntil: until } : {}),
+      ...(status === "limited" && until !== undefined ? { coolingUntil: until } : {}),
       checkedAt,
       healthEpoch,
     })
@@ -696,7 +757,16 @@ export class Tester {
         }
         if (this.stopped) return
         try {
-          await this.test(exit.id, mode)
+          const result = await this.test(exit.id, mode)
+          // A check asked for by name is already running: the sweep leaves
+          // the exit to it rather than checking the address a second time.
+          // The skip still counts as done, or the pill's fraction would
+          // never reach the end of a run that skipped its way there.
+          if (result === TEST_IN_FLIGHT) {
+            done += 1
+            this.deps.state.setScanning({ startedAt, total, done, deep: mode === "deep" })
+            continue
+          }
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error)
           this.deps.state.noteFailure(`${exit.name} could not be tested: ${message}`)
@@ -727,6 +797,7 @@ export class Tester {
       runtime?: string
       lastError?: string
       exhaustedUntil?: number
+      coolingUntil?: number
       checkedAt?: number
       healthEpoch?: number
     },

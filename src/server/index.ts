@@ -105,10 +105,19 @@ export default Plugin.define({
     }
 
     return async () => {
-      tester.stop()
+      // A scan still in flight writes whole keys, so an immediate reload must
+      // not read or write them before it lands: wait for it first.
+      await tester.stop()
+      // The hooks are disposed before the flush, so anything they write on
+      // the way out is queued while the flush is still waiting, and lands
+      // inside the snapshot the next load reads.
+      await Promise.all([hooks.request.dispose(), hooks.response.dispose(), hooks.retry.dispose()])
+      // Stopping the scan awaits the scan, not the whole-key writes it queued:
+      // close only once those have landed, so the next load reads what the
+      // last tests recorded.
+      await state.flush()
       bridge.stop()
       closeSocksBridges()
-      await Promise.all([hooks.request.dispose(), hooks.response.dispose(), hooks.retry.dispose()])
       await registration.dispose()
     }
   },

@@ -40,6 +40,7 @@ import {
   probeRelay,
   recycleRelay,
   VercelError,
+  VercelTeamError,
 } from "../lib/vercel.ts"
 import { projectName, relaySource } from "../lib/relay-source.ts"
 import type { ProxyBridge } from "./bridge.ts"
@@ -47,7 +48,7 @@ import { decideModel } from "./decide.ts"
 import type { ModelCatalog } from "./models.ts"
 import type { RelayState, Settings } from "./state.ts"
 import { StorageError, proxyExclusions } from "./state.ts"
-import type { Tester } from "./tester.ts"
+import { TEST_IN_FLIGHT, type Tester } from "./tester.ts"
 
 /** Everything the handlers need from the outside world. */
 export interface HandlerDeps {
@@ -99,6 +100,17 @@ const IMPORT_LIMIT_BYTES = 2 * 1024 * 1024
  */
 const IMPORT_RELAY_LIMIT = 200
 const IMPORT_PROXY_LIMIT = 1000
+
+/**
+ * The relays being redeployed, by id.
+ *
+ * The exits list stays open while a deployment runs, and the terminal runs an
+ * action on every keypress. Two deployments of one project race each other in
+ * Vercel, so a second one — from the single-relay action or the batch — is
+ * refused or skipped, and the claim is released when the work ends, failed or
+ * not.
+ */
+export const updatesInFlight = new Set<string>()
 
 /** A proxy's default name: its address, which is what the user recognizes. */
 function proxyName(host: string, port: number, index: number, prefix?: string): string {
@@ -189,12 +201,30 @@ function describeState(options: {
   if (exhausted.length > 0) {
     problems.push(`${exhausted.length} exit${exhausted.length === 1 ? " is" : "s are"} used up.`)
   }
-  const otherSkipped = skipped.filter((id) => id !== active?.id)
+  // The picker's own skip list is the authority on why an exit sits out: it
+  // also holds the exits whose stored verdict is healthy but which cannot
+  // carry a request (a proxy while the bridge is stopped), and an untested or
+  // imported exit is skipped there while it is not cooling at all. The
+  // cooldown list is only the fallback for a caller without a picker result.
+  const pickReasons = new Map(
+    (options.pickSkipped ?? []).map((entry) => [entry.id, entry.reason] as const),
+  )
+  // The chosen exit is only named in a sentence of its own when another exit
+  // takes over; otherwise its own skip reason is reported below like any
+  // other exit's. Without a picker result the old fallback still leaves it
+  // out, as it always did.
+  const activeSkipped = active === undefined ? undefined : pickReasons.get(active.id)
+  const chosenSkipped =
+    serving !== undefined && active !== undefined && active.id !== serving.id && activeSkipped !== undefined
+  const activeExplained = options.pickSkipped === undefined || chosenSkipped
+  const otherSkipped = (options.pickSkipped !== undefined
+    ? options.pickSkipped.map((entry) => entry.id)
+    : skipped
+  ).filter((id) => !activeExplained || id !== active?.id)
   if (otherSkipped.length > 0) {
     // Why each skipped exit sits out, in words. The exhausted ones are already
     // counted in their own sentence above, so they are left out here rather
-    // than reported twice. The active exit was handled further up: it is the
-    // one another exit takes over from.
+    // than reported twice.
     const counted = new Set(exhausted)
     const paused: string[] = []
     const limited: string[] = []
@@ -205,18 +235,41 @@ function describeState(options: {
       if (counted.has(id)) continue
       const exit = exits.find((entry) => entry.id === id)
       if (exit === undefined) continue
+      const reason = pickReasons.get(id)
+      if (reason !== undefined) {
+        // The reason is the picker's own, in the picker's words: a
+        // rate-limited exit did answer, and one held back by the bridge is
+        // not failing, so the note must not re-classify either by status.
+        if (reason === "paused") paused.push(exit.name)
+        // An imported exit is its own sentence: it is not waiting on a
+        // verdict a check could clear, and "has not been tested yet" would
+        // hide that only the user's own test can put it in use.
+        else if (reason.startsWith("imported")) {
+          problems.push(`${exit.name} is imported and not tested by you, so it is skipped.`)
+        } else if (reason.startsWith("used up")) continue
+        else if (reason === "not tested yet") untested.push(exit.name)
+        // A refusal is its own sentence: "did not answer" would be false, and
+        // the user needs to know OpenCode itself turned the exit away.
+        else if (reason === "blocked by OpenCode") {
+          problems.push(`${exit.name} is blocked by OpenCode, so it is skipped.`)
+        } else if (reason === "failing") failing.push(exit.name)
+        else if (reason === "not answering") silent.push(exit.name)
+        else if (reason === "rate limited") limited.push(exit.name)
+        // A reason with no group of its own ("cooling until ...", the local
+        // bridge not running) is already readable: it is shown as it is.
+        else problems.push(`${exit.name} is skipped: ${reason}.`)
+        continue
+      }
+      // A record written before the picker carried reasons (hand-edited or
+      // legacy storage): the stored status is all there is to go on.
       if (!exit.enabled) paused.push(exit.name)
-      // Like the blocked case, an imported exit is its own sentence: it is not
-      // waiting on a verdict a check could clear, and "has not been tested
-      // yet" would hide that only the user's own test can put it in use.
+      // Like the blocked case, an imported exit is its own sentence.
       else if (exit.imported === true) {
         problems.push(`${exit.name} is imported and not tested by you, so it is skipped.`)
       } else if (exit.status === "limited") limited.push(exit.name)
       else if (exit.status === "exhausted") continue
       else if (exit.status === "untested" || exit.status === "unknown") untested.push(exit.name)
       else if (exit.status === "blocked") {
-        // A refusal is its own sentence: "did not answer" would be false, and
-        // the user needs to know OpenCode itself turned the exit away.
         problems.push(`${exit.name} is blocked by OpenCode, so it is skipped.`)
       } else if (exit.status === "bad") {
         // The exit answered with an error, which is not the same as not
@@ -278,16 +331,12 @@ function describeState(options: {
       : settings.strategy === "fastest"
         ? "through the fastest exit"
         : `through ${serving.name}`
-  // The chosen exit is only named when it is the one that did not answer and
-  // another takes over; otherwise the note names the exit that will serve.
   // The strategy reads as words, not as its stored id: "Routing ... (fixed)"
   // said nothing to a reader who never opened the settings.
   // The chosen exit is only named when the picker leaves it out and another
   // takes over; otherwise the note names the exit that will serve. The
   // reason is the picker's own, so a rate-limited exit is not said to have
   // failed to answer.
-  const activeSkipped = options.pickSkipped?.find((entry) => entry.id === active?.id)
-  const chosenSkipped = active !== undefined && active.id !== serving.id && activeSkipped !== undefined
   const how =
     settings.strategy === "fixed"
       ? "one exit preferred"
@@ -295,7 +344,7 @@ function describeState(options: {
         ? "until it is exhausted"
         : undefined
   const note = chosenSkipped
-    ? `Routing ${models}: ${active.name} cannot serve right now (${activeSkipped.reason}), so ${serving.name} takes over.`
+    ? `Routing ${models}: ${active.name} cannot serve right now (${activeSkipped}), so ${serving.name} takes over.`
     : how !== undefined
       ? `Routing ${models} ${where} (${how}).`
       : `Routing ${models} ${where}.`
@@ -354,6 +403,16 @@ async function deployOne(options: {
     ...(runtime !== undefined ? { runtime } : {}),
     access,
     relaySource: relaySource(),
+  }).catch((error: unknown): never => {
+    // A refused token means nothing was created, so the receipt would send
+    // the user looking for a project that is not there.
+    if (error instanceof VercelError && (error.status === 401 || error.status === 403)) {
+      throw error
+    }
+    // The project may exist on Vercel even when the deploy or a status check
+    // failed, so the receipt travels with the failure: the user has to know
+    // what may still be running before deploying the same region again.
+    throw new Error(`The Vercel project ${project} may still exist: ${describe(error)}`)
   })
   const relay: RelayRecord = {
     kind: "relay",
@@ -431,7 +490,7 @@ async function recordProbe(
       probe.status > 0
         ? `The relay answered with HTTP ${probe.status}.`
         : "The relay did not answer its first check."
-    state.markFailure(id, note, probe.status > 0 ? "bad" : "unreachable")
+    state.markFailure(id, note, probe.status > 0 ? "bad" : "unreachable", healthEpoch)
     return
   }
   try {
@@ -584,6 +643,12 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
         // refused token sends the user to check the token, while "Vercel could
         // not be reached" would send them down the wrong path entirely.
         const message = redact(describe(err), [input.token])
+        // A team the token cannot see is a problem with the input, not with
+        // the token or the network: the add is refused rather than stored
+        // with a plan, since its deployments would run outside that team.
+        if (err instanceof VercelTeamError) {
+          return error("vercel_unreachable", "That Vercel team is not one this token can see.", { message })
+        }
         const status = err instanceof VercelError ? err.status : undefined
         if (status === 401 || status === 403) {
           return error("invalid_token", "Vercel did not accept this token.", { message })
@@ -597,13 +662,16 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
         name: safeName(input.name),
         token: input.token,
         ...(input.teamId !== undefined ? { teamId: input.teamId } : {}),
-        plan: plan.plan,
+        // The teams list carries no personal-scope plan, so "unknown" is not
+        // a plan to store: the field is left out rather than presenting a
+        // plan the account was never shown to have.
+        ...(plan.plan !== "unknown" ? { plan: plan.plan } : {}),
       })
       announceChanged(announce, "account added")
       return {
         id: account.id,
         name: account.name,
-        ...(plan.plan ? { plan: plan.plan } : {}),
+        ...(plan.plan !== "unknown" ? { plan: plan.plan } : {}),
         ...(plan.team ? { team: plan.team } : {}),
         teams: plan.teams,
         projectsSampled: plan.projectsSampled,
@@ -644,7 +712,7 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
         // well be live. Saying "Vercel did not accept it" would send the user
         // into a second deployment in the same region.
         if (err instanceof StorageError) throw err
-        return error("deploy_failed", "Vercel did not accept the deployment.", {
+        return error("deploy_failed", "The deployment did not finish.", {
           message: redact(describe(err), [account.token]),
         })
       }
@@ -819,6 +887,14 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
 
     /** Redeploy the current relay code, keeping the URL and access token. */
     updateRelay: async (input, { error }) => {
+      // Two deployments of one project race each other in Vercel: the slower
+      // one can finish last and leave the project on older code. The second
+      // call is refused rather than queued behind the first.
+      if (updatesInFlight.has(input.id)) {
+        return error("update_failed", "That relay is already being redeployed.", {
+          message: "Wait for the running deployment to finish before starting another.",
+        })
+      }
       const relay = state.relay(input.id)
       if (!relay) {
         return error("update_failed", "Unknown relay.", {
@@ -839,33 +915,38 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
           message: "The account this relay was deployed with is not there any more.",
         })
       }
+      updatesInFlight.add(input.id)
       try {
-        await deployToVercel({
-          account: {
-            token: account.token,
-            ...(account.teamId !== undefined ? { teamId: account.teamId } : {}),
-          },
-          project: relay.project,
-          region: relay.region,
-          access: relay.access,
-          // The same runtime the relay was deployed with: another one makes a
-          // different relay, and it may stop answering.
-          ...(relay.deployRuntime !== undefined ? { runtime: relay.deployRuntime } : {}),
-          relaySource: relaySource(),
-        })
-      } catch (err) {
-        return error("update_failed", "Vercel did not accept the deployment.", {
-          message: redact(describe(err), [account.token, relay.access]),
-        })
+        try {
+          await deployToVercel({
+            account: {
+              token: account.token,
+              ...(account.teamId !== undefined ? { teamId: account.teamId } : {}),
+            },
+            project: relay.project,
+            region: relay.region,
+            access: relay.access,
+            // The same runtime the relay was deployed with: another one makes a
+            // different relay, and it may stop answering.
+            ...(relay.deployRuntime !== undefined ? { runtime: relay.deployRuntime } : {}),
+            relaySource: relaySource(),
+          })
+        } catch (err) {
+          return error("update_failed", "The deployment did not finish.", {
+            message: redact(describe(err), [account.token, relay.access]),
+          })
+        }
+        // Stamped when the probe starts: a live verdict while it is in flight
+        // wins over whatever the probe answers.
+        const checkedAt = Date.now()
+        const healthEpoch = state.healthEpoch(relay.id)
+        const probe = await probeRelay(relay.url, relay.access)
+        await recordProbe(state, relay.id, probe, checkedAt, healthEpoch)
+        announceChanged(announce, "relay updated")
+        return { id: relay.id, reachable: probe.reachable, status: probe.status }
+      } finally {
+        updatesInFlight.delete(input.id)
       }
-      // Stamped when the probe starts: a live verdict while it is in flight
-      // wins over whatever the probe answers.
-      const checkedAt = Date.now()
-      const healthEpoch = state.healthEpoch(relay.id)
-      const probe = await probeRelay(relay.url, relay.access)
-      await recordProbe(state, relay.id, probe, checkedAt, healthEpoch)
-      announceChanged(announce, "relay updated")
-      return { id: relay.id, reachable: probe.reachable, status: probe.status }
     },
 
     /** Redeploy every relay this plugin deployed, with the current code. */
@@ -892,6 +973,17 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
           })
           continue
         }
+        // The single-relay action may be redeploying this project right now:
+        // the batch leaves it to that call rather than racing it in Vercel.
+        if (updatesInFlight.has(relay.id)) {
+          skipped.push({
+            id: relay.id,
+            name: relay.name,
+            message: "It is already being redeployed; wait for that deployment to finish.",
+          })
+          continue
+        }
+        updatesInFlight.add(relay.id)
         try {
           await deployToVercel({
             account: {
@@ -922,6 +1014,8 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
             name: relay.name,
             message: redact(describe(err), [account.token, relay.access]),
           })
+        } finally {
+          updatesInFlight.delete(relay.id)
         }
       }
       // One announce for the whole batch, like deployRelays: per-relay
@@ -932,7 +1026,13 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
 
     /** Test one exit: an OpenCode request, or a tiny real model request. */
     testExit: async (input) => {
+      // Two checks of one address waste the exit's allowance and race their
+      // verdicts. The Tester owns that claim, because the background sweep
+      // reaches the same exit; a check it refuses must not be reported as one
+      // that ran, and the contract has no refused field here, so the answer is
+      // a verdict of its own that never reaches the stored state.
       const result = await tester.test(input.id, input.deep ? "deep" : "api")
+      if (result === TEST_IN_FLIGHT) return result
       // The user asked for this exit by name, so a test that saw an answer
       // makes an imported one theirs: it may enter service. A test that
       // proved nothing (no captured request to replay, a paused exit) has
@@ -1109,7 +1209,11 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
       }
     },
 
-    /** Change a proxy's name or address. A new address is tested afresh. */
+    /**
+     * Change a proxy's name or address. A changed address is tested, unless a
+     * check of it is already running: that one is awaited, then the new
+     * address is tested for itself.
+     */
     updateProxy: async (input) => {
       const current = state.proxy(input.id)
       if (!current) return { updated: false, reason: "This proxy is not there any more." }
@@ -1159,12 +1263,22 @@ export function createHandlers(deps: HandlerDeps): RpcHandlers<typeof Relay> {
       if (!next) return { updated: false, reason: "This proxy is not there any more." }
       announceChanged(announce, "proxy updated")
       if (url !== undefined) {
-        void tester
-          .test(next.id, "api")
-          .then(() => announceChanged(announce, "exit tested"))
-          .catch((error: unknown) => {
-            state.noteFailure(`The new address could not be checked: ${describe(error)}`)
-          })
+        const check = async (): Promise<void> => {
+          // The sweep may have been checking the new address already: its
+          // answer is awaited (a refused check saw nothing, so announcing it
+          // would say a verdict arrived when one did not), and the check of
+          // the new address follows it rather than being lost to the refusal.
+          const holder = tester.inFlightTest(next.id)
+          if (holder !== undefined) {
+            await holder.catch(() => {})
+          }
+          const result = await tester.test(next.id, "api")
+          if (result === TEST_IN_FLIGHT) return
+          announceChanged(announce, "exit tested")
+        }
+        void check().catch((error: unknown) => {
+          state.noteFailure(`The new address could not be checked: ${describe(error)}`)
+        })
       }
       return { updated: true }
     },

@@ -3,7 +3,7 @@ import { createServer, type Server } from "node:http"
 import { startRelay, startTraceStub, traceUrl } from "../tools/relay-harness.ts"
 import { ROTATE_DELAY_MS } from "../src/server/hooks.ts"
 import { relayRequest } from "../src/lib/routing.ts"
-import { createHandlers } from "../src/server/handlers.ts"
+import { createHandlers, updatesInFlight } from "../src/server/handlers.ts"
 import { RelayState } from "../src/server/state.ts"
 import { Tester } from "../src/server/tester.ts"
 import plugin from "../src/server/index.ts"
@@ -1611,6 +1611,69 @@ describe("the server half", () => {
       expect(updated.skipped).toHaveLength(0)
     } finally {
       await app.dispose()
+    }
+  })
+
+  test("update-all skips a relay whose redeploy is already running", async () => {
+    const store = new Map<string, unknown>()
+    const storage = {
+      get: async (key: string) => store.get(key),
+      set: async (key: string, value: unknown) => {
+        store.set(key, value)
+      },
+      remove: async (key: string) => {
+        store.delete(key)
+      },
+      scan: async () => ({ entries: [] }),
+    }
+    const state = new RelayState(storage as never)
+    await state.load()
+    const account = await state.addAccount({ name: "mine", token: "tok-secret" })
+    await state.addRelay({
+      kind: "relay",
+      id: "relay-updating",
+      name: "busy relay",
+      project: "busy-project",
+      region: "fra1",
+      url: "http://127.0.0.1:9",
+      access: ACCESS,
+      accountId: account.id,
+      enabled: true,
+      status: "reachable",
+      createdAt: Date.now(),
+      deployRuntime: "bun",
+    })
+    const handlers = createHandlers({
+      state,
+      catalog: {} as never,
+      bridge: {} as never,
+      tester: new Tester({ state, announce: async () => {} }),
+      announce: async () => {},
+    })
+
+    // The single-relay action has claimed this project, and the batch reaches
+    // the same list: a second deployment of one project would race the first.
+    updatesInFlight.add("relay-updating")
+    try {
+      const result = (await handlers.updateAllRelays({}, {} as never)) as {
+        updated: number
+        failed: unknown[]
+        skipped: Array<{ id: string; name: string; message: string }>
+      }
+
+      expect(result.updated).toBe(0)
+      expect(result.failed).toEqual([])
+      expect(result.skipped).toHaveLength(1)
+      expect(result.skipped[0]).toMatchObject({
+        id: "relay-updating",
+        name: "busy relay",
+      })
+      expect(result.skipped[0]?.message).toContain("already being redeployed")
+      // The batch did not take the claim, so it must not release it either:
+      // the call that owns it is still running.
+      expect(updatesInFlight.has("relay-updating")).toBe(true)
+    } finally {
+      updatesInFlight.delete("relay-updating")
     }
   })
 

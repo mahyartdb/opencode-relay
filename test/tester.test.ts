@@ -3,6 +3,7 @@ import net from "node:net"
 import tls from "node:tls"
 import { readFileSync } from "node:fs"
 import type { RelayRecord } from "../src/lib/types.ts"
+import { createHandlers } from "../src/server/handlers.ts"
 import { RelayState } from "../src/server/state.ts"
 import { Tester } from "../src/server/tester.ts"
 
@@ -124,6 +125,68 @@ function netStubServer(onData: (socket: net.Socket) => void) {
 
 async function netCloseServer(server: net.Server): Promise<void> {
   await new Promise<void>((resolve) => server.close(() => resolve()))
+}
+
+/**
+ * Poll until the condition holds, and fail with a note when the deadline
+ * passes. The follow-up check of an edited address is fire-and-forget, so the
+ * event to await is the state changing, whenever it lands.
+ */
+async function waitFor(condition: () => boolean, withinMs = 5_000): Promise<void> {
+  const deadline = Date.now() + withinMs
+  for (;;) {
+    if (condition()) return
+    if (Date.now() >= deadline) throw new Error("the condition never held within the deadline")
+    await Bun.sleep(25)
+  }
+}
+
+/**
+ * A SOCKS5 upstream whose tunnel ends in a TLS endpoint answering like the
+ * trace service. The tunnel's TLS is ended by the stub itself with a
+ * self-signed certificate, so verification must be off while the test runs;
+ * the stub is closed afterwards. A `gate`, when given, holds the answer back
+ * until it resolves, so a check through the stub stays in flight.
+ */
+async function traceStub(answer: () => { status: number; body: string }, gate?: Promise<void>) {
+  const { closeServer, stubServer, KEY, CERT } = await tlsStubParts()
+  const server = await stubServer((socket) => {
+    let greeted = false
+    let replied = false
+    socket.on("data", (chunk: Buffer) => {
+      if (!greeted) {
+        greeted = true
+        socket.write(Buffer.from([0x05, 0x00]))
+        return
+      }
+      if (replied) return
+      replied = true
+      socket.write(Buffer.from([0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0x1f, 0x90]))
+      const tlsSocket = new tls.TLSSocket(socket, {
+        isServer: true,
+        key: KEY,
+        cert: CERT,
+      })
+      tlsSocket.on("data", async (data: Buffer) => {
+        const text = data.toString("latin1")
+        if (text.startsWith("GET") || text.startsWith("POST")) {
+          if (gate !== undefined) await gate
+          const { status, body } = answer()
+          tlsSocket.write(
+            `HTTP/1.1 ${status} x\r\ncontent-type: text/plain\r\n\r\n${body}`,
+          )
+          tlsSocket.end()
+        }
+      })
+      tlsSocket.on("error", () => {})
+    })
+  })
+  return {
+    port: server.port,
+    stop: async () => {
+      await closeServer(server.server)
+    },
+  }
 }
 
 /** A tester pointed at a local server that stands in for the relay. */
@@ -466,53 +529,6 @@ describe("the deep check", () => {
 })
 
 describe("overlapping checks", () => {
-  test("an older check cannot retire an exit a newer check cleared", async () => {
-    let release!: () => void
-    const gate = new Promise<void>((resolve) => {
-      release = resolve
-    })
-    let arrived!: () => void
-    const firstArrived = new Promise<void>((resolve) => {
-      arrived = resolve
-    })
-    let requests = 0
-
-    const made = await setup(async () => {
-      requests += 1
-      if (requests === 1) {
-        arrived()
-        await gate
-        return new Response("{}", { status: 409, headers: { "x-relay-rotate": "1" } })
-      }
-      return new Response("{}", { status: 200 })
-    })
-
-    // An egress on record makes a stale spend mark visible, and a newer
-    // verdict makes the stale one easy to spot.
-    await made.state.setHealth(made.id, {
-      status: "reachable",
-      egress: "203.0.113.9",
-      checkedAt: Date.now(),
-    })
-
-    const older = made.tester.test(made.id, "api")
-    await firstArrived
-    await Bun.sleep(5)
-    const newer = await made.tester.test(made.id, "api")
-
-    expect(newer.status).toBe("reachable")
-    release()
-    const stale = await older
-
-    // The old answer still says what it saw, but it must not have retired the
-    // exit the newer answer had already cleared.
-    expect(stale.status).toBe("exhausted")
-    expect(made.state.exit(made.id)?.status).toBe("reachable")
-    expect(made.state.exit(made.id)?.exhaustedUntil).toBeUndefined()
-    expect(made.state.spentEgresses()).toEqual([])
-    expect(made.state.exhaustedExits()).toEqual([])
-  })
-
   test("a live failure during a check wins over the check's answer", async () => {
     let release!: () => void
     const gate = new Promise<void>((resolve) => {
@@ -572,6 +588,273 @@ describe("overlapping checks", () => {
     expect(made.state.exit(made.id)?.status).toBe("exhausted")
     expect(made.state.exit(made.id)?.exhaustedUntil).toBe(until)
     expect(made.state.exhaustedExits()).toContain(made.id)
+  })
+
+  test("a stale exhausted verdict must not spend the egress or arm a cooldown", async () => {
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    let arrived!: () => void
+    const firstArrived = new Promise<void>((resolve) => {
+      arrived = resolve
+    })
+
+    const made = await setup(async () => {
+      arrived()
+      await gate
+      // The check itself answers rotate-409, an exhausted verdict that would
+      // spend the egress address and arm the exit's own rest if it were fresh.
+      return new Response("{}", {
+        status: 409,
+        headers: { "x-relay-rotate": "1", "x-relay-egress": "203.0.113.9" },
+      })
+    })
+
+    const check = made.tester.test(made.id, "api")
+    await firstArrived
+    const until = Date.now() + 60 * 60_000
+    // A live verdict bumps the epoch mid-check: the check's answer, no matter
+    // what it saw, is older evidence than this.
+    made.state.markExhausted(made.id, until, "A real request was refused.")
+    release()
+    const result = await check
+
+    expect(result.status).toBe("exhausted")
+    // The verdict is stale, so it must not spend the egress address the stub
+    // named, nor push the exit's own rest out from the live one.
+    expect(made.state.spentEgresses()).toEqual([])
+    expect(made.state.exit(made.id)?.exhaustedUntil).toBe(until)
+    expect(made.state.exhaustedExits()).toContain(made.id)
+  })
+})
+
+describe("a check that is already running", () => {
+  /** A tester whose server holds the first answer until the test releases it. */
+  async function held() {
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    let arrived!: () => void
+    const firstArrived = new Promise<void>((resolve) => {
+      arrived = resolve
+    })
+    let requests = 0
+    const made = await setup(async () => {
+      requests += 1
+      if (requests === 1) {
+        arrived()
+        await gate
+      }
+      return new Response("{}", { status: 200 })
+    })
+    const handlers = createHandlers({
+      state: made.state,
+      catalog: {} as never,
+      bridge: {} as never,
+      tester: made.tester,
+      announce: async () => {},
+    })
+    return {
+      ...made,
+      handlers,
+      release,
+      firstArrived,
+      requests: () => requests,
+    }
+  }
+
+  test("a second test of the same exit is refused, and the first still finishes", async () => {
+    const made = await held()
+
+    const first = made.handlers.testExit({ id: made.id }, {} as never)
+    await made.firstArrived
+    const second = (await made.handlers.testExit({ id: made.id }, {} as never)) as {
+      ok: boolean
+      status: string
+      code: number
+      ms: number
+      note?: string
+    }
+
+    // The contract has no refused field, so the refusal is a verdict of its
+    // own that never reaches the stored state.
+    expect(second).toMatchObject({ ok: false, status: "testing", code: 0, ms: 0 })
+    expect(second.note).toContain("already being tested")
+    expect(made.state.exit(made.id)?.status).toBe("untested")
+
+    made.release()
+    const settled = (await first) as { status: string }
+    expect(settled.status).toBe("reachable")
+  })
+
+  test("the Tester itself refuses a second test of the same exit", async () => {
+    const made = await held()
+
+    // The claim lives at test()'s entry, so every caller — the handlers, the
+    // sweep, a fire-and-forget check — meets the same guard.
+    const first = made.tester.test(made.id, "api")
+    await made.firstArrived
+    const second = await made.tester.test(made.id, "api")
+
+    // A refused check is a verdict of its own that says nothing ran, not a
+    // result dressed up as one.
+    expect(second).toMatchObject({ ok: false, status: "testing", code: 0, ms: 0 })
+    expect(second.note).toContain("already being tested")
+    expect(made.requests()).toBe(1)
+
+    made.release()
+    const settled = await first
+    expect(settled.status).toBe("reachable")
+
+    // The claim went out with the first check: the exit can be tested again.
+    const again = await made.tester.test(made.id, "api")
+    expect(again.status).toBe("reachable")
+  })
+
+  test("the holder of the running check can be awaited, then the exit re-tested", async () => {
+    const made = await held()
+
+    const first = made.tester.test(made.id, "api")
+    await made.firstArrived
+    const holder = made.tester.inFlightTest(made.id)
+    expect(holder).toBeDefined()
+    const refused = await made.tester.test(made.id, "api")
+    expect(refused).toMatchObject({ ok: false, status: "testing" })
+
+    // A caller that follows the holder instead of racing it can act on the
+    // settled verdict — this is what a check fired after an address edit does.
+    made.release()
+    await holder
+    const again = await made.tester.test(made.id, "api")
+    expect(again.status).toBe("reachable")
+    expect(made.requests()).toBe(2)
+  })
+
+  test("the sweep skips the exit a user's test is already checking", async () => {
+    const made = await held()
+
+    // The user's test claims the exit first, the way the sweep and a test
+    // asked for by name both reach the same address.
+    const check = made.handlers.testExit({ id: made.id }, {} as never)
+    await made.firstArrived
+    await made.tester.scan("api")
+
+    // A second check would have spent the exit's allowance and raced the
+    // verdict, and the sweep must finish rather than fail on the claim.
+    expect(made.requests()).toBe(1)
+
+    made.release()
+    const result = (await check) as { status: string }
+    expect(result.status).toBe("reachable")
+  })
+
+  test("a check the sweep skips still counts toward the scan's progress", async () => {
+    let release!: () => void
+    const gate = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    let arrived!: () => void
+    const secondArrived = new Promise<void>((resolve) => {
+      arrived = resolve
+    })
+    // Two exits: one claimed by a user's test, one held mid-answer. The
+    // sweep skips the first (counted) and waits on the second, so the
+    // fraction is observable while it runs.
+    const made = await setup(async () => {
+      arrived()
+      await gate
+      return new Response("{}", { status: 200 })
+    })
+    const claimed = made.tester.test(made.id, "api")
+    await Bun.sleep(25)
+    await made.state.addRelay({
+      kind: "relay",
+      id: "relay-2",
+      name: "held",
+      project: "",
+      region: "",
+      url: made.state.exit(made.id)?.url ?? "",
+      access: "test-access",
+      accountId: "",
+      enabled: true,
+      status: "untested",
+      createdAt: Date.now(),
+    })
+
+    const sweeping = made.tester.scan("api")
+    await secondArrived
+    // The skipped exit was already counted: 1 of 2 done while the second
+    // check waits. Without counting the skip, the fraction would sit at 0.
+    expect(made.state.scanning()).toMatchObject({ total: 2, done: 1 })
+
+    release()
+    await sweeping
+    const settled = (await claimed) as { status: string }
+    expect(settled.status).toBe("reachable")
+  })
+
+  test("a check fired after an address edit follows the holder, then tests the new address", async () => {
+    // A held relay whose first answer waits, standing in for the check that
+    // holds the claim when a scan is running while the address is edited.
+    const made = await held()
+    const first = made.handlers.testExit({ id: made.id }, {} as never)
+    await made.firstArrived
+
+    // The proxy's first address is the gated trace stub, and its own scan is
+    // started through the handler path so it claims the proxy. The edit then
+    // moves the address while that check holds the claim: the refusal must be
+    // followed by a check of the newest address, not a silent nothing.
+    let pass!: () => void
+    const gate = new Promise<void>((resolve) => {
+      pass = resolve
+    })
+    const trace = await traceStub(() => ({ status: 200, body: "ip=203.0.113.7\n" }), gate)
+    const previousTls = process.env.NODE_TLS_REJECT_UNAUTHORIZED
+    process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0"
+    try {
+      await made.state.addProxy({
+        kind: "proxy",
+        id: "proxy-1",
+        name: "edited",
+        url: `socks5://127.0.0.1:${trace.port}`,
+        enabled: true,
+        status: "untested",
+        createdAt: Date.now(),
+      })
+      const holding = made.tester.test("proxy-1", "ping")
+      await waitFor(() => made.tester.inFlightTest("proxy-1") !== undefined)
+
+      // The edit lands while the ping holds the claim. Without following the
+      // holder, the fired check would be refused and the new address would
+      // never be tested at all.
+      const update = made.handlers.updateProxy(
+        { id: "proxy-1", url: "socks5://127.0.0.1:9" },
+        {} as never,
+      )
+      expect(((await update) as { updated: boolean }).updated).toBe(true)
+
+      // The holder settles; the follow-up check of the new address then runs
+      // against port 9 (nothing listens) and answers unreachable, not the
+      // refusal's never-stored no-verdict.
+      pass()
+      made.release()
+      const settled = (await holding) as { status: string }
+      expect(settled.status).toBe("reachable")
+      const settledFirst = (await first) as { status: string }
+      expect(settledFirst.status).toBe("reachable")
+
+      await waitFor(() => made.state.exit("proxy-1")?.status !== "untested")
+      // Port 9 refuses the tunnel, the local bridge answers 502, and the api
+      // check calls that a failing exit: a verdict, where the refusal alone
+      // would have left the address untested forever.
+      expect(made.state.exit("proxy-1")?.status).toBe("bad")
+    } finally {
+      if (previousTls === undefined) delete process.env.NODE_TLS_REJECT_UNAUTHORIZED
+      else process.env.NODE_TLS_REJECT_UNAUTHORIZED = previousTls
+      await trace.stop()
+    }
   })
 })
 
@@ -681,52 +964,6 @@ describe("a proxy ping", () => {
       enabled: true,
       status: "untested" as const,
       createdAt: Date.now(),
-    }
-  }
-
-  /**
-   * A SOCKS5 upstream whose tunnel ends in a TLS endpoint answering like the
-   * trace service. The tunnel's TLS is ended by the stub itself with a
-   * self-signed certificate, so verification must be off while the test runs;
-   * the stub is closed afterwards.
-   */
-  async function traceStub(answer: () => { status: number; body: string }) {
-    const { closeServer, stubServer, KEY, CERT } = await tlsStubParts()
-    const server = await stubServer((socket) => {
-      let greeted = false
-      let replied = false
-      socket.on("data", (chunk: Buffer) => {
-        if (!greeted) {
-          greeted = true
-          socket.write(Buffer.from([0x05, 0x00]))
-          return
-        }
-        if (replied) return
-        replied = true
-        socket.write(Buffer.from([0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0x1f, 0x90]))
-        const tlsSocket = new tls.TLSSocket(socket, {
-          isServer: true,
-          key: KEY,
-          cert: CERT,
-        })
-        tlsSocket.on("data", (data: Buffer) => {
-          const text = data.toString("latin1")
-          if (text.startsWith("GET") || text.startsWith("POST")) {
-            const { status, body } = answer()
-            tlsSocket.write(
-              `HTTP/1.1 ${status} x\r\ncontent-type: text/plain\r\n\r\n${body}`,
-            )
-            tlsSocket.end()
-          }
-        })
-        tlsSocket.on("error", () => {})
-      })
-    })
-    return {
-      port: server.port,
-      stop: async () => {
-        await closeServer(server.server)
-      },
     }
   }
 
